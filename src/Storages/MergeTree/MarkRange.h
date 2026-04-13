@@ -1,11 +1,11 @@
 #pragma once
 
 #include <cstddef>
-#include <Common/AllocatorWithMemoryTracking.h>
 #include <Processors/Chunk.h>
+#include <base/types.h>
 #include <boost/container/devector.hpp>
 #include <fmt/format.h>
-#include <base/types.h>
+#include <Common/AllocatorWithMemoryTracking.h>
 
 namespace DB
 {
@@ -38,6 +38,7 @@ struct MarkRanges : public boost::container::devector<MarkRange, AllocatorWithMe
         Unknown,
         BinarySearch,
         GenericExclusionSearch,
+        SetBasedSearch,
     };
 
     using boost::container::devector<MarkRange, AllocatorWithMemoryTracking<MarkRange>>::devector; /// NOLINT(modernize-type-traits)

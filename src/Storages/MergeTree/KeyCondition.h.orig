@@ -2,19 +2,18 @@
 
 #include <optional>
 
-#include <Core/Range.h>
 #include <Core/SortDescription.h>
+#include <Core/Range.h>
 
 #include <DataTypes/Serializations/ISerialization.h>
 
 #include <Interpreters/ActionsDAG.h>
-#include <Interpreters/Set.h>
 #include <Interpreters/TreeRewriter.h>
+#include <Interpreters/Set.h>
 
-#include <Storages/MergeTree/BoolMask.h>
-#include <Storages/MergeTree/MarkRange.h>
-#include <Storages/MergeTree/RPNBuilder.h>
 #include <Storages/SelectQueryInfo.h>
+#include <Storages/MergeTree/BoolMask.h>
+#include <Storages/MergeTree/RPNBuilder.h>
 
 
 namespace DB
@@ -61,9 +60,7 @@ struct DeterministicKeyTransformDag
 class KeyCondition
 {
 private:
-    struct ThisIsPrivate
-    {
-    };
+    struct ThisIsPrivate {};
 
 public:
     /// Construct key condition from ActionsDAG nodes
@@ -109,7 +106,7 @@ public:
     /// done in MergeTreeDataSelectExecutor::filterMarksUsingIndex(). Each *IndexCondition
     /// invokes this callback as it is evaluating the predicate. The final result for each
     /// granule is computed in MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions()
-    using UpdatePartialDisjunctionResultFn = std::function<void(size_t position, bool result, bool is_unknown)>;
+    using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, bool result, bool is_unknown)>;
 
     /// Whether the condition and its negation are feasible in the direct product of single column ranges specified by `hyperrectangle`.
     BoolMask checkInHyperrectangle(
@@ -132,8 +129,11 @@ public:
 
     /// Same as checkInRange, but calculate only may_be_true component of a result.
     /// This is more efficient than checkInRange(...).can_be_true.
-    bool
-    mayBeTrueInRange(size_t used_key_size, const FieldRef * left_keys, const FieldRef * right_keys, const DataTypes & data_types) const;
+    bool mayBeTrueInRange(
+        size_t used_key_size,
+        const FieldRef * left_keys,
+        const FieldRef * right_keys,
+        const DataTypes & data_types) const;
 
     /// Checks that the index can not be used
     /// FUNCTION_UNKNOWN will be AND'ed (if any).
@@ -175,28 +175,27 @@ public:
     /** Computes value of constant expression and its data type.
       * Returns false, if expression isn't constant.
       */
-    static bool getConstant(const ASTPtr & expr, Block & block_with_constants, Field & out_value, DataTypePtr & out_type);
+    static bool getConstant(
+        const ASTPtr & expr,
+        Block & block_with_constants,
+        Field & out_value,
+        DataTypePtr & out_type);
 
     /** Calculate expressions, that depend only on constants.
       * For index to work when something like "WHERE Date = toDate(now())" is written.
       */
-    static Block getBlockWithConstants(const ASTPtr & query, const TreeRewriterResultPtr & syntax_analyzer_result, ContextPtr context);
+    static Block getBlockWithConstants(
+        const ASTPtr & query,
+        const TreeRewriterResultPtr & syntax_analyzer_result,
+        ContextPtr context);
 
     static std::optional<Range> applyMonotonicFunctionsChainToRange(
-        Range key_range, const MonotonicFunctionsChain & functions, DataTypePtr current_type, bool single_point = false);
+        Range key_range,
+        const MonotonicFunctionsChain & functions,
+        DataTypePtr current_type,
+        bool single_point = false);
 
     bool matchesExactContinuousRange() const;
-
-    /// Returns true when the RPN is exactly one FUNCTION_IN_SET with:
-    /// - More than 1 element (single-element falls through to matchesExactContinuousRange)
-    /// - No monotonic function chains
-    /// - Prefix coverage of PK columns
-    /// This enables the granule-index hybrid search algorithm.
-    bool matchesSetBasedRange() const;
-
-    /// Find all marks intersecting the IN set, using the granule-index hybrid algorithm.
-    /// Only valid when matchesSetBasedRange() is true.
-    MarkRanges findMarksViaSetIndex(const ColumnsWithTypeAndName & sparse_index, size_t marks_count, size_t L_mark, size_t R_mark) const;
 
     /// Extract plain ranges of the condition.
     /// Note that only support one column key condition.
@@ -280,11 +279,7 @@ public:
         /// If `key_names` is empty, prints column numbers instead.
         String toString(const std::vector<String> & key_names = {}) const;
 
-        size_t getKeyColumn() const
-        {
-            chassert(key_columns.size() == 1);
-            return key_columns.at(0);
-        }
+        size_t getKeyColumn() const { chassert(key_columns.size() == 1); return key_columns.at(0); }
 
         Function function = FUNCTION_UNKNOWN;
 
@@ -335,7 +330,7 @@ public:
     using RPN = std::vector<RPNElement>;
     using ColumnIndices = std::map<String, size_t>;
 
-    using AtomMap = std::unordered_map<std::string, bool (*)(RPNElement & out, const Field & value)>;
+    using AtomMap = std::unordered_map<std::string, bool(*)(RPNElement & out, const Field & value)>;
     static const AtomMap atom_map;
 
     const RPN & getRPN() const { return rpn; }
@@ -348,9 +343,8 @@ public:
     /// Does the filter condition have any ORs?
     bool hasOnlyConjunctions() const;
 
-    void prepareBloomFilterData(
-        std::function<std::optional<uint64_t>(size_t column_idx, const Field &)> hash_one,
-        std::function<std::optional<std::vector<uint64_t>>(size_t column_idx, const ColumnPtr &)> hash_many);
+    void prepareBloomFilterData(std::function<std::optional<uint64_t>(size_t column_idx, const Field &)> hash_one,
+                                std::function<std::optional<std::vector<uint64_t>>(size_t column_idx, const ColumnPtr &)> hash_many);
 
     /// Split the KeyCondition into single-column conditions AND-ed together, plus a remaining
     /// multi-column KeyCondition.
@@ -360,9 +354,7 @@ public:
     /// as the original KeyCondition. E.g. when calling checkInHyperrectangle on the single-column
     /// KeyCondition-s, the passed hyperrectangle must have as many elements as the original key size,
     /// not just one element.
-    void extractSingleColumnConditions(
-        std::vector<std::pair</*column_idx*/ size_t, std::shared_ptr<KeyCondition>>> & out_column_conditions,
-        std::shared_ptr<KeyCondition> * out_complex_condition) const;
+    void extractSingleColumnConditions(std::vector<std::pair</*column_idx*/ size_t, std::shared_ptr<KeyCondition>>> & out_column_conditions, std::shared_ptr<KeyCondition> * out_complex_condition) const;
 
     /// List key columns that are actually used in the condition. E.g. condition `x AND y` doesn't use column `z`.
     std::unordered_set<size_t> getUsedColumns() const;
