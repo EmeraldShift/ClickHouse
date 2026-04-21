@@ -185,6 +185,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"throw_if_deduplication_in_dependent_materialized_views_enabled_with_async_insert", true, false, "It becomes obsolete."},
             {"database_datalake_require_metadata_access", true, true, "New setting."},
             {"automatic_parallel_replicas_min_bytes_per_replica", 0, 1_MiB, "Better default value derived from testing results"},
+            {"use_minmax_index_part_subsumption", false, false, "New setting. Short-circuits granule-level minmax index evaluation when a part's partition-level minmax already proves the condition."},
+            {"use_minmax_index_specialized_evaluator", false, false, "New setting. Uses a type-resolved specialized evaluator for minmax skip index conditions."},
+            {"use_minmax_index_bulk_filtering", false, false, "New setting. Evaluates minmax skip indexes in bulk across granules using the column engine."},
         });
         addSettingsChanges(settings_changes_history, "25.12",
         {

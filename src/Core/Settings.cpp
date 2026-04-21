@@ -1883,6 +1883,38 @@ SELECT * FROM data_01515 WHERE d1 = 0 AND assumeNotNull(d1_null) = 0 SETTINGS fo
     DECLARE(Bool, secondary_indices_enable_bulk_filtering, true, R"(
 Enable the bulk filtering algorithm for indices. It is expected to be always better, but we have this setting for compatibility and control.
 )", 0) \
+    DECLARE(Bool, use_minmax_index_part_subsumption, false, R"(
+Short-circuit minmax skip index evaluation when the part-level (partition) minmax index already proves the WHERE condition holds on the whole part.
+
+For a skip index of type `minmax` on columns that are also inputs of the partition key, each part has a partition-level minmax hyperrectangle over those columns. If the query's `KeyCondition` is proved true on that hyperrectangle (its `BoolMask` has `can_be_false = false`), then every granule inside the part must also pass the condition. In that case we skip opening and walking the per-granule minmax index entirely for this (part, index) pair.
+
+Possible values:
+
+- 0 — Disabled.
+- 1 — Enabled.
+)", 0) \
+    DECLARE(Bool, use_minmax_index_specialized_evaluator, false, R"(
+Use a specialized, type-resolved evaluator for minmax skip index conditions.
+
+When enabled, each `FUNCTION_IN_RANGE` / `FUNCTION_NOT_IN_RANGE` element of a minmax skip index's `KeyCondition` RPN is lowered at condition-build time into a concrete callable bound to the index column's `DataType`. This eliminates the double `Field`-variant dispatch performed by `Range::intersectsRange` / `Range::containsRange` on each granule.
+
+Possible values:
+
+- 0 — Disabled.
+- 1 — Enabled.
+)", 0) \
+    DECLARE(Bool, use_minmax_index_bulk_filtering, false, R"(
+Evaluate minmax skip indexes in bulk across all granules of a part using the column engine.
+
+When enabled and applicable, the minmax index deserializes the min and max of every granule into a pair of columns per index column, and evaluates the condition as a vectorized expression over those columns. For numeric types this collapses to a pair of SIMD compares per granule.
+
+Falls back to scalar per-granule evaluation when the condition contains elements that cannot be lowered to a simple interval check (e.g. space-filling curves, polygon predicates, or when `use_skip_indexes_for_disjunctions` is active).
+
+Possible values:
+
+- 0 — Disabled.
+- 1 — Enabled.
+)", 0) \
     DECLARE(Float, max_streams_to_max_threads_ratio, 1, R"(
 Allows you to use more sources than the number of threads - to more evenly distribute work across threads. It is assumed that this is a temporary solution since it will be possible in the future to make the number of sources equal to the number of threads, but for each source to dynamically select available work for itself.
 )", 0) \

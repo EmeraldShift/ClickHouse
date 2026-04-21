@@ -68,6 +68,7 @@ extern const Event FilteringMarksWithSecondaryKeysMicroseconds;
 extern const Event IndexBinarySearchAlgorithm;
 extern const Event IndexGenericExclusionSearchAlgorithm;
 extern const Event FilterPartsByVirtualColumnsMicroseconds;
+extern const Event MinMaxIndexPartSubsumptionShortCircuits;
 }
 
 namespace DB
@@ -1910,6 +1911,66 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     return res;
 }
 
+namespace
+{
+
+/// If the given skip index is a minmax index, all its columns appear in the part's
+/// partition key, and the provided condition is proved true on the part's partition-level
+/// minmax hyperrectangle, returns `true`: every granule inside the part passes this index,
+/// so granule-level evaluation can be skipped.
+///
+/// Not applicable when `use_skip_indexes_for_disjunctions` is on: the disjunction-merge
+/// path relies on per-granule per-RPN-position callbacks that we would otherwise skip.
+bool tryMinMaxPartSubsumptionShortCircuit(
+    const MergeTreeIndexPtr & index_helper,
+    const MergeTreeIndexConditionPtr & condition,
+    const MergeTreeData::DataPartPtr & part,
+    bool use_skip_indexes_for_disjunctions)
+{
+    if (use_skip_indexes_for_disjunctions)
+        return false;
+
+    const auto * minmax_condition = typeid_cast<const MergeTreeIndexConditionMinMax *>(condition.get());
+    if (!minmax_condition)
+        return false;
+
+    if (!part->minmax_idx || !part->minmax_idx->initialized)
+        return false;
+
+    auto metadata_snapshot = part->storage.getInMemoryMetadataPtr(part->storage.getContext(), /*bypass_metadata_cache=*/false);
+    if (!metadata_snapshot)
+        return false;
+
+    const auto & partition_key = metadata_snapshot->getPartitionKey();
+    Names minmax_column_names = MergeTreeData::getMinMaxColumnsNames(partition_key);
+    if (minmax_column_names.empty())
+        return false;
+
+    const auto & part_hyperrectangle = part->minmax_idx->hyperrectangle;
+    if (part_hyperrectangle.size() != minmax_column_names.size())
+        return false;
+
+    std::unordered_map<std::string_view, size_t> minmax_col_pos;
+    minmax_col_pos.reserve(minmax_column_names.size());
+    for (size_t i = 0; i < minmax_column_names.size(); ++i)
+        minmax_col_pos.emplace(minmax_column_names[i], i);
+
+    const auto & index_column_names = index_helper->index.column_names;
+    std::vector<Range> projected;
+    projected.reserve(index_column_names.size());
+    for (const auto & name : index_column_names)
+    {
+        auto it = minmax_col_pos.find(name);
+        if (it == minmax_col_pos.end())
+            return false;
+        projected.push_back(part_hyperrectangle[it->second]);
+    }
+
+    return minmax_condition->isProvedTrueOn(projected);
+}
+
+}
+
 std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::filterMarksUsingIndex(
     MergeTreeIndexPtr index_helper,
     MergeTreeIndexConditionPtr condition,
@@ -1925,6 +1986,18 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
     PartialDisjunctionResult & partial_disjunction_result,
     LoggerPtr log)
 {
+    /// If the part's partition-level minmax already proves the condition on the whole part,
+    /// every sub-granule must also pass. Return the input ranges unchanged and skip opening
+    /// the skip index entirely.
+    if (reader_settings.use_minmax_index_part_subsumption
+        && tryMinMaxPartSubsumptionShortCircuit(index_helper, condition, part, use_skip_indexes_for_disjunctions))
+    {
+        ProfileEvents::increment(ProfileEvents::MinMaxIndexPartSubsumptionShortCircuits);
+        LOG_TRACE(log, "MinMax index {} subsumed by partition-level minmax on part {}; skipping granule evaluation.",
+            backQuote(index_helper->index.name), part->name);
+        return {ranges, in_read_hints};
+    }
+
     if (!index_helper->getDeserializedFormat(part->checksums, index_helper->getFileName()))
     {
         LOG_DEBUG(log, "File for index {} does not exist ({}.*). Skipping it.", backQuote(index_helper->index.name),

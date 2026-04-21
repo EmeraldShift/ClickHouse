@@ -64,6 +64,15 @@ public:
 
     std::string getDescription() const override;
 
+    /// Returns true iff the condition is proved to hold on every point of the given hyperrectangle.
+    /// Equivalently: `checkInHyperrectangle(hyperrectangle, ...).can_be_false == false`.
+    ///
+    /// Used for the part-level subsumption short-circuit: if the part's partition minmax
+    /// hyperrectangle (projected onto this index's columns) proves the condition, then every
+    /// sub-granule inside the part also satisfies the condition and the granule-level
+    /// minmax index evaluation can be skipped.
+    bool isProvedTrueOn(const std::vector<Range> & hyperrectangle) const;
+
     ~MergeTreeIndexConditionMinMax() override = default;
 private:
     DataTypes index_data_types;
