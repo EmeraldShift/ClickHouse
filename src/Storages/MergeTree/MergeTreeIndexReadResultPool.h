@@ -31,6 +31,7 @@ public:
         UsefulSkipIndexes skip_indexes_,
         std::optional<KeyCondition> & key_condition_rpn_template_,
         bool use_for_disjunctions_,
+        Names partition_minmax_column_names_,
         MarkCachePtr mark_cache_,
         UncompressedCachePtr uncompressed_cache_,
         VectorSimilarityIndexCachePtr vector_similarity_index_cache_,
@@ -45,6 +46,7 @@ private:
     UsefulSkipIndexes skip_indexes;
     std::optional<KeyCondition> key_condition_rpn_template;
     bool use_for_disjunctions;
+    Names partition_minmax_column_names;
     MarkCachePtr mark_cache;
     UncompressedCachePtr uncompressed_cache;
     VectorSimilarityIndexCachePtr vector_similarity_index_cache;

@@ -1,0 +1,11 @@
+correctness, setting off	41760
+correctness, setting on	41760
+79840
+79850
+79840
+79840
+cross-setting correctness	1
+positive fires >= 1	1
+cross-disjunction fires >= 1	1
+relaxed fires = 0	0
+mixed-and fires = 0	0

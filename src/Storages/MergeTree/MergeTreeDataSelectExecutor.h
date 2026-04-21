@@ -85,6 +85,7 @@ public:
         MergeTreeIndexConditionPtr condition,
         const std::optional<KeyCondition> & key_condition_rpn_template,
         MergeTreeData::DataPartPtr part,
+        const Names & partition_minmax_column_names,
         const MarkRanges & ranges,
         const RangesInDataPartReadHints & in_read_hints,
         const MergeTreeReaderSettings & reader_settings,

@@ -68,6 +68,7 @@ extern const Event FilteringMarksWithSecondaryKeysMicroseconds;
 extern const Event IndexBinarySearchAlgorithm;
 extern const Event IndexGenericExclusionSearchAlgorithm;
 extern const Event FilterPartsByVirtualColumnsMicroseconds;
+extern const Event PartMinMaxSkipsGranuleIndex;
 }
 
 namespace DB
@@ -793,6 +794,11 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
     const auto original_num_parts = parts_with_ranges.size();
     const Settings & settings = context->getSettingsRef();
 
+    /// Partition-key minmax column names, computed once per query so the part-minmax
+    /// granule-skip shortcut doesn't take the metadata cache per (part, skip index) pair
+    /// inside the hot loop. Empty when the table has no partition key.
+    const Names partition_minmax_column_names = MergeTreeData::getMinMaxColumnsNames(metadata_snapshot->getPartitionKey());
+
     if (use_skip_indexes && settings[Setting::force_data_skipping_indices].changed)
     {
         const auto & indices_str = settings[Setting::force_data_skipping_indices].toString();
@@ -1004,6 +1010,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                             index_and_condition.condition,
                             key_condition_rpn_template,
                             ranges.data_part,
+                            partition_minmax_column_names,
                             ranges.ranges,
                             ranges.read_hints,
                             reader_settings,
@@ -1910,11 +1917,70 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     return res;
 }
 
+namespace
+{
+
+/// If the given skip index is a minmax index, all its columns appear in the part's
+/// partition key, and the provided condition is proved true on the part's partition-level
+/// minmax hyperrectangle, returns `true`: every granule inside the part passes this index,
+/// so granule-level evaluation can be skipped.
+///
+/// Compatible with `use_skip_indexes_for_disjunctions`. The shortcut's firing precondition
+/// (`can_be_false = false` on the part, with other-index columns treated as UNKNOWN) is
+/// already strong enough to guarantee the full WHERE predicate holds on every point of
+/// every granule: UNKNOWN's `cf = true` forces `cf = true` at every position in the RPN
+/// that is reachable via AND, so the only way the overall RPN can have `cf = false` is
+/// via my-leaves whose values don't depend on other columns. The disjunction merge is a
+/// monotone, sound over-approximation of the predicate, so it evaluates to `true` on
+/// every such granule regardless of whether this index's bitset slots are populated by
+/// per-granule evaluation or left at the `true` default.
+bool trySkipGranuleIndexByPartMinMax(
+    const MergeTreeIndexPtr & index_helper,
+    const MergeTreeIndexConditionPtr & condition,
+    const MergeTreeData::DataPartPtr & part,
+    const Names & partition_minmax_column_names)
+{
+    if (partition_minmax_column_names.empty())
+        return false;
+
+    const auto * minmax_condition = typeid_cast<const MergeTreeIndexConditionMinMax *>(condition.get());
+    if (!minmax_condition)
+        return false;
+
+    if (!part->minmax_idx || !part->minmax_idx->initialized)
+        return false;
+
+    const auto & part_hyperrectangle = part->minmax_idx->hyperrectangle;
+    if (part_hyperrectangle.size() != partition_minmax_column_names.size())
+        return false;
+
+    /// Project the part's partition-level minmax onto the skip-index's columns. If the skip
+    /// index is defined over an expression (e.g. `toStartOfDay(t)`) rather than a raw column,
+    /// `index.column_names` will contain the expression's output name, which is not in the
+    /// partition-key minmax column list, and this lookup fails. That's correct: the
+    /// short-circuit requires the skip-index column to be a partition-key input.
+    const auto & index_column_names = index_helper->index.column_names;
+    std::vector<Range> projected;
+    projected.reserve(index_column_names.size());
+    for (const auto & name : index_column_names)
+    {
+        auto it = std::find(partition_minmax_column_names.begin(), partition_minmax_column_names.end(), name);
+        if (it == partition_minmax_column_names.end())
+            return false;
+        projected.push_back(part_hyperrectangle[it - partition_minmax_column_names.begin()]);
+    }
+
+    return minmax_condition->isProvedTrueOn(projected);
+}
+
+}
+
 std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::filterMarksUsingIndex(
     MergeTreeIndexPtr index_helper,
     MergeTreeIndexConditionPtr condition,
     const std::optional<KeyCondition> & key_condition_rpn_template,
     MergeTreeData::DataPartPtr part,
+    const Names & partition_minmax_column_names,
     const MarkRanges & ranges,
     const RangesInDataPartReadHints & in_read_hints,
     const MergeTreeReaderSettings & reader_settings,
@@ -1925,6 +1991,18 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
     PartialDisjunctionResult & partial_disjunction_result,
     LoggerPtr log)
 {
+    /// If the part's partition-level minmax already proves the condition on the whole part,
+    /// every sub-granule must also pass. Return the input ranges unchanged and skip opening
+    /// the skip index entirely.
+    if (reader_settings.use_part_minmax_to_skip_granule_index
+        && trySkipGranuleIndexByPartMinMax(index_helper, condition, part, partition_minmax_column_names))
+    {
+        ProfileEvents::increment(ProfileEvents::PartMinMaxSkipsGranuleIndex);
+        LOG_TRACE(log, "Part-level minmax on part {} proves the condition for index {}; skipping granule evaluation.",
+            part->name, backQuote(index_helper->index.name));
+        return {ranges, in_read_hints};
+    }
+
     if (!index_helper->getDeserializedFormat(part->checksums, index_helper->getFileName()))
     {
         LOG_DEBUG(log, "File for index {} does not exist ({}.*). Skipping it.", backQuote(index_helper->index.name),

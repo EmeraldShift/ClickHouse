@@ -3476,6 +3476,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, cons
                 applicable_skip_indexes,
                 indexes->key_condition_rpn_template,
                 indexes->use_skip_indexes_for_disjunctions,
+                MergeTreeData::getMinMaxColumnsNames(storage_snapshot->metadata->getPartitionKey()),
                 context->getIndexMarkCache(),
                 context->getIndexUncompressedCache(),
                 context->getVectorSimilarityIndexCache(),

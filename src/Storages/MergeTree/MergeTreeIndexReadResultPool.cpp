@@ -28,6 +28,7 @@ MergeTreeSkipIndexReader::MergeTreeSkipIndexReader(
     UsefulSkipIndexes skip_indexes_,
     std::optional<KeyCondition> & key_condition_rpn_template_,
     bool use_for_disjunctions_,
+    Names partition_minmax_column_names_,
     MarkCachePtr mark_cache_,
     UncompressedCachePtr uncompressed_cache_,
     VectorSimilarityIndexCachePtr vector_similarity_index_cache_,
@@ -36,6 +37,7 @@ MergeTreeSkipIndexReader::MergeTreeSkipIndexReader(
     : skip_indexes(std::move(skip_indexes_))
     , key_condition_rpn_template(key_condition_rpn_template_)
     , use_for_disjunctions(use_for_disjunctions_)
+    , partition_minmax_column_names(std::move(partition_minmax_column_names_))
     , mark_cache(std::move(mark_cache_))
     , uncompressed_cache(std::move(uncompressed_cache_))
     , vector_similarity_index_cache(std::move(vector_similarity_index_cache_))
@@ -71,6 +73,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(const RangesInDataPart & p
             index_and_condition.condition,
             key_condition_rpn_template,
             part.data_part,
+            partition_minmax_column_names,
             ranges,
             part.read_hints,
             reader_settings,

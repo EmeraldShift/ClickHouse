@@ -31,6 +31,7 @@ namespace Setting
     extern const SettingsBool merge_tree_use_prefixes_deserialization_thread_pool;
     extern const SettingsUInt64 filesystem_prefetches_limit;
     extern const SettingsBool secondary_indices_enable_bulk_filtering;
+    extern const SettingsBool use_part_minmax_to_skip_granule_index;
     extern const SettingsUInt64 merge_tree_min_bytes_for_seek;
     extern const SettingsUInt64 merge_tree_min_rows_for_seek;
 }
@@ -119,6 +120,7 @@ MergeTreeReaderSettings MergeTreeReaderSettings::createFromContext(const Context
     result.use_deserialization_prefixes_cache = settings[Setting::merge_tree_use_deserialization_prefixes_cache];
     result.use_prefixes_deserialization_thread_pool = settings[Setting::merge_tree_use_prefixes_deserialization_thread_pool];
     result.secondary_indices_enable_bulk_filtering = settings[Setting::secondary_indices_enable_bulk_filtering];
+    result.use_part_minmax_to_skip_granule_index = settings[Setting::use_part_minmax_to_skip_granule_index];
     result.merge_tree_min_bytes_for_seek = settings[Setting::merge_tree_min_bytes_for_seek];
     result.merge_tree_min_rows_for_seek = settings[Setting::merge_tree_min_rows_for_seek];
     result.filesystem_prefetches_limit = settings[Setting::filesystem_prefetches_limit];

@@ -1883,6 +1883,18 @@ SELECT * FROM data_01515 WHERE d1 = 0 AND assumeNotNull(d1_null) = 0 SETTINGS fo
     DECLARE(Bool, secondary_indices_enable_bulk_filtering, true, R"(
 Enable the bulk filtering algorithm for indices. It is expected to be always better, but we have this setting for compatibility and control.
 )", 0) \
+    DECLARE(Bool, use_part_minmax_to_skip_granule_index, false, R"(
+Skip granule-level evaluation of a `minmax` skip index when the part's partition range already proves the `WHERE` condition holds on the whole part.
+
+Applies to `minmax` skip indexes whose columns are all inputs of the partition key (each part tracks its min/max of those columns already). When the predicate is proved true over that partition-level range, every granule inside the part trivially satisfies it, so the per-granule skip index file is not opened for the part.
+
+Composes with [use_skip_indexes_for_disjunctions](#use_skip_indexes_for_disjunctions). The shortcut's firing precondition (the predicate is proved true on the part's partition range, with non-partition columns treated as unknown) is already strong enough to guarantee the full `WHERE` predicate holds on every row of the part, so the disjunction-merge result is unchanged whether this index's per-granule bitset slots are populated or left at the default.
+
+Possible values:
+
+- 0 — Disabled.
+- 1 — Enabled.
+)", 0) \
     DECLARE(Float, max_streams_to_max_threads_ratio, 1, R"(
 Allows you to use more sources than the number of threads - to more evenly distribute work across threads. It is assumed that this is a temporary solution since it will be possible in the future to make the number of sources equal to the number of threads, but for each source to dynamically select available work for itself.
 )", 0) \

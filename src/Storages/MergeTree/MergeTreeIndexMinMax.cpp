@@ -209,6 +209,18 @@ std::string MergeTreeIndexConditionMinMax::getDescription() const
     return condition.getDescription().condition;
 }
 
+bool MergeTreeIndexConditionMinMax::isProvedTrueOn(const std::vector<Range> & hyperrectangle) const
+{
+    if (hyperrectangle.size() != index_data_types.size())
+        return false;
+    /// If the condition is relaxed on any RPN element (e.g. `match(...)`), `checkInHyperrectangle`
+    /// conservatively forces `can_be_false = true` on that element. That means this function will
+    /// correctly refuse the short-circuit for relaxed conditions, which is what we want: a relaxed
+    /// predicate may overcount but must not undercount, so we must not declare "all granules pass"
+    /// based on it.
+    return !condition.checkInHyperrectangle(hyperrectangle, index_data_types, {}, {}).can_be_false;
+}
+
 MergeTreeIndexGranulePtr MergeTreeIndexMinMax::createIndexGranule() const
 {
     return std::make_shared<MergeTreeIndexGranuleMinMax>(index.name, index.sample_block);
