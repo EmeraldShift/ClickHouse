@@ -4,6 +4,7 @@
 
 #include <Common/typeid_cast.h>
 
+#include <Common/CurrentThread.h>
 #include <Interpreters/getColumnFromBlock.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Interpreters/InterpreterSelectQuery.h>
@@ -73,10 +74,14 @@ protected:
         if (initializer_func)
         {
             if (materialized_cte && !materialized_cte->is_built)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "Reading from materialized CTE '{}' before it has been materialized (materialization was planned: {})",
-                    materialized_cte->cte_name,
-                    materialized_cte->is_materialization_planned.load());
+            {
+                auto context = CurrentThread::tryGetQueryContext();
+                if (!context)
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "Reading from materialized CTE '{}' without a current query context",
+                        materialized_cte->cte_name);
+                materialized_cte->buildIfNeeded(context);
+            }
 
             initializer_func(data);
             initializer_func = {};
