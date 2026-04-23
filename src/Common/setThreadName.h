@@ -81,6 +81,7 @@ namespace DB
     M(KAFKA_MAIN, "KafkaMain") \
     M(LOAD_MARKS, "LoadMarksThread") \
     M(LOCAL_SERVER_PTY, "LocalServerPty") \
+    M(MATERIALIZE_CTE, "MaterializeCTE") \
     M(MEMORY_WORKER, "MemoryWorker") \
     M(MERGE_MUTATE, "MergeMutate") \
     M(MERGETREE_COMMON, "Common") \

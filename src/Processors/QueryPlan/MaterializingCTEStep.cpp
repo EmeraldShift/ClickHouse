@@ -1,5 +1,6 @@
 #include <Processors/QueryPlan/MaterializingCTEStep.h>
 
+#include <Interpreters/MaterializedCTE.h>
 #include <Processors/QueryPlan/ITransformingStep.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <QueryPipeline/QueryPipelineBuilder.h>
@@ -153,12 +154,23 @@ std::vector<std::unique_ptr<QueryPlan>> DelayedMaterializingCTEsStep::makePlansF
             continue;
         }
 
-        /// buildInplace uses the builder installed on the MaterializedCTE's
-        /// future (MaterializedCTE::MaterializedCTE): optimize + build +
-        /// CompletedPipelineExecutor::execute, returning the populated
-        /// storage. On failure the future transitions to State::Failed and
-        /// the exception propagates back to this caller.
-        materialized_cte->future->buildInplace(optimization_settings.query_context);
+        /// Dispatch the build onto the global thread pool so it can run
+        /// concurrently with the rest of plan optimization and pipeline
+        /// construction. Readers (MemorySource::generate) barrier on the
+        /// future via buildInplace, so correctness is preserved even if
+        /// a reader wins the NotStarted → Building race against the
+        /// pool worker: worst case the reader builds it itself on the
+        /// reader thread, equivalent to running the build synchronously
+        /// on the optimizer thread.
+        ///
+        /// getOrScheduleBuild is a no-op fast path when the future is
+        /// already Built (e.g. an earlier makePlansForCTEs invocation
+        /// for a shared CTE already dispatched it). The atomic state
+        /// transition guarantees exactly-one build.
+        ///
+        materialized_cte->future->getOrScheduleBuild(
+            optimization_settings.query_context,
+            makeMaterializeCTEScheduler());
     }
     return plans;
 }

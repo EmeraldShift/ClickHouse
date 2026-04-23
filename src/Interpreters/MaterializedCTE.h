@@ -252,4 +252,13 @@ private:
     EventFD readiness_event_fd;
 };
 
+/// Returns a scheduler suitable for `FutureMaterializedCTE::getOrScheduleBuild`
+/// that dispatches jobs onto the global thread pool and re-attaches each
+/// job to the caller's current `ThreadGroup`. The thread group is captured
+/// at the call site, so the CTE build runs with the originating query's
+/// `MemoryTracker`, cancellation flag, and profile events rather than the
+/// pool worker's defaults. Use this from any pipeline / planner path that
+/// wants async CTE dispatch.
+FutureMaterializedCTE::Scheduler makeMaterializeCTEScheduler();
+
 }

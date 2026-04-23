@@ -1,6 +1,10 @@
 #include <Interpreters/MaterializedCTE.h>
 
+#include <Common/CurrentThread.h>
 #include <Common/Exception.h>
+#include <Common/ThreadPool.h>
+#include <Common/ThreadStatus.h>
+#include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
 #include <Core/Block.h>
 #include <Interpreters/Context.h>
@@ -299,6 +303,26 @@ int FutureMaterializedCTE::getReadinessFd() const noexcept
 #else
     return -1;
 #endif
+}
+
+FutureMaterializedCTE::Scheduler makeMaterializeCTEScheduler()
+{
+    /// The thread group is captured at *call time* (i.e. off the thread that
+    /// called `makeMaterializeCTEScheduler`), and every job dispatched through
+    /// the returned scheduler reuses that snapshot. This is correct when the
+    /// scheduler is built and used inside the same query (the current call
+    /// sites, in the optimizer and the reader path, both do this). Do not
+    /// cache the returned scheduler and hand it to callers on unrelated
+    /// threads — they would attach the wrong group.
+    return [thread_group = CurrentThread::getGroup()](std::function<void()> outer_job)
+    {
+        GlobalThreadPool::instance().scheduleOrThrow(
+            [thread_group, job = std::move(outer_job)]()
+            {
+                ThreadGroupSwitcher switcher(thread_group, ThreadName::MATERIALIZE_CTE);
+                job();
+            });
+    };
 }
 
 }

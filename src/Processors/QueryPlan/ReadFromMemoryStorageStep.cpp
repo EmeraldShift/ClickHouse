@@ -5,8 +5,14 @@
 #include <Common/typeid_cast.h>
 
 #include <Common/CurrentThread.h>
+#include <Common/ErrnoException.h>
 
 #include <base/defines.h>
+
+#if defined(OS_LINUX)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <Interpreters/getColumnFromBlock.h>
 #include <Interpreters/inplaceBlockConversions.h>
@@ -34,6 +40,7 @@ namespace ErrorCodes
 {
 
 extern const int LOGICAL_ERROR;
+extern const int CANNOT_FCNTL;
 
 }
 
@@ -70,6 +77,105 @@ public:
     }
 
     String getName() const override { return "Memory"; }
+
+#if defined(OS_LINUX)
+    ~MemorySource() override
+    {
+        if (readiness_fd_dup >= 0)
+            ::close(readiness_fd_dup);
+    }
+#endif
+
+    /// If a materialized CTE is attached and its future hasn't reached a
+    /// terminal state (Built / Failed), return Status::Async and expose the
+    /// CTE's readiness eventfd via schedule(). The executor reclaims the
+    /// worker, polls the fd, and re-invokes prepare() when the build
+    /// completes. Keeps reader workers fully available for unrelated work
+    /// instead of blocking on `shared_future::get()` inside generate().
+    ///
+    /// Non-Linux: skipped; generate()'s buildInplace barrier (inside the
+    /// initializer_func path) remains the fallback wait mechanism.
+    Status prepare() override
+    {
+        /// Run the base prepare first so that cancellation, downstream
+        /// close (output finished), and any buffered-chunk state are
+        /// resolved before we consider blocking on the CTE future. We
+        /// only intercept when the base says "ready to generate" —
+        /// any other status (Finished, PortFull, NeedData, Async) is
+        /// the correct answer already.
+        Status status = ISource::prepare();
+        if (status != Status::Ready)
+            return status;
+
+#if defined(OS_LINUX)
+        if (materialized_cte && materialized_cte->future)
+        {
+            const auto s = materialized_cte->future->getState();
+            if (s == FutureMaterializedCTE::State::NotStarted)
+            {
+                /// Safety net: the owning
+                /// `DelayedMaterializingCTEsStep::makePlansForCTEs`
+                /// already dispatches the build via getOrScheduleBuild
+                /// on the global pool, so state == NotStarted here is
+                /// not expected. Dispatch defensively anyway so the
+                /// reader does not deadlock if some future path forgets
+                /// to — the fd will fire once the job lands.
+                ///
+                /// Capture the thread group so the CTE build runs with
+                /// this query's MemoryTracker / cancellation flag /
+                /// ProfileEvents, not the pool worker's.
+                materialized_cte->future->getOrScheduleBuild(
+                    CurrentThread::tryGetQueryContext(),
+                    makeMaterializeCTEScheduler());
+                return Status::Async;
+            }
+            if (s == FutureMaterializedCTE::State::Building)
+                return Status::Async;
+            /// Built or Failed: fall through. generate()'s buildInplace
+            /// call is a fast no-op on Built; on Failed it rethrows the
+            /// builder's exception via shared_future::get(), surfacing
+            /// the error to the pipeline correctly.
+        }
+#endif
+
+        return status;
+    }
+
+    int schedule() override
+    {
+#if defined(OS_LINUX)
+        /// Multiple MemorySources read from the same MaterializedCTE and
+        /// therefore from the same FutureMaterializedCTE, so handing back
+        /// the raw readiness fd would make the pipeline executor try to
+        /// `epoll_ctl(ADD)` one fd multiple times — second call errors
+        /// with EEXIST. Give each source its own `dup(2)` of the
+        /// underlying eventfd: distinct fd numbers (so epoll is happy),
+        /// shared underlying state (so they all wake when the build
+        /// signals). We never `read()` the counter, so all dups stay
+        /// readable after the first signal; that's fine because each
+        /// processor's prepare() falls through to the normal ISource
+        /// path once it observes Built / Failed.
+        if (readiness_fd_dup < 0 && materialized_cte && materialized_cte->future)
+        {
+            int src = materialized_cte->future->getReadinessFd();
+            if (src >= 0)
+            {
+                readiness_fd_dup = ::dup(src);
+                if (readiness_fd_dup < 0)
+                    throw ErrnoException(
+                        ErrorCodes::CANNOT_FCNTL,
+                        "Cannot dup materialized-CTE readiness fd for pipeline source");
+                if (::fcntl(readiness_fd_dup, F_SETFD, FD_CLOEXEC) < 0)
+                    throw ErrnoException(
+                        ErrorCodes::CANNOT_FCNTL,
+                        "Cannot set FD_CLOEXEC on duped materialized-CTE readiness fd");
+            }
+        }
+        return readiness_fd_dup;
+#else
+        return -1;
+#endif
+    }
 
 protected:
     Chunk generate() override
@@ -165,6 +271,12 @@ private:
     std::shared_ptr<std::atomic<size_t>> parallel_execution_index;
     InitializerFunc initializer_func;
     MaterializedCTEPtr materialized_cte;
+#if defined(OS_LINUX)
+    /// Per-source `dup(2)` of the CTE future's readiness eventfd, lazily
+    /// initialized in schedule(). -1 until first schedule() call. Closed
+    /// in the destructor.
+    int readiness_fd_dup = -1;
+#endif
 };
 
 ReadFromMemoryStorageStep::ReadFromMemoryStorageStep(
