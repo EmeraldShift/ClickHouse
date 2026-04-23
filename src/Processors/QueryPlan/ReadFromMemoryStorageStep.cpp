@@ -4,6 +4,10 @@
 
 #include <Common/typeid_cast.h>
 
+#include <Common/CurrentThread.h>
+
+#include <base/defines.h>
+
 #include <Interpreters/getColumnFromBlock.h>
 #include <Interpreters/inplaceBlockConversions.h>
 #include <Interpreters/InterpreterSelectQuery.h>
@@ -72,11 +76,34 @@ protected:
     {
         if (initializer_func)
         {
-            if (materialized_cte && !materialized_cte->future->isBuilt())
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "Reading from materialized CTE '{}' before it has been materialized (materialization was planned: {})",
-                    materialized_cte->cte_name,
-                    materialized_cte->is_materialization_planned.load());
+            if (materialized_cte)
+            {
+                /// Barrier on the CTE's materialization future. The
+                /// first reader to hit this call site either finds the
+                /// build already complete (fast path: atomic load, no
+                /// wait), waits on an in-flight build, or — if nothing
+                /// has driven the build yet — kicks it off synchronously
+                /// via the installed builder. If the build failed, the
+                /// builder's exception propagates through
+                /// `shared_future::get()` and surfaces here.
+                ///
+                /// This replaces the pre-refactor "throw if not built"
+                /// gate: correctness is now a property of the future
+                /// barrier rather than of plan-tree placement. Main-
+                /// pipeline readers that race ahead of an async-
+                /// scheduled CTE build simply wait here; under the
+                /// synchronous `makePlansForCTEs` path, the barrier is a
+                /// no-op because the build has already completed during
+                /// plan optimization.
+                ///
+                /// `MaterializedCTE::create` is the only construction
+                /// path and it always installs a future, so the handle
+                /// is non-null by invariant; the chassert catches any
+                /// violation in debug builds.
+                chassert(materialized_cte->future);
+                if (!materialized_cte->future->isBuilt())
+                    materialized_cte->future->buildInplace(CurrentThread::tryGetQueryContext());
+            }
 
             initializer_func(data);
             initializer_func = {};

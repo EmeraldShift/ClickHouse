@@ -114,13 +114,51 @@ std::vector<std::unique_ptr<QueryPlan>> DelayedMaterializingCTEsStep::makePlansF
     const QueryPlanOptimizationSettings & optimization_settings)
 {
     std::vector<std::unique_ptr<QueryPlan>> plans;
+
+    /// Correctness of CTE visibility comes from the future barrier on
+    /// each MaterializedCTE rather than from the plan-tree placement of
+    /// MaterializingCTEsStep. Any consumer that sees an unbuilt CTE —
+    /// including eager optimizer-time consumers fired from the same
+    /// `plan.optimize()` call (KeyCondition → buildOrderedSetInplace,
+    /// DelayedCreatingSetsStep::makePlansForSets, evaluateScalarSubqueryIfNeeded)
+    /// — must find the CTE's storage populated. Synchronously run
+    /// each claimed CTE's build here, at the top of plan optimization,
+    /// so the build completes before any sub-pipeline fires.
+    ///
+    /// For EXPLAIN and for deserialized plans without a captured
+    /// query_context, keep the plan-return shape (wire the CTE plan into
+    /// the outer tree for later execution) so EXPLAIN PLAN remains
+    /// side-effect-free.
+    const bool can_build_inplace = !optimization_settings.is_explain
+        && optimization_settings.query_context != nullptr;
+
     for (auto & materialized_cte : step.ctes)
     {
-        if (materialized_cte->is_materialization_planned.exchange(true))
+        if (!can_build_inplace)
+        {
+            /// EXPLAIN / remote-deserialized path: keep the legacy
+            /// plan-return shape — optimize here, hand the plan off to
+            /// the outer tree for side-effect-free rendering.
+            ///
+            /// Dedup: a CTE may appear in several DelayedMaterializing
+            /// CTEsSteps (e.g. in force_materialize_cte sub-planner
+            /// scenarios). After the first emission through this branch,
+            /// `materialized_cte->plan` has been moved out and is null.
+            /// Subsequent calls skip, which replaces the old
+            /// `is_materialization_planned.exchange(true)` guard.
+            if (!materialized_cte->plan)
+                continue;
+            materialized_cte->plan->optimize(optimization_settings);
+            plans.emplace_back(std::move(materialized_cte->plan));
             continue;
+        }
 
-        materialized_cte->plan->optimize(optimization_settings);
-        plans.emplace_back(std::move(materialized_cte->plan));
+        /// buildInplace uses the builder installed on the MaterializedCTE's
+        /// future (MaterializedCTE::MaterializedCTE): optimize + build +
+        /// CompletedPipelineExecutor::execute, returning the populated
+        /// storage. On failure the future transitions to State::Failed and
+        /// the exception propagates back to this caller.
+        materialized_cte->future->buildInplace(optimization_settings.query_context);
     }
     return plans;
 }

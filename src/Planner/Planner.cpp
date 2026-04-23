@@ -1607,22 +1607,25 @@ void addBuildSubqueriesForMaterializedCTEsIfNeeded(
     // │            │                           │                │
     // └────────────┘                           └────────────────┘
     //
-    // The CTEs are added as DelayedMaterializingCTEsStep nodes — one per level — so that
-    // resolveMaterializingCTEs can skip already-materialized CTEs. This is important when
-    // buildOrderedSetInplace runs a subquery plan that contains CTEs: by the time the main
-    // plan's resolveMaterializingCTEs fires, is_planned is already true for those CTEs
-    // so they won't be materialized a second time.
+    // All CTEs — regardless of level — are attached as a single
+    // DelayedMaterializingCTEsStep at the plan root. Correctness is
+    // owned by the FutureMaterializedCTE barrier at read time, not by
+    // plan-tree structure, so per-level nesting is unnecessary. The per-level loop that used to stack one
+    // step per level (deepest wrapping shallowest) is collapsed here to
+    // a single emission.
     //
-    // The level structure is preserved: for each level we push one DelayedMaterializingCTEsStep
-    // on top of the current plan, wrapping it the same way the old eager approach did with
-    // MaterializingCTEsStep. resolveMaterializingCTEs processes nodes post-order, so the inner
-    // (lower-level) step is resolved before the outer one, guaranteeing that a CTE at level N
-    // is always materialized before the CTE at level N-1 that depends on it.
+    // Dependency ordering (deeper CTEs build before shallower ones that
+    // reference them) is still enforced, but implicitly: a shallower
+    // CTE's build pipeline contains readers that barrier on the deeper
+    // CTE's future, so the pool-dispatched shallower build simply waits
+    // for the deeper one if it hasn't finished yet. No plan-tree
+    // topology required.
+    std::vector<MaterializedCTEPtr> all_ctes;
+    for (const auto & cte_level : materialized_ctes)
+        all_ctes.reserve(all_ctes.size() + cte_level.size());
+
     for (const auto & cte_level : materialized_ctes)
     {
-        std::vector<MaterializedCTEPtr> ctes;
-        ctes.reserve(cte_level.size());
-
         for (const auto & cte_node : cte_level)
         {
             auto * cte_table_node = cte_node->as<TableNode>();
@@ -1652,14 +1655,17 @@ void addBuildSubqueriesForMaterializedCTEsIfNeeded(
                 materialized_cte->plan = std::make_unique<QueryPlan>(std::move(cte_plan));
             }
 
-            ctes.push_back(materialized_cte);
+            all_ctes.push_back(materialized_cte);
         }
-
-        auto delayed_step = std::make_unique<DelayedMaterializingCTEsStep>(
-            query_plan.getCurrentHeader(),
-            std::move(ctes));
-        query_plan.addStep(std::move(delayed_step));
     }
+
+    if (all_ctes.empty())
+        return;
+
+    auto delayed_step = std::make_unique<DelayedMaterializingCTEsStep>(
+        query_plan.getCurrentHeader(),
+        std::move(all_ctes));
+    query_plan.addStep(std::move(delayed_step));
 }
 
 /// Support for `additional_result_filter` setting
@@ -1886,15 +1892,18 @@ void Planner::buildPlanForUnionNode()
         query_plan.addStep(std::move(distinct_step));
     }
 
-    /// Each child of the UNION/INTERSECT/EXCEPT may independently add a DelayedMaterializingCTEsStep
-    /// for the same CTE. During optimization only one child wins the atomic is_materialization_planned
-    /// flag, leaving the other children without CTE materialization. Because IntersectOrExceptStep
-    /// runs all children concurrently, the losing child may read from the CTE StorageMemory before the
-    /// winning child has finished materializing it.
+    /// UNION / INTERSECT / EXCEPT children are planned recursively as
+    /// subqueries, and `collectMaterializedCTEs` bails out early with an
+    /// empty result for subqueries. So the CTE registration and the
+    /// DelayedMaterializingCTEsStep emission happen here, at the
+    /// UNION-level plan build, as the canonical (and only) emission
+    /// point for the whole query.
     ///
-    /// Fix: add a DelayedMaterializingCTEsStep at the UNION level so that resolveMaterializingCTEs
-    /// (which walks pre-order) claims the CTE here first, ensuring materialization completes before
-    /// any child starts reading.
+    /// Concurrency among children is not a correctness concern: the
+    /// reader-side barrier on `FutureMaterializedCTE` (see
+    /// MemorySource::generate) makes tree shape irrelevant. Readers
+    /// wait on the same future regardless of which branch "planned"
+    /// the build.
     if (!select_query_options.only_analyze)
     {
         auto materialized_ctes = collectMaterializedCTEs(query_tree, select_query_options);

@@ -73,8 +73,6 @@ public:
     const std::string temporary_table_name;
     /// Query Plan for the CTE
     std::unique_ptr<QueryPlan> plan = {};
-    /// If true, query plan is built for the CTE (i.e. the table is being populated, but is not ready for reads yet).
-    std::atomic_bool is_materialization_planned{false};
     /// Future-barrier handle. Canonical source of truth for the CTE's
     /// build state. Readers and planners drive or query the build via
     /// `tryGet` / `isBuilt` / `buildInplace` / `getOrScheduleBuild`.
