@@ -1,10 +1,19 @@
 #include <Interpreters/MaterializedCTE.h>
 
+#include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 #include <Processors/QueryPlan/QueryPlan.h>
+#include <Storages/IStorage.h>
+
+#include <utility>
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
 
 MaterializedCTE::MaterializedCTE(const std::string & cte_name_)
     : cte_name(cte_name_)
@@ -12,5 +21,191 @@ MaterializedCTE::MaterializedCTE(const std::string & cte_name_)
 {}
 
 MaterializedCTE::~MaterializedCTE() noexcept = default;
+
+FutureMaterializedCTE::FutureMaterializedCTE(std::string cte_name_, Builder builder_)
+    : cte_name(std::move(cte_name_))
+    , builder(std::move(builder_))
+    , build_future(build_promise.get_future().share())
+{
+}
+
+StoragePtr FutureMaterializedCTE::buildInplace(const ContextPtr & context)
+{
+    if (!builder)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "FutureMaterializedCTE::buildInplace called on '{}' without a builder", cte_name);
+
+    bool must_build = false;
+    std::shared_future<StoragePtr> future_copy;
+
+    {
+        std::lock_guard lock(mutex);
+
+        const auto current_state = state.load(std::memory_order_relaxed);
+        future_copy = build_future;
+
+        if (current_state == State::NotStarted)
+        {
+            state.store(State::Building, std::memory_order_relaxed);
+            must_build = true;
+        }
+    }
+
+    if (must_build)
+        runBuildAndFulfillPromise(context);
+
+    /// Rethrows the builder's exception for every waiter if the build failed.
+    return future_copy.get();
+}
+
+std::shared_future<StoragePtr> FutureMaterializedCTE::getOrScheduleBuild(
+    const ContextPtr & context,
+    const Scheduler & scheduler)
+{
+    if (!builder)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "FutureMaterializedCTE::getOrScheduleBuild called on '{}' without a builder", cte_name);
+    if (!scheduler)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "FutureMaterializedCTE::getOrScheduleBuild called with null scheduler");
+
+    bool must_schedule = false;
+    std::shared_future<StoragePtr> future_copy;
+
+    {
+        std::lock_guard lock(mutex);
+
+        const auto current_state = state.load(std::memory_order_relaxed);
+        future_copy = build_future;
+
+        if (current_state == State::NotStarted)
+        {
+            state.store(State::Building, std::memory_order_relaxed);
+            must_schedule = true;
+        }
+    }
+
+    if (must_schedule)
+    {
+        /// Capture a weak_ptr rather than `this`. The scheduled job may be
+        /// queued for arbitrarily long; if the query is cancelled and every
+        /// owner of this future drops before the pool worker dequeues it,
+        /// the lock fails and the build silently no-ops. Any waiter on the
+        /// shared_future has been torn down along with its query, so
+        /// leaving the promise unfulfilled is correct.
+        ///
+        /// Enforce that the caller actually owns this through shared_ptr
+        /// (otherwise weak_from_this() returns empty, every pool worker
+        /// no-ops, and every reader barriers forever on an unfulfilled
+        /// promise). Use `MaterializedCTE::create` in production, or
+        /// `std::make_shared<FutureMaterializedCTE>(...)` in tests.
+        std::weak_ptr<FutureMaterializedCTE> weak_self = weak_from_this();
+        if (weak_self.expired())
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "FutureMaterializedCTE::getOrScheduleBuild called on a non-shared instance; "
+                "construct via std::make_shared so weak_from_this can track the owner");
+
+        auto ctx_copy = context;
+        scheduler([weak_self, ctx_copy]()
+        {
+            if (auto self = weak_self.lock())
+                self->runBuildAndFulfillPromise(ctx_copy);
+        });
+    }
+
+    return future_copy;
+}
+
+StoragePtr FutureMaterializedCTE::tryGet() const noexcept
+{
+    /// Release-acquire handshake with runBuildAndFulfillPromise: if we
+    /// observe Built, the builder's write to `storage` happens-before this
+    /// load, so it is safe to read `storage` without locking.
+    if (state.load(std::memory_order_acquire) != State::Built)
+        return nullptr;
+    return storage;
+}
+
+void FutureMaterializedCTE::markBuilt(StoragePtr storage_)
+{
+    {
+        std::lock_guard lock(mutex);
+        if (state.load(std::memory_order_relaxed) != State::NotStarted)
+            return;
+
+        storage = storage_;
+        /// Release store pairs with acquire loads in isBuilt/tryGet/getState.
+        state.store(State::Built, std::memory_order_release);
+    }
+    build_promise.set_value(std::move(storage_));
+    signalReadiness();
+}
+
+void FutureMaterializedCTE::markFailed(std::exception_ptr ex)
+{
+    if (!ex)
+        ex = std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
+            "FutureMaterializedCTE::markFailed called with null exception_ptr"));
+
+    {
+        std::lock_guard lock(mutex);
+        if (state.load(std::memory_order_relaxed) != State::NotStarted)
+            return;
+
+        state.store(State::Failed, std::memory_order_release);
+    }
+    build_promise.set_exception(std::move(ex));
+    signalReadiness();
+}
+
+void FutureMaterializedCTE::runBuildAndFulfillPromise(const ContextPtr & context)
+{
+    try
+    {
+        auto built = builder(context);
+
+        storage = built;
+        /// Release store: pairs with acquire loads in isBuilt / tryGet /
+        /// getState so readers see the populated `storage` once they observe
+        /// state == Built.
+        state.store(State::Built, std::memory_order_release);
+        build_promise.set_value(std::move(built));
+    }
+    catch (...)
+    {
+        state.store(State::Failed, std::memory_order_release);
+        build_promise.set_exception(std::current_exception());
+    }
+    signalReadiness();
+}
+
+void FutureMaterializedCTE::signalReadiness() noexcept
+{
+#if defined(OS_LINUX)
+    /// Wakes any reader polling the eventfd via Status::Async. Safe to call
+    /// under all terminal transitions; the fd is level-triggered and edge-
+    /// equivalent here because each FutureMaterializedCTE signals at most
+    /// once (Built and Failed are terminal, and only one transition can
+    /// reach this function). If the fd write fails we swallow the error
+    /// because by this point the promise is fulfilled and any blocking
+    /// waiter on shared_future::get() will unblock regardless.
+    ///
+    /// Nothing ever calls `read()` on the eventfd: each reader receives its
+    /// own `dup`'d fd (see `MemorySource::schedule`) and every reader's fd
+    /// needs to stay signaled so `epoll_wait` returns immediately once the
+    /// build is resolved. Because the fd is level-triggered, leaving the
+    /// value at 1 keeps all current and future dups primed.
+    [[maybe_unused]] bool ok = readiness_event_fd.write();
+#endif
+}
+
+int FutureMaterializedCTE::getReadinessFd() const noexcept
+{
+#if defined(OS_LINUX)
+    return readiness_event_fd.fd;
+#else
+    return -1;
+#endif
+}
 
 }
