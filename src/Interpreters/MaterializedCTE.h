@@ -24,14 +24,23 @@ using StoragePtr = std::shared_ptr<IStorage>;
 
 class QueryPlan;
 
-/// Owns a temporary Memory table used by a materialized CTE, and tracks whether
-/// the table has already been populated. The `is_built` flag is checked
-/// atomically in `MaterializingCTETransform` so that when the same CTE is
-/// referenced from multiple places (e.g. two IN-subqueries or an IN-subquery
-/// and the main plan), the table is written exactly once.
-struct MaterializedCTE
+class FutureMaterializedCTE;
+using FutureMaterializedCTEPtr = std::shared_ptr<FutureMaterializedCTE>;
+
+/// Owns a temporary Memory table used by a materialized CTE. Whether the
+/// table has been populated lives on `future` (see `FutureMaterializedCTE`);
+/// consumers call `future->isBuilt()` or barrier on the future directly.
+///
+/// Construction must go through `MaterializedCTE::create`. The factory
+/// installs a build pipeline on the future that is safe against the CTE
+/// being torn down while a scheduled build is still queued. The ctor is
+/// private so direct construction outside of `create` won't compile.
+struct MaterializedCTE : std::enable_shared_from_this<MaterializedCTE>
 {
-    explicit MaterializedCTE(const std::string & cte_name_);
+public:
+    /// Factory. Must be used in place of direct construction. Callers get
+    /// a shared_ptr with the future already wired to build this CTE.
+    static std::shared_ptr<MaterializedCTE> create(const std::string & cte_name_);
 
     MaterializedCTE(const MaterializedCTE &) = delete;
     MaterializedCTE & operator=(const MaterializedCTE &) = delete;
@@ -43,10 +52,10 @@ struct MaterializedCTE
         return storage != nullptr;
     }
 
-    bool hasPlanOrBuilt() const noexcept
-    {
-        return plan != nullptr || is_built;
-    }
+    /// True once the CTE has either been planned (so somebody will
+    /// build it) or already built. The planner uses this to skip CTEs
+    /// that don't need further work.
+    bool hasPlanOrBuilt() const noexcept;
 
     TemporaryTableHolder extractTableHolder()
     {
@@ -66,8 +75,15 @@ struct MaterializedCTE
     std::unique_ptr<QueryPlan> plan = {};
     /// If true, query plan is built for the CTE (i.e. the table is being populated, but is not ready for reads yet).
     std::atomic_bool is_materialization_planned{false};
-    /// If true, the CTE has been materialized (i.e. the table has been populated and is ready for reads).
-    std::atomic_bool is_built{false};
+    /// Future-barrier handle. Canonical source of truth for the CTE's
+    /// build state. Readers and planners drive or query the build via
+    /// `tryGet` / `isBuilt` / `buildInplace` / `getOrScheduleBuild`.
+    /// Installed by `create()`; non-null by invariant everywhere the CTE
+    /// has been constructed through the factory (which is the only path).
+    FutureMaterializedCTEPtr future;
+
+private:
+    explicit MaterializedCTE(const std::string & cte_name_);
 };
 
 using MaterializedCTEPtr = std::shared_ptr<MaterializedCTE>;
@@ -237,7 +253,5 @@ private:
     /// on non-Linux platforms (getReadinessFd returns -1 there).
     EventFD readiness_event_fd;
 };
-
-using FutureMaterializedCTEPtr = std::shared_ptr<FutureMaterializedCTE>;
 
 }

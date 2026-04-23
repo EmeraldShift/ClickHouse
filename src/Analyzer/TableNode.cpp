@@ -71,7 +71,7 @@ TableNode::TableNode(
             ColumnsDescription{NamesAndTypesList{{"_dummy", std::make_shared<DataTypeUInt8>()}}}),
         context_)
 {
-    materialized_cte = std::make_shared<MaterializedCTE>(cte_name_);
+    materialized_cte = MaterializedCTE::create(cte_name_);
     children[materialized_cte_subquery_index] = std::move(materialized_cte_subquery_);
     setTemporaryTableName(materialized_cte->temporary_table_name);
 }

@@ -2,7 +2,15 @@
 
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
+#include <Core/Block.h>
+#include <Interpreters/Context.h>
+#include <Processors/Executors/CompletedPipelineExecutor.h>
+#include <Processors/Port.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
 #include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/Sinks/EmptySink.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/IStorage.h>
 
 #include <utility>
@@ -15,12 +23,97 @@ namespace ErrorCodes
     extern const int LOGICAL_ERROR;
 }
 
+namespace
+{
+
+/// Runs `cte`'s pre-built QueryPlan on a fresh CompletedPipelineExecutor in
+/// the calling thread, then returns the populated storage. The
+/// `MaterializingCTETransform` inside the pipeline is what actually writes
+/// rows into `cte.storage` and (via its external-completion guard) leaves
+/// the future's promise alone because the FutureMaterializedCTE is already
+/// in State::Building — the caller (buildInplace) fulfills the promise with
+/// the return value of this function.
+///
+StoragePtr runMaterializationPipeline(MaterializedCTE & cte, const ContextPtr & context)
+{
+    if (!context)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Materialized CTE '{}' builder invoked without a context", cte.cte_name);
+    if (!cte.plan)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Materialized CTE '{}' has no plan to build", cte.cte_name);
+    if (!cte.storage)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Materialized CTE '{}' has no storage; finalizeMaterializedCTE must run first",
+            cte.cte_name);
+
+    QueryPlanOptimizationSettings optimization_settings(context);
+    /// buildQueryPipeline runs optimize() internally when do_optimize=true
+    /// (the default), so we don't call optimize() explicitly here.
+    auto pipeline_builder = cte.plan->buildQueryPipeline(
+        optimization_settings,
+        BuildQueryPipelineSettings(context));
+    auto pipeline = QueryPipelineBuilder::getPipeline(std::move(*pipeline_builder));
+    pipeline.complete(std::make_shared<EmptySink>(std::make_shared<const Block>(Block())));
+
+    CompletedPipelineExecutor executor(pipeline);
+    executor.execute();
+
+    /// Tripwire: the pipeline completing implies `MaterializingCTETransform::generate()`
+    /// ran and populated `cte.storage`. If a future refactor removes the transform from
+    /// this pipeline, this assert fires instead of silently returning an empty CTE.
+    chassert(cte.storage != nullptr);
+    return cte.storage;
+}
+
+}
+
 MaterializedCTE::MaterializedCTE(const std::string & cte_name_)
     : cte_name(cte_name_)
     , temporary_table_name(fmt::format("_materialized_cte_{}_{}", cte_name, thread_local_rng()))
-{}
+{
+    /// `future` is left null here and installed by `create()` after the
+    /// shared_ptr exists, so the builder can capture a weak_ptr to the
+    /// newly-constructed object. `create()` is the only caller that can
+    /// reach this private constructor, so no one ever observes a
+    /// MaterializedCTE with a null future in practice.
+}
+
+std::shared_ptr<MaterializedCTE> MaterializedCTE::create(const std::string & cte_name_)
+{
+    /// `new` rather than `std::make_shared` because the constructor is
+    /// private; `make_shared`'s internal allocator can't reach it. One
+    /// extra allocation per CTE, only at planning time.
+    std::shared_ptr<MaterializedCTE> self(new MaterializedCTE(cte_name_));
+
+    /// Weak-pointer capture: the builder may outlive the MaterializedCTE
+    /// in pathological scenarios (e.g. if a FutureMaterializedCTEPtr gets
+    /// stranded in a registry whose lifetime detaches from the query
+    /// tree). `weak.lock()` in that case returns empty and we surface a
+    /// clear error to the shared_future's waiters instead of use-after-
+    /// free'ing into a destroyed object.
+    std::weak_ptr<MaterializedCTE> weak_self = self;
+
+    self->future = std::make_shared<FutureMaterializedCTE>(
+        cte_name_,
+        [weak_self](const ContextPtr & ctx) -> StoragePtr
+        {
+            auto locked = weak_self.lock();
+            if (!locked)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "MaterializedCTE was destroyed before its materialization build could run");
+            return runMaterializationPipeline(*locked, ctx);
+        });
+
+    return self;
+}
 
 MaterializedCTE::~MaterializedCTE() noexcept = default;
+
+bool MaterializedCTE::hasPlanOrBuilt() const noexcept
+{
+    return plan != nullptr || (future && future->isBuilt());
+}
 
 FutureMaterializedCTE::FutureMaterializedCTE(std::string cte_name_, Builder builder_)
     : cte_name(std::move(cte_name_))

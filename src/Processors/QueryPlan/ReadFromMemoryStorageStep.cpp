@@ -72,7 +72,7 @@ protected:
     {
         if (initializer_func)
         {
-            if (materialized_cte && !materialized_cte->is_built)
+            if (materialized_cte && !materialized_cte->future->isBuilt())
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "Reading from materialized CTE '{}' before it has been materialized (materialization was planned: {})",
                     materialized_cte->cte_name,

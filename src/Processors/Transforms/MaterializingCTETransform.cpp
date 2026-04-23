@@ -3,18 +3,12 @@
 #include <Common/CurrentThread.h>
 #include <Common/logger_useful.h>
 #include <Common/Logger.h>
+#include <Interpreters/MaterializedCTE.h>
 #include <Processors/Port.h>
 #include <Storages/IStorage.h>
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-
-extern const int LOGICAL_ERROR;
-
-}
 
 MaterializingCTETransform::MaterializingCTETransform(
     const SharedHeader & input_header_,
@@ -58,8 +52,14 @@ Chunk MaterializingCTETransform::generate()
 
     LOG_DEBUG(getLogger("MaterializingCTETransform"), "Finished materializing CTE with name '{}'", materialized_cte->cte_name);
 
-    if (materialized_cte->is_built.exchange(true))
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CTE is already built");
+    /// Publish completion to the future-barrier. Idempotent: if the
+    /// transform is running inside a `buildInplace` pipeline the future
+    /// is already in State::Building and `markBuilt` no-ops; the builder's
+    /// own terminal transition fulfills the promise. If the transform is
+    /// the sole completion path (EXPLAIN, remote-deserialized plans that
+    /// execute the CTE plan as part of the outer pipeline), this is the
+    /// transition that unblocks any waiter on the future.
+    materialized_cte->future->markBuilt(materialized_cte->storage);
 
     return {};
 }
