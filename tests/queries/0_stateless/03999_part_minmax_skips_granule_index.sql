@@ -63,10 +63,10 @@ WHERE t >= '2024-01-15' AND t < '2024-03-15' AND match(toString(v), '^\d+$')
 SETTINGS use_part_minmax_to_skip_granule_index = 1, log_comment = '03999_part_minmax_skip_relaxed';
 
 -- Mixed-column conjunction: `(t range) AND (v predicate)`. idx_t's per-index RPN is
--- `t_range AND UNKNOWN(v)`; `UNKNOWN`'s `cf = T` poisons the AND to `cf = T`, so the
--- shortcut structurally can never fire here regardless of settings. This is not a
--- shortcoming of the gate — it's the correct behavior: the full predicate is not
--- proved true on the part without knowing `v`.
+-- `t_range AND UNKNOWN(v)`. The optimistic-UNKNOWN walker used by `isProvedTrueOn`
+-- treats UNKNOWN as the AND-identity, so the AND's `can_be_false` comes from
+-- `t_range` alone. When the part's t range proves `t_range` true, the shortcut fires.
+-- This captures the common observability shape `(time_range) AND (attribute predicate)`.
 SELECT count() FROM t_part_minmax_skip
 WHERE t >= '2024-01-15' AND t < '2024-03-15' AND v > 0
 SETTINGS use_part_minmax_to_skip_granule_index = 1,
@@ -115,9 +115,9 @@ SELECT 'relaxed fires = 0',
 FROM system.query_log
 WHERE log_comment = '03999_part_minmax_skip_relaxed' AND type = 'QueryFinish';
 
--- Mixed-column AND: shortcut structurally cannot fire.
-SELECT 'mixed-and fires = 0',
-    sum(ProfileEvents['PartMinMaxSkipsGranuleIndex'])
+-- Mixed-column AND: shortcut fires thanks to the optimistic-UNKNOWN walker.
+SELECT 'mixed-and fires >= 1',
+    sum(ProfileEvents['PartMinMaxSkipsGranuleIndex']) >= 1
 FROM system.query_log
 WHERE log_comment = '03999_part_minmax_skip_mixed_and' AND type = 'QueryFinish';
 

@@ -4376,12 +4376,34 @@ Ranges KeyCondition::extractBounds() const
     return std::move(bounds.ranges);
 }
 
+bool KeyCondition::hasFunctionNot() const
+{
+    return std::ranges::any_of(rpn, [](const RPNElement & e) { return e.function == RPNElement::FUNCTION_NOT; });
+}
+
 BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & hyperrectangle,
     const DataTypes & data_types,
     const ColumnIndexToBloomFilter & column_index_to_column_bf,
-    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn,
+    bool optimistic_unknowns) const
 {
+    /// `optimistic_unknowns` treats FUNCTION_UNKNOWN as the AND-identity `(true, false)`
+    /// instead of the neutral `(true, true)`. Under that rewrite UNKNOWN no longer pollutes
+    /// `can_be_false = true` through an AND, which lets callers prove "no point in this
+    /// hyperrectangle falsifies the RPN *assuming the unknown parts are always true*".
+    /// That stronger statement is sound for subsumption-style pruning questions where the
+    /// caller only cares whether per-granule evaluation would drop a granule: under the
+    /// real UNKNOWN = (true, true) evaluator, UNKNOWN contributes `ct = true` per granule
+    /// unconditionally, and "always true" captures that same domination through AND / OR.
+    ///
+    /// The rewrite is only sound when the RPN has no FUNCTION_NOT: NOT swaps `ct` and `cf`,
+    /// and flipping UNKNOWN's `cf` from true to false changes `NOT UNKNOWN` from
+    /// `(true, true)` to `(false, true)`, which *can* trigger unsound ct propagation in
+    /// enclosing AND / OR contexts. Callers must pre-check `hasFunctionNot()` before
+    /// opting in. After inversion push-down (`ActionsDAGWithInversionPushDown`) NOT is
+    /// pushed to leaves, so this is rarely a real constraint in practice.
+    chassert(!optimistic_unknowns || !hasFunctionNot());
     std::vector<BoolMask> rpn_stack;
 
     auto curve_type = [&](size_t key_column_pos)
@@ -4403,7 +4425,8 @@ BoolMask KeyCondition::checkInHyperrectangle(
         }
         else if (element.function == RPNElement::FUNCTION_UNKNOWN)
         {
-            rpn_stack.emplace_back(true, true);
+            /// See `optimistic_unknowns` at the top of this function.
+            rpn_stack.emplace_back(true, !optimistic_unknowns);
         }
         else if (element.function == RPNElement::FUNCTION_IN_RANGE
                  || element.function == RPNElement::FUNCTION_NOT_IN_RANGE)

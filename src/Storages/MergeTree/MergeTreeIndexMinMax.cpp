@@ -213,12 +213,27 @@ bool MergeTreeIndexConditionMinMax::isProvedTrueOn(const std::vector<Range> & hy
 {
     if (hyperrectangle.size() != index_data_types.size())
         return false;
-    /// If the condition is relaxed on any RPN element (e.g. `match(...)`), `checkInHyperrectangle`
-    /// conservatively forces `can_be_false = true` on that element. That means this function will
-    /// correctly refuse the short-circuit for relaxed conditions, which is what we want: a relaxed
-    /// predicate may overcount but must not undercount, so we must not declare "all granules pass"
-    /// based on it.
-    return !condition.checkInHyperrectangle(hyperrectangle, index_data_types, {}, {}).can_be_false;
+    /// Use the optimistic UNKNOWN walker (`UNKNOWN = (true, false)`) whenever the RPN has no
+    /// FUNCTION_NOT. That rewrite removes the `can_be_false = true` pollution that a
+    /// non-partition-key column's UNKNOWN otherwise propagates through AND, and lets the
+    /// shortcut fire on queries shaped like `(partition_column_range) AND (arbitrary predicates
+    /// on other columns)` — the common observability shape.
+    ///
+    /// Soundness: under the real per-granule evaluator UNKNOWN contributes `ct = true`
+    /// unconditionally, so per-granule `ct` depends only on this index's own leaves;
+    /// claiming "UNKNOWN is always true" gives the same per-granule `ct` result and thus the
+    /// same "would this index drop a granule?" answer that the conservative walker would
+    /// give on the pre-projection full predicate. The presence of FUNCTION_NOT would break
+    /// the monotonicity argument (NOT swaps ct/cf), so we fall back to the conservative
+    /// walker in that case. After inversion push-down FUNCTION_NOT is rare in practice.
+    ///
+    /// Relaxed RPN elements (e.g. `match(...)`) still force `can_be_false = true` at the
+    /// leaf level inside `checkInHyperrectangle`, so this function correctly refuses the
+    /// shortcut for relaxed conditions in both modes.
+    const bool optimistic_unknowns = !condition.hasFunctionNot();
+    return !condition
+                .checkInHyperrectangle(hyperrectangle, index_data_types, {}, {}, optimistic_unknowns)
+                .can_be_false;
 }
 
 MergeTreeIndexGranulePtr MergeTreeIndexMinMax::createIndexGranule() const
