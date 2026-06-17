@@ -1,0 +1,58 @@
+<test>
+    <create_query>
+        CREATE TABLE relaxed_key_condition_otel
+        (
+            service String,
+            timestamp DateTime64(3),
+            trace_id String,
+            span_count UInt32
+        )
+        ENGINE = MergeTree
+        ORDER BY (service, timestamp)
+        SETTINGS index_granularity = 8192
+    </create_query>
+
+    <fill_query>
+        INSERT INTO relaxed_key_condition_otel
+        SELECT
+            arrayElement(['apple/frontend', 'banana/database', 'banana/server', 'carrot/cache'], (number % 4) + 1) AS service,
+            toDateTime64('2026-01-01 00:00:00', 3) + intDiv(number, 4) / 1000,
+            hex(sipHash128(number)),
+            1
+        FROM numbers(100000000)
+    </fill_query>
+    <fill_query>OPTIMIZE TABLE relaxed_key_condition_otel FINAL</fill_query>
+
+    <create_query>
+        CREATE TABLE relaxed_key_condition_partitions
+        (
+            d Date,
+            n UInt64
+        )
+        ENGINE = MergeTree
+        PARTITION BY d
+        ORDER BY tuple()
+        SETTINGS index_granularity = 8192, add_minmax_index_for_numeric_columns = 0
+    </create_query>
+
+    <fill_query>INSERT INTO relaxed_key_condition_partitions SELECT toDate('2026-01-01') + (number % 10), number FROM numbers(100000000)</fill_query>
+
+    <query tag='service_in_exact_count' short='1'>
+        SELECT count()
+        FROM relaxed_key_condition_otel
+        WHERE service IN ('banana/database', 'banana/server')
+        FORMAT Null
+        SETTINGS optimize_trivial_count_query = 1, optimize_use_implicit_projections = 1, optimize_use_projections = 1, max_threads = 1
+    </query>
+
+    <query tag='partition_in_metadata_count' short='1'>
+        SELECT count()
+        FROM relaxed_key_condition_partitions
+        WHERE d IN ('2026-01-01', '2026-01-03')
+        FORMAT Null
+        SETTINGS optimize_trivial_count_query = 1, optimize_use_implicit_projections = 1, optimize_use_projections = 1, max_threads = 1
+    </query>
+
+    <drop_query>DROP TABLE IF EXISTS relaxed_key_condition_otel</drop_query>
+    <drop_query>DROP TABLE IF EXISTS relaxed_key_condition_partitions</drop_query>
+</test>

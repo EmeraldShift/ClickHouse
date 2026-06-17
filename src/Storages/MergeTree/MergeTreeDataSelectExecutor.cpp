@@ -1618,11 +1618,6 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
         return part_with_ranges.ranges;
 
-    /// If conditions are relaxed, don't fill exact ranges.
-    if (key_condition.legacyContainsRelaxedRPN() || (part_offset_condition && part_offset_condition->legacyContainsRelaxedRPN())
-        || (total_offset_condition && total_offset_condition->legacyContainsRelaxedRPN()))
-        exact_ranges = nullptr;
-
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     const auto & sorting_key = metadata_snapshot->getSortingKey();
     auto index_columns = std::make_shared<ColumnsWithTypeAndName>();
@@ -1824,7 +1819,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 
                     if (exact_ranges && !result.can_be_false)
                     {
-                        if (exact_ranges->empty() || range.begin - exact_ranges->back().end > min_marks_for_seek)
+                        /// Unlike read ranges, exact ranges must not be coalesced across
+                        /// non-matching gaps merely to avoid seeks: every mark in an exact
+                        /// range can be counted without applying the filter.
+                        if (exact_ranges->empty() || range.begin != exact_ranges->back().end)
                             exact_ranges->push_back(range);
                         else
                             exact_ranges->back().end = range.end;
@@ -1923,22 +1921,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                         check_in_range({result_exact_range.end - 1, result_exact_range.end}, BoolMask::consider_only_can_be_false).can_be_false)
                         --result_exact_range.end;
 
-                    if (result_exact_range.begin < result_exact_range.end)
+                    if (result_exact_range.begin < result_exact_range.end
+                        && !check_in_range(result_exact_range, BoolMask::consider_only_can_be_false).can_be_false)
                     {
-                        if (check_in_range(result_exact_range, BoolMask::consider_only_can_be_false).can_be_false)
-                        {
-                            /// key_condition.matchesExactContinuousRange returned true, but the
-                            /// range doesn't seem to be continuous. Something's broken.
-                            /// TODO: Remove the #ifndef and always throw after
-                            ///       https://github.com/ClickHouse/ClickHouse/issues/90461 is fixed.
-#ifndef NDEBUG
-                            throw Exception(ErrorCodes::LOGICAL_ERROR, "Inconsistent KeyCondition behavior");
-#endif
-                        }
-                        else
-                        {
-                            exact_ranges->emplace_back(std::move(result_exact_range));
-                        }
+                        exact_ranges->emplace_back(std::move(result_exact_range));
                     }
                 }
             }

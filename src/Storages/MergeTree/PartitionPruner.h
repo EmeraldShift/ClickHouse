@@ -17,9 +17,9 @@ public:
         const StorageMetadataPtr & metadata,
         const ActionsDAGWithInversionPushDown & filter_dag,
         ContextPtr context,
-        bool strict = false,
         bool skip_analysis = false);
 
+    BoolMask checkInPartition(const IMergeTreeDataPart & part) const;
     bool canBePruned(const IMergeTreeDataPart & part) const;
 
     bool isUseless() const { return useless; }
@@ -28,7 +28,7 @@ public:
 
 private:
     /// Cache already analyzed partitions.
-    mutable std::unordered_map<String, bool> partition_filter_map;
+    mutable std::unordered_map<String, BoolMask> partition_filter_map;
 
     /// partition_key is adjusted here (with substitution from modulo to moduloLegacy).
     KeyDescription partition_key;

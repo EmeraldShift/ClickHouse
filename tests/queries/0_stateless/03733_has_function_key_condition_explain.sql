@@ -2,6 +2,8 @@
 -- add_minmax_index_for_numeric_columns=0: Different plan
 -- EXPLAIN output may differ
 
+SET optimize_use_implicit_projections = 0;
+
 -- { echoOn }
 
 DROP TABLE IF EXISTS test_has_idx_simple;

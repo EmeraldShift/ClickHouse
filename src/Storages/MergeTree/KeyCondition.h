@@ -282,12 +282,41 @@ public:
 
         Function function = FUNCTION_UNKNOWN;
 
-        /// Whether to relax the atom (e.g., for LIKE queries without a perfect prefix).
+        /// Whether this atom is an approximate weakening of the original predicate.
+        ///
+        /// Keys may not align exactly with the condition specified in the query.  We still
+        /// want to use the key expression to skip data when it is safe, so some atoms are
+        /// intentionally weakened during analysis.
+        ///
+        /// For example, suppose the key column is `toDate(a)`, and the current key range is
+        /// `toDate(a) IN [x, y]`.  A condition `a IN [u, v]` can be checked against the key as
+        /// `toDate(a) IN [toDate(u), toDate(v)]`, because `toDate` is monotonic
+        /// non-decreasing.  Similarly, `a IN (u, v)` also becomes
+        /// `toDate(a) IN [toDate(u), toDate(v)]`, because `toDate` is not strictly increasing.
+        /// That weakens the condition.
+        ///
+        /// For such a weakened atom, `can_be_true = false` is still reliable: if the weaker
+        /// condition cannot match, then the original condition cannot match either.  But
+        /// `can_be_false = false` is not reliable: the weaker condition might cover the whole
+        /// key range even though the original condition does not.  Therefore relaxed atom
+        /// evaluation must force `can_be_false = true` before any NOT/AND/OR composition can
+        /// consume the result.
+        ///
+        /// Current sources of relaxed atoms include:
+        ///  * FUNCTION_IN_RANGE / FUNCTION_NOT_IN_RANGE when constants are transformed through
+        ///    monotonic or deterministic key expressions.
+        ///  * FUNCTION_IN_SET / FUNCTION_NOT_IN_SET when the set check is not exact, e.g. tuple
+        ///    elements are dropped or transformed through a non-exact key expression.  Exact
+        ///    multi-element IN is discontinuous, but it is not relaxed for this purpose.
+        ///  * FUNCTION_ARGS_IN_HYPERRECTANGLE for space-filling curves.
+        ///  * FUNCTION_POINT_IN_POLYGON, which can prove non-intersection but does not prove
+        ///    that every point in the key range is inside the polygon.
+        ///  * Special functions such as `match`, which can produce a relaxed FUNCTION_IN_RANGE
+        ///    atom from a regular-expression prefix.
+        ///
+        /// FUNCTION_UNKNOWN is not marked relaxed: it already evaluates to `(true, true)`, so
+        /// it cannot prove either non-match or full match.
         bool relaxed = false;
-
-        /// Whether this atom contributes to the legacy whole-condition relaxed
-        /// state for compatibility, without changing atom-local behavior.
-        bool marked_relaxed_for_compatibility = false;
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();
@@ -338,32 +367,6 @@ public:
 
     const RPN & getRPN() const { return rpn; }
     const ColumnIndices & getKeyColumns() const { return key_columns; }
-
-    /// Whether the key condition is relaxed in the legacy whole-condition sense.
-    ///
-    /// A relaxed key condition is a weakened form of the query predicate.  Keys may
-    /// not align perfectly with the condition specified in the query, but we still
-    /// want to use key expressions to skip data when doing so is safe.
-    ///
-    /// For example, suppose the key column is `toDate(a)`, and a granule has key
-    /// range `toDate(a) IN [x, y]`.  A condition `a IN [u, v]` can be checked
-    /// against the key as `toDate(a) IN [toDate(u), toDate(v)]`, because `toDate`
-    /// is monotonic non-decreasing.  Similarly, `a IN (u, v)` also becomes
-    /// `toDate(a) IN [toDate(u), toDate(v)]`, because `toDate` is not strictly
-    /// increasing.  That weakens the condition.
-    ///
-    /// For a weakened atom, `can_be_true = false` is reliable: if the weaker
-    /// condition cannot match, the original condition cannot match either.
-    /// `can_be_false = false` is not reliable: the weaker condition may cover a
-    /// whole key range even when the original condition does not.  Consumers that
-    /// need exact truth, such as exact count optimizations, must treat relaxed
-    /// conditions conservatively.
-    ///
-    /// This function computes the old whole-condition relaxed flag from the RPN.
-    /// It exists as a compatibility shim while relaxedness is moved onto
-    /// RPNElement atoms.  In particular, it preserves the old behavior for
-    /// FUNCTION_UNKNOWN and multi-value FUNCTION_IN_SET / FUNCTION_NOT_IN_SET.
-    bool legacyContainsRelaxedRPN() const;
 
     bool isSinglePoint() const { return single_point; }
 

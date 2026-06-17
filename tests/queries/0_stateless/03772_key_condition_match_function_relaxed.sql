@@ -2,6 +2,7 @@
 -- no-replicated-database: EXPLAIN output differs for replicated database.
 -- no-parallel-replicas: EXPLAIN output differs for parallel replicas.
 
+SET optimize_use_implicit_projections = 0;
 
 DROP TABLE IF EXISTS 03772_table_match;
 

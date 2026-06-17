@@ -62,7 +62,7 @@ SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE p IN ('abc', 'x9999');
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_chain)
@@ -75,6 +75,7 @@ Expression ((Project names + Projection))
             Granules: 9002/10000
             Search Algorithm: generic exclusion search
           Ranges: 1
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE p IN ('abc', 'x9999');
@@ -84,7 +85,7 @@ SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_chain)
@@ -97,6 +98,7 @@ Expression ((Project names + Projection))
             Granules: 9002/10000
             Search Algorithm: generic exclusion search
           Ranges: 1
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
@@ -106,7 +108,7 @@ SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE p NOT IN ('abc', 'x9999');
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_chain)
@@ -119,6 +121,7 @@ Expression ((Project names + Projection))
             Granules: 1000/10000
             Search Algorithm: generic exclusion search
           Ranges: 1
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE p NOT IN ('abc', 'x9999');
@@ -128,7 +131,7 @@ SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE NOT has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_chain)
@@ -141,6 +144,7 @@ Expression ((Project names + Projection))
             Granules: 1000/10000
             Search Algorithm: generic exclusion search
           Ranges: 1
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_chain
 WHERE NOT has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
@@ -207,7 +211,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE p IN ('abc', 'x9999');
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag)
@@ -220,6 +224,7 @@ Expression ((Project names + Projection))
             Granules: 9002/10000
             Search Algorithm: generic exclusion search
           Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE p IN ('abc', 'x9999');
@@ -229,7 +234,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag)
@@ -242,6 +247,7 @@ Expression ((Project names + Projection))
             Granules: 9002/10000
             Search Algorithm: generic exclusion search
           Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
@@ -251,7 +257,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE p NOT IN ('abc', 'x9999');
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag)
@@ -263,7 +269,8 @@ Expression ((Project names + Projection))
             Parts: 1/1
             Granules: 1000/10000
             Search Algorithm: generic exclusion search
-          Ranges: 1
+          Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE p NOT IN ('abc', 'x9999');
@@ -273,7 +280,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE NOT has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag)
@@ -285,7 +292,8 @@ Expression ((Project names + Projection))
             Parts: 1/1
             Granules: 1000/10000
             Search Algorithm: generic exclusion search
-          Ranges: 1
+          Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag
 WHERE NOT has(['abc', 'x9999'], p) SETTINGS optimize_rewrite_has_to_in = 0;
@@ -352,7 +360,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE lower(p) IN ('abc', 'x9999');
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag_complex)
@@ -365,6 +373,7 @@ Expression ((Project names + Projection))
             Granules: 9002/10000
             Search Algorithm: generic exclusion search
           Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE lower(p) IN ('abc', 'x9999');
@@ -374,7 +383,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE has(['abc', 'x9999'], lower(p)) SETTINGS optimize_rewrite_has_to_in = 0;
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag_complex)
@@ -387,6 +396,7 @@ Expression ((Project names + Projection))
             Granules: 9002/10000
             Search Algorithm: generic exclusion search
           Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE has(['abc', 'x9999'], lower(p)) SETTINGS optimize_rewrite_has_to_in = 0;
@@ -396,7 +406,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE lower(p) NOT IN ('abc', 'x9999');
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag_complex)
@@ -408,7 +418,8 @@ Expression ((Project names + Projection))
             Parts: 1/1
             Granules: 1000/10000
             Search Algorithm: generic exclusion search
-          Ranges: 1
+          Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE lower(p) NOT IN ('abc', 'x9999');
@@ -418,7 +429,7 @@ SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE NOT has(['abc', 'x9999'], lower(p)) SETTINGS optimize_rewrite_has_to_in = 0;
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_deterministic_injective_function_dag_complex)
@@ -430,7 +441,8 @@ Expression ((Project names + Projection))
             Parts: 1/1
             Granules: 1000/10000
             Search Algorithm: generic exclusion search
-          Ranges: 1
+          Ranges: 2
+    ReadFromPreparedSource (_exact_count_projection)
 SELECT count()
 FROM test_deterministic_injective_function_dag_complex
 WHERE NOT has(['abc', 'x9999'], lower(p)) SETTINGS optimize_rewrite_has_to_in = 0;
