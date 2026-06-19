@@ -50,6 +50,7 @@
 #include <Storages/MergeTree/MergeTreeIndexText.h>
 #include <Storages/MergeTree/MergeTreeIndexVectorSimilarity.h>
 #include <Storages/MergeTree/MergeTreePrefetchedReadPool.h>
+#include <Storages/MergeTree/MergeTreePipelinedReadPool.h>
 #include <Storages/MergeTree/MergeTreeReadPool.h>
 #include <Storages/MergeTree/MergeTreeReadPoolInOrder.h>
 #include <Storages/MergeTree/MergeTreeReadPoolParallelReplicas.h>
@@ -192,6 +193,7 @@ namespace Setting
     extern const SettingsBool force_aggregate_partitions_independently;
     extern const SettingsBool force_primary_key;
     extern const SettingsString ignore_data_skipping_indices;
+    extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsUInt64 max_number_of_partitions_for_independent_aggregation;
     extern const SettingsInt64 max_partitions_to_read;
     extern const SettingsUInt64 max_rows_to_read;
@@ -202,12 +204,14 @@ namespace Setting
     extern const SettingsUInt64 max_query_size;
     extern const SettingsUInt64 max_streams_for_merge_tree_reading;
     extern const SettingsMaxThreads max_threads;
+    extern const SettingsUInt64 max_threads_for_indexes;
     extern const SettingsUInt64 merge_tree_max_bytes_to_use_cache;
     extern const SettingsUInt64 merge_tree_max_rows_to_use_cache;
     extern const SettingsUInt64 merge_tree_min_bytes_for_concurrent_read_for_remote_filesystem;
     extern const SettingsUInt64 merge_tree_min_rows_for_concurrent_read_for_remote_filesystem;
     extern const SettingsUInt64 merge_tree_min_bytes_for_concurrent_read;
     extern const SettingsUInt64 merge_tree_min_rows_for_concurrent_read;
+    extern const SettingsBool merge_tree_pipelined_index_analysis;
     extern const SettingsFloat merge_tree_read_split_ranges_into_intersecting_and_non_intersecting_injection_probability;
     extern const SettingsBool merge_tree_use_const_size_tasks_for_remote_reading;
     extern const SettingsUInt64 min_count_to_compile_sort_description;
@@ -258,6 +262,7 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsUInt64 distributed_index_analysis_min_parts_to_activate;
     extern const MergeTreeSettingsUInt64 distributed_index_analysis_min_indexes_bytes_to_activate;
 }
+
 
 namespace ErrorCodes
 {
@@ -587,6 +592,18 @@ Pipe ReadFromMergeTree::readFromPool(
     bool allow_prefetched_local = all_parts_are_local && settings[Setting::allow_prefetched_read_pool_for_local_filesystem]
         && MergeTreePrefetchedReadPool::checkReadMethodAllowed(reader_settings.read_settings.local_fs_settings.method);
 
+    /// Keep this list boring and explicit.  If a new MergeTree read mode is
+    /// added, please make a conscious choice here: either it can consume ranges
+    /// from the pipelined per-part analysis path, or it should keep using the
+    /// existing bulk-analysis path until somebody has checked the interaction.
+    const bool use_pipelined_index_analysis
+        = settings[Setting::merge_tree_pipelined_index_analysis]
+        && indexes
+        && !top_k_filter_info.has_value()
+        && !query_info.isFinal()
+        && !query_info.input_order_info
+        && !is_parallel_reading_from_replicas;
+
     /** Do not use prefetched read pool if query is trivial limit query.
       * Because time spend during filling per thread tasks can be greater than whole query
       * execution for big tables with small limit.
@@ -611,6 +628,53 @@ Pipe ReadFromMergeTree::readFromPool(
             context,
             dataflow_cache_updater);
     }
+    else if (use_pipelined_index_analysis)
+    {
+        std::optional<size_t> query_condition_cache_hash;
+        String query_condition_cache_text;
+        if (reader_settings.use_query_condition_cache && query_info.filter_actions_dag && !query_info.isFinal())
+        {
+            const auto & outputs = query_info.filter_actions_dag->getOutputs();
+            if (outputs.size() == 1 && VirtualColumnUtils::isDeterministic(outputs.front()))
+            {
+                query_condition_cache_hash = outputs.front()->getHash();
+                query_condition_cache_text = outputs.front()->result_name;
+            }
+        }
+
+        MergeTreePipelinedReadPool::AnalysisContext analysis_context{
+            .metadata_snapshot = storage_snapshot->metadata,
+            .is_final_query = query_info.isFinal(),
+            .context = context,
+            .indexes = std::make_shared<ReadFromMergeTree::Indexes>(*indexes),
+            .top_k_filter_info = top_k_filter_info,
+            .log = log,
+            .num_streams = pool_settings.threads,
+            .find_exact_ranges = false,
+            .is_parallel_reading_from_replicas = false,
+            .has_projections = storage_snapshot->metadata->hasProjections(),
+            .index_build_context = index_build_context,
+            .query_condition_cache_hash = query_condition_cache_hash,
+            .query_condition_cache_text = std::move(query_condition_cache_text),
+        };
+
+        pool = std::make_shared<MergeTreePipelinedReadPool>(
+            std::move(parts_with_range),
+            mutations_snapshot,
+            shared_virtual_fields,
+            index_read_tasks,
+            storage_snapshot,
+            query_info.row_level_filter,
+            query_info.prewhere_info,
+            actions_settings,
+            reader_settings,
+            required_columns,
+            pool_settings,
+            block_size,
+            context,
+            dataflow_cache_updater,
+            analysis_context);
+    }
     else
     {
         pool = std::make_shared<MergeTreeReadPool>(
@@ -632,6 +696,10 @@ Pipe ReadFromMergeTree::readFromPool(
 
     LOG_DEBUG(log, "Reading approx. {} rows with {} streams", total_rows, pool_settings.threads);
 
+    const auto processor_index_build_context = use_pipelined_index_analysis
+        ? MergeTreeIndexBuildContextPtr{}
+        : index_build_context;
+
     Pipes pipes;
     for (size_t i = 0; i < pool_settings.threads; ++i)
     {
@@ -645,7 +713,7 @@ Pipe ReadFromMergeTree::readFromPool(
             index_read_tasks,
             actions_settings,
             reader_settings,
-            index_build_context,
+            processor_index_build_context,
             lazy_materializing_rows);
 
         auto source = std::make_shared<MergeTreeSource>(std::move(processor), data.getLogName());
@@ -2392,6 +2460,7 @@ void ReadFromMergeTree::applyFilters(ActionDAGNodes added_filter_nodes)
 }
 
 using PartsRangesMap = std::unordered_map<std::string, const RangesInDataPart *>;
+
 /// Same as filterPartsByPrimaryKeyAndSkipIndexes(), but accept part names and parts map to transform parts names to parts
 /// Used for distributed index analysis
 static IndexAnalysisPartsRanges filterPartsNamesByPrimaryKeyAndSkipIndexes(MergeTreeDataSelectExecutor::IndexAnalysisContext & filter_context, PartsRangesMap & parts_ranges_map, const std::vector<std::string_view> & parts_to_analyze)
@@ -2627,15 +2696,61 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
             /// Otherwise, subqueries in the predicate (e.g. `IN (SELECT ...)`) on follower replicas would each independently trigger distributed index analysis, causing O(N^2) queries.
             && (is_initial_query || !settings[Setting::distributed_index_analysis_only_on_coordinator]);
 
+        bool all_parts_are_remote = true;
+        bool all_parts_are_local = true;
+        for (const auto & part : res_parts)
+        {
+            const bool is_remote = part.data_part->isStoredOnRemoteDisk();
+            all_parts_are_local &= !is_remote;
+            all_parts_are_remote &= is_remote;
+        }
+
+        const bool allow_prefetched_remote = all_parts_are_remote && settings[Setting::allow_prefetched_read_pool_for_remote_filesystem]
+            && MergeTreePrefetchedReadPool::checkReadMethodAllowed(reader_settings.read_settings.remote_fs_settings.method);
+        const bool allow_prefetched_local = all_parts_are_local && settings[Setting::allow_prefetched_read_pool_for_local_filesystem]
+            && MergeTreePrefetchedReadPool::checkReadMethodAllowed(reader_settings.read_settings.local_fs_settings.method);
+        const bool will_use_prefetched_read_pool = query_info_.trivial_limit == 0 && (allow_prefetched_remote || allow_prefetched_local);
+
+        /// This is the matching analysis-side gate for the read-pool choice
+        /// above.  A new read mode should not accidentally inherit this path just
+        /// because it happens not to set one of the existing flags; add the mode
+        /// to the explicit allow/deny list when its scheduling rules are known.
+        const bool use_pipelined_read_pool
+            = settings[Setting::merge_tree_pipelined_index_analysis]
+            && !will_use_prefetched_read_pool
+            && !find_exact_ranges
+            && !query_info_.isFinal()
+            && !query_info_.input_order_info
+            && !is_parallel_reading_from_replicas_
+            && !top_k_filter_info.has_value();
+
         if (!distributed_index_analysis_enabled)
         {
-            result.parts_with_ranges = MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipIndexes(filter_context, res_parts, result.index_stats);
-
-            if (final_second_pass)
+            if (use_pipelined_read_pool)
             {
-                result.parts_with_ranges
-                    = findPKRangesForFinalAfterSkipIndex(primary_key, metadata_snapshot->getSortingKey(), result.parts_with_ranges, log);
-                add_index_stat_row_for_pk_expand = true;
+                /// Pipelined mode stops after cheap global pruning.  The read pool
+                /// runs PK/eager skip-index analysis one part at a time and
+                /// publishes read tasks as each part finishes analysis.
+                result.parts_with_ranges = std::move(res_parts);
+
+                const size_t initial_parts = result.parts_with_ranges.size();
+                const size_t initial_marks = result.parts_with_ranges.getMarksCountAllParts();
+                result.index_stats.emplace_back(IndexStat{
+                    .type = IndexType::PrimaryKey,
+                    .description = "Pipelined per-part analysis",
+                    .num_parts_after = initial_parts,
+                    .num_granules_after = initial_marks});
+            }
+            else
+            {
+                result.parts_with_ranges = MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipIndexes(filter_context, res_parts, result.index_stats);
+
+                if (final_second_pass)
+                {
+                    result.parts_with_ranges
+                        = findPKRangesForFinalAfterSkipIndex(primary_key, metadata_snapshot->getSortingKey(), result.parts_with_ranges, log);
+                    add_index_stat_row_for_pk_expand = true;
+                }
             }
         }
         else

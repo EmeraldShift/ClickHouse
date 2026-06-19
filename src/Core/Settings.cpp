@@ -1731,6 +1731,18 @@ Possible values:
 - 0 — Disabled.
 - 1 — Enabled.
 )", 0) \
+    DECLARE(Bool, merge_tree_pipelined_index_analysis, false, R"(
+Pipeline MergeTree primary-key and skip-index analysis with reading.
+
+When enabled, selected parts start from cheap global pruning and a read-pool worker performs PK and skip-index analysis for one part at a time, publishing read tasks as each part finishes analysis. This avoids waiting for all parts to finish index analysis before reading can begin.
+
+This is an experimental setting and is disabled for paths that require ordered reads, FINAL-specific handling, parallel replicas, prefetched read pools, or dynamic TopK index filtering.
+
+Possible values:
+
+- 0 — Disabled.
+- 1 — Enabled.
+)", 0) \
     DECLARE(Bool, use_skip_indexes_for_disjunctions, true, R"(
 Evaluate WHERE filters with mixed AND and OR conditions using skip indexes. Example: WHERE A = 5 AND (B = 5 OR C = 5).
 If disabled, skip indexes are still used to evaluate WHERE conditions but they must only contain AND-ed clauses.
