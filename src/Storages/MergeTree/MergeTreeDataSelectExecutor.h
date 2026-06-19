@@ -224,7 +224,8 @@ public:
     {
         StorageMetadataPtr metadata_snapshot;
         MergeTreeData::MutationsSnapshotPtr mutations_snapshot;
-        const SelectQueryInfo & query_info;
+        const SelectQueryInfo * query_info = nullptr;
+        bool is_final_query = false;
         const ContextPtr & context;
         const ReadFromMergeTree::Indexes & indexes;
         const std::optional<TopKFilterInfo> & top_k_filter_info;
@@ -240,6 +241,49 @@ public:
     /// Filter parts using primary key and secondary indexes.
     /// For every part, select mark ranges to read.
     static RangesInDataParts filterPartsByPrimaryKeyAndSkipIndexes(IndexAnalysisContext & filter_context, RangesInDataParts parts_with_ranges, ReadFromMergeTree::IndexStats & index_stats);
+
+    struct PerPartIndexAnalysisStats
+    {
+        struct SkipIndexStats
+        {
+            size_t order_position = 0;
+            size_t index_idx = 0;
+            size_t total_parts = 0;
+            size_t total_granules = 0;
+            size_t granules_dropped = 0;
+            size_t parts_dropped = 0;
+            size_t elapsed_us = 0;
+            bool used = false;
+        };
+
+        size_t pk_total_parts = 0;
+        size_t pk_total_granules = 0;
+        size_t pk_granules_dropped = 0;
+        size_t pk_parts_dropped = 0;
+        size_t pk_elapsed_us = 0;
+        MarkRanges::SearchAlgorithm pk_search_algorithm = MarkRanges::SearchAlgorithm::Unknown;
+        size_t marks_after_pk = 0;
+        bool part_after_pk = false;
+
+        std::vector<SkipIndexStats> skip_index_stats;
+        bool skip_index_used = false;
+        size_t marks_after_skip_indexes_union = 0;
+
+        std::vector<MergeTreeIndexBulkGranulesMinMax::MinMaxGranule> top_k_granules;
+        size_t top_k_elapsed_us = 0;
+
+        std::optional<size_t> rows_estimate;
+    };
+
+    /// Single-part counterpart of filterPartsByPrimaryKeyAndSkipIndexes.
+    /// This is intended for callers that schedule index analysis one part at a
+    /// time while keeping the same PK/skip-index semantics as the bulk path.
+    static std::optional<RangesInDataPart> analyzePartByPrimaryKeyAndSkipIndexes(
+        IndexAnalysisContext & filter_context,
+        RangesInDataPart part,
+        const std::vector<size_t> * part_index_order,
+        ReadFromMergeTree::IndexStats & index_stats,
+        PerPartIndexAnalysisStats * stats = nullptr);
 
     /// Filter parts using query condition cache.
     static void filterPartsByQueryConditionCache(

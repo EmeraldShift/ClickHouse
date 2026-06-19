@@ -819,24 +819,20 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByStatistics(
 RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipIndexes(IndexAnalysisContext & filter_context, RangesInDataParts parts_with_ranges, ReadFromMergeTree::IndexStats & index_stats)
 {
     auto & metadata_snapshot = filter_context.metadata_snapshot;
-    auto & mutations_snapshot = filter_context.mutations_snapshot;
-    const auto & query_info = filter_context.query_info;
+    chassert(filter_context.query_info);
+    const auto & query_info = *filter_context.query_info;
     const auto & context = filter_context.context;
     const auto & key_condition = filter_context.indexes.key_condition;
-    const auto & part_offset_condition = filter_context.indexes.part_offset_condition;
-    const auto & total_offset_condition = filter_context.indexes.total_offset_condition;
     const auto & key_condition_rpn_template = filter_context.indexes.key_condition_rpn_template;
     const auto & skip_indexes = filter_context.indexes.skip_indexes;
     const auto & top_k_filter_info = filter_context.top_k_filter_info;
-    const auto & reader_settings = filter_context.reader_settings;
     const auto & log = filter_context.log;
     size_t num_streams = filter_context.num_streams;
     bool use_skip_indexes = filter_context.indexes.use_skip_indexes;
     bool use_skip_indexes_for_disjunctions_ = filter_context.indexes.use_skip_indexes_for_disjunctions;
     bool use_skip_indexes_on_data_read_ = filter_context.indexes.use_skip_indexes_on_data_read;
     bool use_skip_indexes_if_final_exact_mode_ = filter_context.indexes.use_skip_indexes_if_final_exact_mode;
-    bool find_exact_ranges = filter_context.find_exact_ranges;
-    bool is_final_query = filter_context.query_info.isFinal();
+    bool is_final_query = filter_context.is_final_query;
     bool has_projections = filter_context.has_projections;
     auto & result = filter_context.result;
 
@@ -918,15 +914,6 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                                 && key_condition_rpn_template.has_value()
                                 && key_condition_rpn_template->getRPN().size() <= MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT;
 
-    auto is_index_supported_on_data_read = [&](const MergeTreeIndexPtr & index) -> bool
-    {
-        /// Vector similarity indexes are not applicable on data reads.
-        if (index->isVectorSimilarityIndex())
-            return false;
-
-        return use_skip_indexes_on_data_read_;
-    };
-
     /// Let's find what range to read from each part.
     {
         auto mark_cache = context->getIndexMarkCache();
@@ -943,170 +930,71 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
         auto process_part = [&](size_t part_index)
         {
-            if (query_status)
-                query_status->checkTimeLimit();
+            PerPartIndexAnalysisStats part_stats;
+            const std::vector<size_t> * part_index_order = nullptr;
+            if (!skip_indexes.per_part_index_orders.empty())
+                part_index_order = &skip_indexes.per_part_index_orders[part_index];
 
-            auto & ranges = parts_with_ranges[part_index];
-            if (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition)
-            {
-                CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithPrimaryKey);
-                ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithPrimaryKeyMicroseconds);
+            auto analyzed = analyzePartByPrimaryKeyAndSkipIndexes(
+                filter_context,
+                parts_with_ranges[part_index],
+                part_index_order,
+                index_stats,
+                &part_stats);
 
-                const size_t total_marks_count = ranges.getMarksCount();
-                ProfileEvents::increment(ProfileEvents::FilteringMarksWithPrimaryKeyProcessedMarks, total_marks_count);
-                pk_stat.total_parts.fetch_add(1, std::memory_order_relaxed);
-                pk_stat.total_granules.fetch_add(total_marks_count, std::memory_order_relaxed);
+            pk_stat.total_parts.fetch_add(part_stats.pk_total_parts, std::memory_order_relaxed);
+            pk_stat.total_granules.fetch_add(part_stats.pk_total_granules, std::memory_order_relaxed);
+            pk_stat.granules_dropped.fetch_add(part_stats.pk_granules_dropped, std::memory_order_relaxed);
+            pk_stat.parts_dropped.fetch_add(part_stats.pk_parts_dropped, std::memory_order_relaxed);
+            pk_stat.elapsed_us.fetch_add(part_stats.pk_elapsed_us, std::memory_order_relaxed);
+            if (part_stats.pk_search_algorithm != MarkRanges::SearchAlgorithm::Unknown)
+                pk_stat.search_algorithm.store(part_stats.pk_search_algorithm, std::memory_order_relaxed);
 
-                ranges.ranges = markRangesFromPKRange(
-                    ranges,
-                    metadata_snapshot,
-                    key_condition,
-                    part_offset_condition,
-                    total_offset_condition,
-                    find_exact_ranges ? &ranges.exact_ranges : nullptr,
-                    settings,
-                    log);
-
-                pk_stat.search_algorithm.store(ranges.ranges.search_algorithm, std::memory_order_relaxed);
-                pk_stat.granules_dropped.fetch_add(total_marks_count - ranges.getMarksCount(), std::memory_order_relaxed);
-                if (ranges.ranges.empty())
-                    pk_stat.parts_dropped.fetch_add(1, std::memory_order_relaxed);
-                pk_stat.elapsed_us.fetch_add(watch.elapsed(), std::memory_order_relaxed);
-            }
-
-            sum_marks_pk.fetch_add(ranges.getMarksCount(), std::memory_order_relaxed);
-
-            if (!ranges.ranges.empty())
+            sum_marks_pk.fetch_add(part_stats.marks_after_pk, std::memory_order_relaxed);
+            if (part_stats.part_after_pk)
                 sum_parts_pk.fetch_add(1, std::memory_order_relaxed);
 
-            if (is_final_query && use_skip_indexes_if_final_exact_mode_)
+            const auto num_indexes = skip_indexes.useful_indices.size();
+            for (const auto & skip_stat : part_stats.skip_index_stats)
             {
-                ranges.ranges_snapshot_after_pk_analysis = ranges.ranges;
-            }
+                auto index_stat_idx = skip_stat.order_position;
+                if (settings[Setting::per_part_index_stats])
+                    index_stat_idx += num_indexes * part_index;
 
-            if (!skip_indexes.empty())
-            {
-                CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithSecondaryKeys);
-                auto alter_conversions = MergeTreeData::getAlterConversionsForPart(ranges.data_part, mutations_snapshot, context);
-                const auto & all_updated_columns = alter_conversions->getAllUpdatedColumns();
-
-                auto can_use_index = [&](const MergeTreeIndexPtr & index) -> std::expected<void, PreformattedMessage>
-                {
-                    auto check_result = canUseIndex(index, metadata_snapshot, all_updated_columns);
-                    if (!check_result)
-                    {
-                        return std::unexpected(PreformattedMessage::create(
-                            "Index {} is not used for part {}. Reason: {}",
-                            index->index.name, ranges.data_part->name, check_result.error().text));
-                    }
-                    return {};
-                };
-
-                const auto num_indexes = skip_indexes.useful_indices.size();
-
-                PartialDisjunctionResult partial_eval_results;
-                if (use_skip_indexes_for_disjunctions)
-                    partial_eval_results.resize(ranges.data_part->index_granularity->getMarksCountWithoutFinal() * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT, true);
-
-                for (size_t idx = 0; idx < num_indexes; ++idx)
-                {
-                    if (ranges.ranges.empty())
-                        break;
-
-                    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithSecondaryKeysMicroseconds);
-
-                    const auto index_idx = skip_indexes.per_part_index_orders[part_index][idx];
-                    const auto & index_and_condition = skip_indexes.useful_indices[index_idx];
-
-                    auto index_stat_idx = idx;
-                    if (settings[Setting::per_part_index_stats])
-                        index_stat_idx += num_indexes * part_index;
-
-                    auto & stat = useful_indices_stat[index_stat_idx];
-
-                    stat.total_parts.fetch_add(1, std::memory_order_relaxed);
-                    size_t total_granules = ranges.getMarksCount();
-                    stat.total_granules.fetch_add(total_granules, std::memory_order_relaxed);
-
-                    if (auto index_result = can_use_index(index_and_condition.index); !index_result)
-                    {
-                        LOG_TRACE(log, "{}", index_result.error().text);
-                        continue;
-                    }
-
-                    if (!is_index_supported_on_data_read(index_and_condition.index))
-                    {
-                        std::tie(ranges.ranges, ranges.read_hints) = filterMarksUsingIndex(
-                            index_and_condition.index,
-                            index_and_condition.condition,
-                            key_condition_rpn_template,
-                            ranges.data_part,
-                            ranges.ranges,
-                            ranges.read_hints,
-                            reader_settings,
-                            mark_cache.get(),
-                            uncompressed_cache.get(),
-                            vector_similarity_index_cache.get(),
-                            use_skip_indexes_for_disjunctions,
-                            partial_eval_results,
-                            log);
-                    }
-
-                    stat.granules_dropped.fetch_add(total_granules - ranges.getMarksCount(), std::memory_order_relaxed);
-                    if (ranges.ranges.empty())
-                        stat.parts_dropped.fetch_add(1, std::memory_order_relaxed);
-                    stat.elapsed_us.fetch_add(watch.elapsed(), std::memory_order_relaxed);
+                auto & stat = useful_indices_stat[index_stat_idx];
+                stat.total_parts.fetch_add(skip_stat.total_parts, std::memory_order_relaxed);
+                stat.total_granules.fetch_add(skip_stat.total_granules, std::memory_order_relaxed);
+                stat.granules_dropped.fetch_add(skip_stat.granules_dropped, std::memory_order_relaxed);
+                stat.parts_dropped.fetch_add(skip_stat.parts_dropped, std::memory_order_relaxed);
+                stat.elapsed_us.fetch_add(skip_stat.elapsed_us, std::memory_order_relaxed);
+                if (skip_stat.used)
                     skip_index_used_in_part[part_index] = 1; /// thread-safe
-                }
-
-                if (use_skip_indexes_for_disjunctions && key_condition_rpn_template.has_value())
-                {
-                    ranges.ranges = mergePartialResultsForDisjunctions(ranges.data_part,
-                                        ranges.ranges, key_condition_rpn_template.value(),
-                                        partial_eval_results, reader_settings, log);
-
-                    sum_marks_union.fetch_add(ranges.getMarksCount(), std::memory_order_relaxed);
-                }
-
             }
 
-            /// Optimize ORDER BY <col> LIMIT n - if <col> is scalar numeric / date / datetime and has a minmax index
-            if (perform_top_k_optimization)
-            {
-                ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithSecondaryKeysMicroseconds);
+            if (part_stats.marks_after_skip_indexes_union)
+                sum_marks_union.fetch_add(part_stats.marks_after_skip_indexes_union, std::memory_order_relaxed);
 
-                auto min_max_granules = getMinMaxIndexGranules(ranges.data_part,
-                                            skip_indexes.skip_index_for_top_k_filtering,
-                                            ranges.ranges,
-                                            top_k_filter_info->direction,
-                                            false, /*access_by_mark*/
-                                            reader_settings,
-                                            mark_cache.get(),
-                                            uncompressed_cache.get(),
-                                            vector_similarity_index_cache.get());
+            if (!part_stats.top_k_granules.empty())
+                parts_top_k_granules[part_index] = std::move(part_stats.top_k_granules);
+            top_k_elapsed_us.fetch_add(part_stats.top_k_elapsed_us, std::memory_order_relaxed);
 
-                if (min_max_granules) /// minmax index may have not been materialized for this part, not a fatal error
-                {
-                    min_max_granules->getTopKMarks(top_k_filter_info->limit_n, top_k_handle_ties, parts_top_k_granules[part_index]);
-                }
-                top_k_elapsed_us.fetch_add(watch.elapsed(), std::memory_order_relaxed);
-            }
+            if (analyzed)
+                parts_with_ranges[part_index] = std::move(*analyzed);
+            else
+                parts_with_ranges[part_index].ranges.clear();
 
-            if (!ranges.ranges.empty() && !perform_top_k_optimization)
+            if (part_stats.rows_estimate)
             {
                 if (limits.max_rows || leaf_limits.max_rows)
                 {
-                    auto current_rows_estimate = ranges.getRowsCount();
-                    size_t prev_rows_estimate = total_rows.fetch_add(current_rows_estimate, std::memory_order_relaxed);
-                    size_t total_rows_estimate = current_rows_estimate + prev_rows_estimate;
+                    size_t prev_rows_estimate = total_rows.fetch_add(*part_stats.rows_estimate, std::memory_order_relaxed);
+                    size_t total_rows_estimate = *part_stats.rows_estimate + prev_rows_estimate;
 
                     if (query_info.trivial_limit > 0 && total_rows_estimate > query_info.trivial_limit)
-                    {
                         total_rows_estimate = query_info.trivial_limit;
-                    }
 
                     bool exceeds_limits = (limits.max_rows && total_rows_estimate > limits.max_rows)
-                                       || (leaf_limits.max_rows && total_rows_estimate > leaf_limits.max_rows);
+                        || (leaf_limits.max_rows && total_rows_estimate > leaf_limits.max_rows);
 
                     /// Even though we exceeded limits on parent parts, we may be able to use a projection
                     /// mark the result as unusable and return gracefully to analyze projection candidates
@@ -1295,6 +1183,237 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
 
     return parts_with_ranges;
+}
+
+
+std::optional<RangesInDataPart> MergeTreeDataSelectExecutor::analyzePartByPrimaryKeyAndSkipIndexes(
+    IndexAnalysisContext & filter_context,
+    RangesInDataPart part,
+    const std::vector<size_t> * part_index_order,
+    ReadFromMergeTree::IndexStats & /*index_stats*/,
+    PerPartIndexAnalysisStats * stats)
+{
+    auto & metadata_snapshot = filter_context.metadata_snapshot;
+    auto & mutations_snapshot = filter_context.mutations_snapshot;
+    const auto & context = filter_context.context;
+    const auto & indexes = filter_context.indexes;
+    const auto & key_condition = indexes.key_condition;
+    const auto & part_offset_condition = indexes.part_offset_condition;
+    const auto & total_offset_condition = indexes.total_offset_condition;
+    const auto & key_condition_rpn_template = indexes.key_condition_rpn_template;
+    const auto & skip_indexes = indexes.skip_indexes;
+    const auto & top_k_filter_info = filter_context.top_k_filter_info;
+    const auto & reader_settings = filter_context.reader_settings;
+    const auto & log = filter_context.log;
+    const Settings & settings = context->getSettingsRef();
+
+    PerPartIndexAnalysisStats local_stats;
+    auto & out_stats = stats ? *stats : local_stats;
+
+    if (auto query_status = context->getProcessListElement())
+        query_status->checkTimeLimit();
+
+    if (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition)
+    {
+        CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithPrimaryKey);
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithPrimaryKeyMicroseconds);
+
+        const size_t total_marks_count = part.getMarksCount();
+        ProfileEvents::increment(ProfileEvents::FilteringMarksWithPrimaryKeyProcessedMarks, total_marks_count);
+        out_stats.pk_total_parts = 1;
+        out_stats.pk_total_granules = total_marks_count;
+
+        part.ranges = markRangesFromPKRange(
+            part,
+            metadata_snapshot,
+            key_condition,
+            part_offset_condition,
+            total_offset_condition,
+            filter_context.find_exact_ranges ? &part.exact_ranges : nullptr,
+            settings,
+            log);
+
+        out_stats.pk_search_algorithm = part.ranges.search_algorithm;
+        out_stats.pk_granules_dropped = total_marks_count - part.getMarksCount();
+        if (part.ranges.empty())
+            out_stats.pk_parts_dropped = 1;
+        out_stats.pk_elapsed_us = watch.elapsed();
+
+        LOG_TRACE(
+            log,
+            "Single-part PK analysis for part {} dropped {}/{} marks in {}us",
+            part.data_part->name,
+            out_stats.pk_granules_dropped,
+            total_marks_count,
+            out_stats.pk_elapsed_us);
+    }
+
+    out_stats.marks_after_pk = part.getMarksCount();
+    out_stats.part_after_pk = !part.ranges.empty();
+
+    if (part.ranges.empty())
+        return std::nullopt;
+
+    if (filter_context.is_final_query && indexes.use_skip_indexes_if_final_exact_mode)
+        part.ranges_snapshot_after_pk_analysis = part.ranges;
+
+    const bool perform_top_k_optimization = top_k_filter_info && skip_indexes.skip_index_for_top_k_filtering && !top_k_filter_info->where_clause;
+    const bool top_k_handle_ties = perform_top_k_optimization && (top_k_filter_info->num_sort_columns > 1 || skip_indexes.skip_index_for_top_k_filtering->index.granularity > 1);
+
+    if (!skip_indexes.empty())
+    {
+        CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithSecondaryKeys);
+        auto mark_cache = context->getIndexMarkCache();
+        auto uncompressed_cache = context->getIndexUncompressedCache();
+        auto vector_similarity_index_cache = context->getVectorSimilarityIndexCache();
+
+        auto alter_conversions = MergeTreeData::getAlterConversionsForPart(part.data_part, mutations_snapshot, context);
+        const auto & all_updated_columns = alter_conversions->getAllUpdatedColumns();
+
+        const bool use_skip_indexes_for_disjunctions = indexes.use_skip_indexes_for_disjunctions
+            && !indexes.use_skip_indexes_on_data_read
+            && key_condition_rpn_template.has_value()
+            && key_condition_rpn_template->getRPN().size() <= MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT;
+
+        PartialDisjunctionResult partial_eval_results;
+        if (use_skip_indexes_for_disjunctions)
+            partial_eval_results.resize(part.data_part->index_granularity->getMarksCountWithoutFinal() * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT, true);
+
+        std::vector<size_t> default_index_order;
+        if (!part_index_order)
+        {
+            const auto & per_part_index_orders = skip_indexes.per_part_index_orders;
+            const size_t original_part_index = part.part_index_in_query;
+            if (original_part_index < per_part_index_orders.size())
+            {
+                part_index_order = &per_part_index_orders[original_part_index];
+            }
+            else
+            {
+                default_index_order.reserve(skip_indexes.useful_indices.size());
+                for (size_t index_idx = 0; index_idx < skip_indexes.useful_indices.size(); ++index_idx)
+                    default_index_order.push_back(index_idx);
+                part_index_order = &default_index_order;
+            }
+        }
+
+        size_t order_position = 0;
+        for (const auto index_idx : *part_index_order)
+        {
+            if (part.ranges.empty())
+                break;
+
+            const auto & index_and_condition = skip_indexes.useful_indices[index_idx];
+            PerPartIndexAnalysisStats::SkipIndexStats index_stats;
+            index_stats.order_position = order_position++;
+            index_stats.index_idx = index_idx;
+            index_stats.total_parts = 1;
+            index_stats.total_granules = part.getMarksCount();
+
+            auto check_result = canUseIndex(index_and_condition.index, metadata_snapshot, all_updated_columns);
+            if (!check_result)
+            {
+                LOG_TRACE(
+                    log,
+                    "Index {} is not used for part {}. Reason: {}",
+                    index_and_condition.index->index.name,
+                    part.data_part->name,
+                    check_result.error().text);
+                out_stats.skip_index_stats.push_back(index_stats);
+                continue;
+            }
+
+            /// Static indexes that are configured for data-read evaluation should
+            /// not be evaluated here, except vector similarity indexes, which are
+            /// not applicable on data reads in the existing bulk path either.
+            const bool supported_on_data_read = indexes.use_skip_indexes_on_data_read && !index_and_condition.index->isVectorSimilarityIndex();
+
+            ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithSecondaryKeysMicroseconds);
+            if (!supported_on_data_read)
+            {
+                std::tie(part.ranges, part.read_hints) = filterMarksUsingIndex(
+                    index_and_condition.index,
+                    index_and_condition.condition,
+                    key_condition_rpn_template,
+                    part.data_part,
+                    part.ranges,
+                    part.read_hints,
+                    reader_settings,
+                    mark_cache.get(),
+                    uncompressed_cache.get(),
+                    vector_similarity_index_cache.get(),
+                    use_skip_indexes_for_disjunctions,
+                    partial_eval_results,
+                    log);
+            }
+
+            index_stats.granules_dropped = index_stats.total_granules - part.getMarksCount();
+            if (part.ranges.empty())
+                index_stats.parts_dropped = 1;
+            index_stats.elapsed_us = watch.elapsed();
+            index_stats.used = true;
+            out_stats.skip_index_used = true;
+            out_stats.skip_index_stats.push_back(index_stats);
+
+            LOG_TRACE(
+                log,
+                "Single-part skip index {} for part {} dropped {}/{} marks in {}us",
+                index_and_condition.index->index.name,
+                part.data_part->name,
+                index_stats.granules_dropped,
+                index_stats.total_granules,
+                index_stats.elapsed_us);
+        }
+
+        if (use_skip_indexes_for_disjunctions && key_condition_rpn_template.has_value())
+        {
+            part.ranges = mergePartialResultsForDisjunctions(
+                part.data_part,
+                part.ranges,
+                key_condition_rpn_template.value(),
+                partial_eval_results,
+                reader_settings,
+                log);
+
+            out_stats.marks_after_skip_indexes_union = part.getMarksCount();
+        }
+    }
+
+    if (perform_top_k_optimization)
+    {
+        auto mark_cache = context->getIndexMarkCache();
+        auto uncompressed_cache = context->getIndexUncompressedCache();
+        auto vector_similarity_index_cache = context->getVectorSimilarityIndexCache();
+        ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithSecondaryKeysMicroseconds);
+
+        auto min_max_granules = getMinMaxIndexGranules(
+            part.data_part,
+            skip_indexes.skip_index_for_top_k_filtering,
+            part.ranges,
+            top_k_filter_info->direction,
+            false, /*access_by_mark*/
+            reader_settings,
+            mark_cache.get(),
+            uncompressed_cache.get(),
+            vector_similarity_index_cache.get());
+
+        if (min_max_granules)
+            min_max_granules->getTopKMarks(top_k_filter_info->limit_n, top_k_handle_ties, out_stats.top_k_granules);
+
+        out_stats.top_k_elapsed_us = watch.elapsed();
+    }
+
+    const bool retain_empty_for_final = filter_context.is_final_query
+        && indexes.use_skip_indexes_if_final_exact_mode
+        && out_stats.skip_index_used;
+
+    if (part.ranges.empty() && !retain_empty_for_final)
+        return std::nullopt;
+
+    if (!part.ranges.empty() && !perform_top_k_optimization)
+        out_stats.rows_estimate = part.getRowsCount();
+
+    return part;
 }
 
 MergeTreeDataSelectExecutor::RowLimits MergeTreeDataSelectExecutor::getRowLimits(

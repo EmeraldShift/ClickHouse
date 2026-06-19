@@ -203,7 +203,8 @@ protected:
         {
             .metadata_snapshot = metadata_snapshot,
             .mutations_snapshot = snapshot_data.mutations_snapshot,
-            .query_info = query_info,
+            .query_info = &query_info,
+            .is_final_query = query_info.isFinal(),
             .context = context,
             .indexes = *indexes,
             .top_k_filter_info = std::nullopt,

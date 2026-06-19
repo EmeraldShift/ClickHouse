@@ -2574,7 +2574,8 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
     {
         .metadata_snapshot = metadata_snapshot,
         .mutations_snapshot = mutations_snapshot,
-        .query_info = query_info_,
+        .query_info = &query_info_,
+        .is_final_query = query_info_.isFinal(),
         .context = context_,
         .indexes = *indexes,
         .top_k_filter_info = top_k_filter_info,
@@ -3110,6 +3111,7 @@ bool ReadFromMergeTree::isQueryWithSampling() const
     const auto & select = query_info.query->as<ASTSelectQuery &>();
     return select.sampleSize() != nullptr;
 }
+
 
 Pipe ReadFromMergeTree::spreadMarkRanges(
     RangesInDataParts && parts_with_ranges,
