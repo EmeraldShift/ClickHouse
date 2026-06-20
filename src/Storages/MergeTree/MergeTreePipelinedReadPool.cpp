@@ -178,6 +178,12 @@ MergeTreePipelinedReadPool::MergeTreePipelinedReadPool(
 {
     for (size_t i = 0; i < per_part_infos.size(); ++i)
         pending_parts.push_back(i);
+
+    if (useTopKBarrier())
+    {
+        pending_top_k_parts.resize(per_part_infos.size());
+        pending_top_k_parts_remaining = per_part_infos.size();
+    }
 }
 
 void MergeTreePipelinedReadPool::enqueueAnalyzedRanges(size_t part_idx, MarkRanges ranges)
@@ -264,11 +270,92 @@ MarkRanges MergeTreePipelinedReadPool::applyPreparedIndexResult(size_t part_idx,
         ranges = intersectMarkRangesLocal(ranges, projection_ranges_for_part);
     }
 
-    /// The result was consumed by the producer.  Readers in this mode do not attach
-    /// the read-time index context, so clear the compatibility registry now.
-    analysis_context.index_build_context->index_reader_pool->clear(analyzed_part.data_part);
+    /// The result was consumed by the producer.  Readers in this mode usually do
+    /// not attach the read-time index context, so clear the compatibility registry
+    /// now.  Dynamic TopK filtering is the exception: readers keep the context so
+    /// `canSkipMark` can consult the live threshold tracker.
+    if (!analysis_context.top_k_filter_info)
+        analysis_context.index_build_context->index_reader_pool->clear(analyzed_part.data_part);
 
     return ranges;
+}
+
+
+bool MergeTreePipelinedReadPool::useTopKBarrier() const
+{
+    return analysis_context.top_k_filter_info
+        && analysis_context.indexes->skip_indexes.skip_index_for_top_k_filtering
+        && !analysis_context.top_k_filter_info->where_clause;
+}
+
+void MergeTreePipelinedReadPool::enqueueTopKReadyPartsIfComplete(
+    size_t part_idx,
+    RangesInDataPart part,
+    MergeTreeDataSelectExecutor::PerPartIndexAnalysisStats stats)
+{
+    std::vector<std::pair<size_t, RangesInDataPart>> parts_to_publish;
+
+    {
+        std::lock_guard lock(mutex);
+        if (is_cancelled.load(std::memory_order_relaxed))
+            return;
+
+        pending_top_k_parts[part_idx] = PendingTopKPart{
+            .part = std::move(part),
+            .has_top_k_granules = !stats.top_k_granules.empty(),
+            .top_k_granules = std::move(stats.top_k_granules),
+        };
+
+        chassert(pending_top_k_parts_remaining > 0);
+        --pending_top_k_parts_remaining;
+        if (pending_top_k_parts_remaining != 0)
+            return;
+
+        chassert(analysis_context.top_k_filter_info);
+        const auto & top_k_filter_info = *analysis_context.top_k_filter_info;
+        const auto & top_k_index = analysis_context.indexes->skip_indexes.skip_index_for_top_k_filtering;
+        chassert(top_k_index);
+
+        std::vector<std::vector<MergeTreeIndexBulkGranulesMinMax::MinMaxGranule>> parts_top_k_granules(
+            pending_top_k_parts.size());
+        for (size_t i = 0; i < pending_top_k_parts.size(); ++i)
+        {
+            if (pending_top_k_parts[i] && pending_top_k_parts[i]->has_top_k_granules)
+                parts_top_k_granules[i] = pending_top_k_parts[i]->top_k_granules;
+        }
+
+        const bool top_k_handle_ties = top_k_filter_info.num_sort_columns > 1 || top_k_index->index.granularity > 1;
+        std::vector<MarkRanges> top_k_ranges;
+        MergeTreeIndexBulkGranulesMinMax::getTopKMarks(
+            top_k_filter_info.direction,
+            top_k_filter_info.limit_n,
+            top_k_index->index.granularity,
+            top_k_handle_ties,
+            parts_top_k_granules,
+            top_k_ranges);
+
+        parts_to_publish.reserve(pending_top_k_parts.size());
+        for (size_t i = 0; i < pending_top_k_parts.size(); ++i)
+        {
+            if (!pending_top_k_parts[i])
+                continue;
+
+            auto ready_part = std::move(pending_top_k_parts[i]->part);
+            if (pending_top_k_parts[i]->has_top_k_granules)
+                ready_part.ranges = std::move(top_k_ranges[i]);
+
+            if (!ready_part.ranges.empty())
+                parts_to_publish.emplace_back(i, std::move(ready_part));
+        }
+    }
+
+    for (auto & [ready_part_idx, ready_part] : parts_to_publish)
+    {
+        auto candidate_ranges = ready_part.ranges;
+        ready_part.ranges = applyPreparedIndexResult(ready_part_idx, ready_part, std::move(candidate_ranges));
+        writeQueryConditionCacheForSkippedRanges(ready_part_idx, ready_part.ranges);
+        enqueueAnalyzedRanges(ready_part_idx, std::move(ready_part.ranges));
+    }
 }
 
 void MergeTreePipelinedReadPool::analyzePartAndEnqueueTasks(size_t part_idx)
@@ -305,11 +392,13 @@ void MergeTreePipelinedReadPool::analyzePartAndEnqueueTasks(size_t part_idx)
             part_index_order = &per_part_index_orders[original_part_index];
     }
 
+    MergeTreeDataSelectExecutor::PerPartIndexAnalysisStats part_stats;
     auto analyzed = MergeTreeDataSelectExecutor::analyzePartByPrimaryKeyAndSkipIndexes(
         part_analysis_context,
         std::move(analyzed_part),
         part_index_order,
-        scratch_result.index_stats);
+        scratch_result.index_stats,
+        useTopKBarrier() ? &part_stats : nullptr);
 
     if (!analyzed || is_cancelled.load(std::memory_order_relaxed))
     {
@@ -318,6 +407,12 @@ void MergeTreePipelinedReadPool::analyzePartAndEnqueueTasks(size_t part_idx)
     }
 
     analyzed_part = std::move(*analyzed);
+    if (useTopKBarrier())
+    {
+        enqueueTopKReadyPartsIfComplete(part_idx, std::move(analyzed_part), std::move(part_stats));
+        return;
+    }
+
     auto candidate_ranges = analyzed_part.ranges;
     analyzed_part.ranges = applyPreparedIndexResult(part_idx, analyzed_part, std::move(candidate_ranges));
 
@@ -355,7 +450,10 @@ MergeTreeReadTaskPtr MergeTreePipelinedReadPool::getTask(size_t, MergeTreeReadTa
 
         if (task_to_read)
         {
-            const size_t min_marks_per_task = std::max<size_t>(1, per_part_infos[task_to_read->part_idx]->min_marks_per_task);
+            size_t min_marks_per_task = std::max<size_t>(1, per_part_infos[task_to_read->part_idx]->min_marks_per_task);
+            if (analysis_context.top_k_filter_info)
+                min_marks_per_task = std::max<size_t>(min_marks_per_task, 4 * 1024 * 1024);
+
             MarkRanges task_ranges = takeMarks(task_to_read->ranges, min_marks_per_task);
             if (!task_to_read->ranges.empty() && !is_cancelled.load(std::memory_order_relaxed))
             {

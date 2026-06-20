@@ -7,6 +7,8 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <optional>
+#include <vector>
 
 namespace DB
 {
@@ -72,6 +74,15 @@ private:
         MarkRanges ranges;
     };
 
+    struct PendingTopKPart
+    {
+        RangesInDataPart part;
+        bool has_top_k_granules = false;
+        std::vector<MergeTreeIndexBulkGranulesMinMax::MinMaxGranule> top_k_granules;
+    };
+
+    bool useTopKBarrier() const;
+    void enqueueTopKReadyPartsIfComplete(size_t part_idx, RangesInDataPart part, MergeTreeDataSelectExecutor::PerPartIndexAnalysisStats stats);
     void analyzePartAndEnqueueTasks(size_t part_idx);
     void enqueueAnalyzedRanges(size_t part_idx, MarkRanges ranges);
     void writeQueryConditionCacheForSkippedRanges(size_t part_idx, const MarkRanges & kept_ranges) const;
@@ -80,6 +91,8 @@ private:
     mutable std::mutex mutex;
     std::deque<size_t> pending_parts TSA_GUARDED_BY(mutex);
     std::deque<ReadyTask> ready_tasks TSA_GUARDED_BY(mutex);
+    std::vector<std::optional<PendingTopKPart>> pending_top_k_parts TSA_GUARDED_BY(mutex);
+    size_t pending_top_k_parts_remaining TSA_GUARDED_BY(mutex) = 0;
     mutable std::mutex qcc_write_mutex;
 
     RuntimeDataflowStatisticsCacheUpdaterPtr updater;

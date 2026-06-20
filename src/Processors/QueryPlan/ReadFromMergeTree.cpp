@@ -599,7 +599,6 @@ Pipe ReadFromMergeTree::readFromPool(
     const bool use_pipelined_index_analysis
         = settings[Setting::merge_tree_pipelined_index_analysis]
         && indexes
-        && !top_k_filter_info.has_value()
         && !query_info.isFinal()
         && !query_info.input_order_info
         && !is_parallel_reading_from_replicas;
@@ -696,7 +695,8 @@ Pipe ReadFromMergeTree::readFromPool(
 
     LOG_DEBUG(log, "Reading approx. {} rows with {} streams", total_rows, pool_settings.threads);
 
-    const auto processor_index_build_context = use_pipelined_index_analysis
+    const bool keep_index_context_for_reader = use_pipelined_index_analysis && top_k_filter_info.has_value();
+    const auto processor_index_build_context = use_pipelined_index_analysis && !keep_index_context_for_reader
         ? MergeTreeIndexBuildContextPtr{}
         : index_build_context;
 
@@ -2721,8 +2721,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
             && !find_exact_ranges
             && !query_info_.isFinal()
             && !query_info_.input_order_info
-            && !is_parallel_reading_from_replicas_
-            && !top_k_filter_info.has_value();
+            && !is_parallel_reading_from_replicas_;
 
         if (!distributed_index_analysis_enabled)
         {
