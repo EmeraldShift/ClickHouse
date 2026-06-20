@@ -1,0 +1,50 @@
+100
+100
+100
+(Expression)
+ExpressionTransform × 2
+  (Aggregating)
+  Resize 2 → 2
+    AggregatingTransform × 2
+      (Expression)
+      ExpressionTransform × 2
+        (Expression)
+        ExpressionTransform × 2
+          (ReadFromMergeTree)
+          MergeTreeSelect(pool: PrefetchedReadPool, algorithm: Thread) × 2 0 → 1
+(Expression)
+ExpressionTransform
+  (Limit)
+  Limit
+    (Sorting)
+    RemoveVirtualRowTransform
+      (Expression)
+      ExpressionTransform
+        (Filter)
+        FilterTransform
+          (ReadFromMergeTree)
+          MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1
+[(1,'new'),(2,'keep')]
+(Expression)
+ExpressionTransform × 2
+  (Aggregating)
+  Resize 2 → 2
+    AggregatingTransform × 2
+      (Expression)
+      ExpressionTransform × 2
+        (Filter)
+        FilterTransform × 2
+          (ReadFromMergeTree)
+          ExpressionTransform × 2
+            SelectByIndicesTransform
+              ReplacingSorted
+                FilterSortedStreamByRange
+                Description: filter values in ((2), +inf]
+                  ExpressionTransform
+                    MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1
+                      SelectByIndicesTransform
+                        ReplacingSorted
+                          FilterSortedStreamByRange
+                          Description: filter values in (-inf, (2)]
+                            ExpressionTransform
+                              MergeTreeSelect(pool: ReadPoolInOrder, algorithm: InOrder) 0 → 1
