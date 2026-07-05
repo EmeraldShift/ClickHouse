@@ -16,6 +16,19 @@ SETTINGS index_granularity = 1;
 INSERT INTO relaxed_atoms_exact_ranges SELECT 'bar' FROM numbers(4096);
 
 -- max_rows_to_read = 1 is load-bearing: this returns 4096, so it can
+-- only pass if the count comes from exact ranges rather than row reads.
+SELECT count()
+FROM relaxed_atoms_exact_ranges
+WHERE match(s, '^foo') OR s = 'bar'
+SETTINGS
+    max_rows_to_read = 1,
+    optimize_trivial_count_query = 1,
+    optimize_use_implicit_projections = 1,
+    optimize_use_projections = 1,
+    use_query_condition_cache = 0,
+    merge_tree_coarse_index_granularity = 8;
+
+-- max_rows_to_read = 1 is load-bearing: this returns 4096, so it can
 -- only pass if exact multi-element IN can prove exact ranges.
 SELECT count()
 FROM relaxed_atoms_exact_ranges

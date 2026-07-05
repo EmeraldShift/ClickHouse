@@ -3,6 +3,7 @@
 -- no-parallel-replicas: EXPLAIN output differs for parallel replicas.
 SET explain_query_plan_default = 'legacy';
 
+SET optimize_use_implicit_projections = 0;
 
 DROP TABLE IF EXISTS 03772_table_match;
 

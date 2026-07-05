@@ -329,7 +329,40 @@ public:
 
         Function function = FUNCTION_UNKNOWN;
 
-        /// Whether to relax the key condition (e.g., for LIKE queries without a perfect prefix).
+        /// Whether this atom is an approximate weakening of the original predicate.
+        ///
+        /// Keys may not align exactly with the condition specified in the query.  We still
+        /// want to use the key expression to skip data when it is safe, so some atoms are
+        /// intentionally weakened during analysis.
+        ///
+        /// For example, suppose the key column is `toDate(a)`, and the current key range is
+        /// `toDate(a) IN [x, y]`.  A condition `a IN [u, v]` can be checked against the key as
+        /// `toDate(a) IN [toDate(u), toDate(v)]`, because `toDate` is monotonic
+        /// non-decreasing.  Similarly, `a IN (u, v)` also becomes
+        /// `toDate(a) IN [toDate(u), toDate(v)]`, because `toDate` is not strictly increasing.
+        /// That weakens the condition.
+        ///
+        /// For such a weakened atom, `can_be_true = false` is still reliable: if the weaker
+        /// condition cannot match, then the original condition cannot match either.  But
+        /// `can_be_false = false` is not reliable: the weaker condition might cover the whole
+        /// key range even though the original condition does not.  Therefore relaxed atom
+        /// evaluation must force `can_be_false = true` before any NOT/AND/OR composition can
+        /// consume the result.
+        ///
+        /// Current sources of relaxed atoms include:
+        ///  * FUNCTION_IN_RANGE / FUNCTION_NOT_IN_RANGE when constants are transformed through
+        ///    monotonic or deterministic key expressions.
+        ///  * FUNCTION_IN_SET / FUNCTION_NOT_IN_SET when the set check is not exact, e.g. tuple
+        ///    elements are dropped or transformed through a non-exact key expression.  Exact
+        ///    multi-element IN is discontinuous, but it is not relaxed for this purpose.
+        ///  * FUNCTION_ARGS_IN_HYPERRECTANGLE for space-filling curves.
+        ///  * FUNCTION_POINT_IN_POLYGON, which can prove non-intersection but does not prove
+        ///    that every point in the key range is inside the polygon.
+        ///  * Special functions such as `match`, which can produce a relaxed FUNCTION_IN_RANGE
+        ///    atom from a regular-expression prefix.
+        ///
+        /// FUNCTION_UNKNOWN is not marked relaxed: it already evaluates to `(true, true)`, so
+        /// it cannot prove either non-match or full match.
         bool relaxed = false;
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
@@ -381,59 +414,6 @@ public:
 
     const RPN & getRPN() const { return rpn; }
     const ColumnIndices & getKeyColumns() const { return key_columns; }
-
-    /// Whether this key condition is relaxed (computed from the RPN atoms). When a key
-    /// condition is relaxed, it is considered weakened. This is because keys may not
-    /// always align perfectly with the condition specified in the query, and the aim is
-    /// to enhance the usefulness of different types of key expressions across various
-    /// scenarios.
-    ///
-    /// For instance, in a scenario with one granule of key column toDate(a), where
-    /// the hyperrectangle is toDate(a) ∊ [x, y], the result of a ∊ [u, v] can be
-    /// deduced as toDate(a) ∊ [toDate(u), toDate(v)] due to the monotonic
-    /// non-decreasing nature of the toDate function. Similarly, for a ∊ (u, v), the
-    /// transformed outcome remains toDate(a) ∊ [toDate(u), toDate(v)] as toDate
-    /// does not strictly follow a monotonically increasing transformation. This is
-    /// one of the main use case about key condition relaxation.
-    ///
-    /// During the KeyCondition::checkInRange process, relaxing the key condition
-    /// can lead to a loosened result. For example, when transitioning from (u, v)
-    /// to [u, v], if a key is within the range [u, u], BoolMask::can_be_true will
-    /// be true instead of false, causing us to not skip this granule. This behavior
-    /// is acceptable as we can still filter it later on. Conversely, if the key is
-    /// within the range [u, v], BoolMask::can_be_false will be false instead of
-    /// true, indicating a stricter condition where all elements of the granule
-    /// satisfy the key condition. Hence, when the key condition is relaxed, we
-    /// cannot rely on BoolMask::can_be_false. One significant use case of
-    /// BoolMask::can_be_false is in trivial count optimization.
-    ///
-    /// Now let's review all the cases of key condition relaxation across different
-    /// atom types.
-    ///
-    /// 1. Not applicable: ALWAYS_FALSE, ALWAYS_TRUE, FUNCTION_NOT,
-    /// FUNCTION_AND, FUNCTION_OR.
-    ///
-    /// These atoms are either never relaxed or are relaxed by their children.
-    ///
-    /// 2. Constant transformed: FUNCTION_IN_RANGE, FUNCTION_NOT_IN_RANGE,
-    /// FUNCTION_IS_NULL. FUNCTION_IS_NOT_NULL, FUNCTION_IN_SET,
-    /// FUNCTION_NOT_IN_SET
-    ///
-    /// These atoms are relaxed only when the associated constants undergo
-    /// transformation by monotonic functions, as illustrated in the example
-    /// mentioned earlier. Multi-value sets are not relaxed by themselves because
-    /// MergeTreeSetIndex::checkInRange keeps can_be_false conservative across gaps.
-    ///
-    /// 3. Always relaxed: FUNCTION_UNKNOWN, FUNCTION_ARGS_IN_HYPERRECTANGLE
-    ///
-    /// These atoms are always considered relaxed for the sake of implementation
-    /// simplicity, as there may be "gaps" within the atom's hyperrectangle that the
-    /// granule's hyperrectangle may or may not intersect.
-    ///
-    /// NOTE: we also need to examine special functions that generate atoms. For
-    /// example, the `match` function can produce a FUNCTION_IN_RANGE atom based
-    /// on a given regular expression, which is relaxed for simplicity.
-    bool isRelaxed() const;
 
     bool isSinglePoint() const { return single_point; }
 

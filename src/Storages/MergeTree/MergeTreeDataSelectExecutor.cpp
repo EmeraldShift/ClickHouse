@@ -1710,11 +1710,6 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
         return part_with_ranges.ranges;
 
-    /// If conditions are relaxed, don't fill exact ranges.
-    if (key_condition.isRelaxed() || (part_offset_condition && part_offset_condition->isRelaxed())
-        || (total_offset_condition && total_offset_condition->isRelaxed()))
-        exact_ranges = nullptr;
-
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     const auto & sorting_key = metadata_snapshot->getSortingKey();
     auto index_columns = std::make_shared<ColumnsWithTypeAndName>();
@@ -2239,56 +2234,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                         check_in_range({result_exact_range.end - 1, result_exact_range.end}, BoolMask::consider_only_can_be_false).can_be_false)
                         --result_exact_range.end;
 
-                    if (result_exact_range.begin < result_exact_range.end)
+                    if (result_exact_range.begin < result_exact_range.end
+                        && !check_in_range(result_exact_range, BoolMask::consider_only_can_be_false).can_be_false)
                     {
-                        if (check_in_range(result_exact_range, BoolMask::consider_only_can_be_false).can_be_false)
-                        {
-                            /// key_condition.matchesExactContinuousRange returned true, but the
-                            /// range doesn't seem to be continuous. Something's broken - most likely a
-                            /// function reported inaccurate monotonicity (see the issue below).
-                            ///
-                            /// Log every participating condition (the key condition as well as the optional
-                            /// _part_offset and total-offset conditions), the part and the offending mark ranges
-                            /// before throwing, so the occurrence (typically found by a stress test or the fuzzer)
-                            /// is actionable. check_in_range combines all useful conditions, so any of them could
-                            /// be the culprit - in particular, a bad _part_offset / total-offset condition can trip
-                            /// this branch while the primary key_condition is empty or unrelated.
-                            /// The thrown message is deliberately kept constant: CI derives the failure's name
-                            /// from the exception's format string, so the details go to the log instead of the
-                            /// message to keep failures grouped under a single stable name.
-                            /// TODO: Remove the #ifndef and always throw after
-                            ///       https://github.com/ClickHouse/ClickHouse/issues/90461 is fixed.
-#ifndef NDEBUG
-                            auto describe_condition = [](const KeyCondition & condition)
-                            {
-                                return fmt::format("(relaxed: {}): {}", condition.isRelaxed(), condition.toString());
-                            };
-
-                            String conditions_description = fmt::format(
-                                "key condition (useful: {}) {}", key_condition_useful, describe_condition(key_condition));
-                            if (part_offset_condition_useful)
-                                conditions_description += fmt::format("; part offset condition {}", describe_condition(*part_offset_condition));
-                            if (total_offset_condition_useful)
-                                conditions_description += fmt::format("; total offset condition {}", describe_condition(*total_offset_condition));
-
-                            LOG_ERROR(
-                                log,
-                                "Inconsistent KeyCondition behavior: matchesExactContinuousRange() reported an exact "
-                                "continuous range, but the mark range [{}, {}) (exact subrange [{}, {})) of part {} is "
-                                "not exactly continuous. This is most likely caused by a function reporting inaccurate "
-                                "monotonicity (see https://github.com/ClickHouse/ClickHouse/issues/90461). "
-                                "Participating conditions: {}",
-                                result_range.begin, result_range.end,
-                                result_exact_range.begin, result_exact_range.end,
-                                part_name,
-                                conditions_description);
-                            throw Exception(ErrorCodes::LOGICAL_ERROR, "Inconsistent KeyCondition behavior");
-#endif
-                        }
-                        else
-                        {
-                            exact_ranges->emplace_back(std::move(result_exact_range));
-                        }
+                        exact_ranges->emplace_back(std::move(result_exact_range));
                     }
                 }
             }

@@ -1862,7 +1862,6 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
         metadata_snapshot,
         inverted_dag,
         local_context,
-        true /* strict */,
         !local_context->getSettingsRef()[Setting::use_partition_pruning] /* skip_analysis */);
 
     if (partition_pruner.isUseless() && !valid)
@@ -1883,9 +1882,23 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
     size_t res = 0;
     for (const auto & part : parts)
     {
-        if ((part_values.empty() || part_values.contains(part.data_part->name))
-            && !partition_pruner.canBePruned(*part.data_part))
+        if (!part_values.empty() && !part_values.contains(part.data_part->name))
+            continue;
+
+        if (valid)
+        {
             res += part.data_part->rows_count;
+            continue;
+        }
+
+        auto partition_match = partition_pruner.checkInPartition(*part.data_part);
+        if (!partition_match.can_be_true)
+            continue;
+
+        if (partition_match.can_be_false)
+            return {};
+
+        res += part.data_part->rows_count;
     }
     return res;
 }
@@ -9265,7 +9278,6 @@ Block MergeTreeData::getMinMaxCountProjectionBlock(
                 metadata_snapshot,
                 inverted_dag,
                 query_context,
-                /*strict=*/false,
                 /*skip_analysis_=*/!query_settings[Setting::use_partition_pruning]);
         }
 
