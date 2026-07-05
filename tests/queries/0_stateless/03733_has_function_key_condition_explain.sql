@@ -3,6 +3,7 @@
 -- EXPLAIN output may differ
 
 SET explain_query_plan_default = 'legacy';
+SET optimize_use_implicit_projections = 0;
 
 -- { echoOn }
 

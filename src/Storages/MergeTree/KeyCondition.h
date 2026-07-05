@@ -416,15 +416,15 @@ public:
     /// These atoms are either never relaxed or are relaxed by their children.
     ///
     /// 2. Constant transformed: FUNCTION_IN_RANGE, FUNCTION_NOT_IN_RANGE,
-    /// FUNCTION_IS_NULL. FUNCTION_IS_NOT_NULL, FUNCTION_IN_SET (1 element),
-    /// FUNCTION_NOT_IN_SET (1 element)
+    /// FUNCTION_IS_NULL. FUNCTION_IS_NOT_NULL, FUNCTION_IN_SET,
+    /// FUNCTION_NOT_IN_SET
     ///
     /// These atoms are relaxed only when the associated constants undergo
     /// transformation by monotonic functions, as illustrated in the example
-    /// mentioned earlier.
+    /// mentioned earlier. Multi-value sets are not relaxed by themselves because
+    /// MergeTreeSetIndex::checkInRange keeps can_be_false conservative across gaps.
     ///
-    /// 3. Always relaxed: FUNCTION_UNKNOWN, FUNCTION_IN_SET (>1 elements),
-    /// FUNCTION_NOT_IN_SET (>1 elements), FUNCTION_ARGS_IN_HYPERRECTANGLE
+    /// 3. Always relaxed: FUNCTION_UNKNOWN, FUNCTION_ARGS_IN_HYPERRECTANGLE
     ///
     /// These atoms are always considered relaxed for the sake of implementation
     /// simplicity, as there may be "gaps" within the atom's hyperrectangle that the

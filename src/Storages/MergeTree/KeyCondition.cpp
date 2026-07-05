@@ -1433,10 +1433,7 @@ bool KeyCondition::isRelaxed() const
 {
     return std::any_of(rpn.begin(), rpn.end(), [](const auto & elem)
     {
-        return elem.relaxed
-            || elem.function == RPNElement::FUNCTION_UNKNOWN
-            || ((elem.function == RPNElement::FUNCTION_IN_SET || elem.function == RPNElement::FUNCTION_NOT_IN_SET)
-                && elem.set_index->size() > 1);
+        return elem.relaxed || elem.function == RPNElement::FUNCTION_UNKNOWN;
     });
 }
 

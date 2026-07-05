@@ -2139,7 +2139,8 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 
                     if (exact_ranges && !result.can_be_false)
                     {
-                        if (exact_ranges->empty() || range.begin - exact_ranges->back().end > min_marks_for_seek)
+                        /// Exact ranges are counted without applying the filter, so they must not be coalesced across non-matching gaps.
+                        if (exact_ranges->empty() || range.begin != exact_ranges->back().end)
                             exact_ranges->push_back(range);
                         else
                             exact_ranges->back().end = range.end;
