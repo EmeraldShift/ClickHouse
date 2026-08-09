@@ -5,6 +5,7 @@
 #include <Core/AccurateComparison.h>
 #include <Core/PlainRanges.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeNullable.h>
@@ -3865,6 +3866,22 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
             }
             else
                 key_expr_type_not_null = key_expr_type;
+
+            /// Range normalizes open Int64/UInt64 bounds by one. An integer or DateTime
+            /// constant uses seconds, while a DateTime64 key can have subsecond values, so
+            /// first represent an exact bound in the key's domain and keep the range open.
+            const auto * date_time64_type = typeid_cast<const DataTypeDateTime64 *>(key_expr_type_not_null.get());
+            if (date_time64_type
+                && date_time64_type->getScale() > 0
+                && (isNativeInteger(const_type) || WhichDataType(const_type).isDateTime()))
+            {
+                Field converted = tryConvertFieldToType(const_value, *key_expr_type_not_null, const_type.get(), {});
+                if (converted.isNull())
+                    return false;
+
+                const_value = converted;
+                const_type = key_expr_type_not_null;
+            }
 
             /// Native integers and DateTime/DateTime64 are accurately compared without cast.
             bool cast_not_needed =
