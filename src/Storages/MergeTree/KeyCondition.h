@@ -79,7 +79,8 @@ public:
         const Names & key_column_names,
         const ExpressionActionsPtr & key_expr,
         bool single_point_ = false,
-        bool skip_analysis_ = false); /// Toggled by `use_primary_key`, `use_partition_key` setting. Useful for testing.
+        bool skip_analysis_ = false, /// Toggled by `use_primary_key` and `use_partition_key`; useful for testing.
+        bool float_extrema_may_omit_nan_ = false);
 
     /// Same as above, but takes the key's KeyDescription. The condition honors the key's per-column
     /// sort directions (reverse flags; an empty vector means all-ascending, e.g. a partition key).
@@ -354,6 +355,9 @@ public:
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();
+
+        /// The source of this range may omit NaNs from Float extrema.
+        bool float_extrema_may_omit_nan = false;
 
         /// Which columns are involved. E.g.:
         ///  * if FUNCTION[_NOT]_IN_RANGE: exactly one element,
@@ -672,6 +676,7 @@ private:
     /// transformed by any deterministic functions. It is used by
     /// PartitionPruner.
     bool single_point;
+    bool float_extrema_may_omit_nan = false;
 
     /// Holds the result of (setting.date_time_overflow_behavior == DateTimeOverflowBehavior::Ignore)
     /// Used to check toDateTime monotonicity.

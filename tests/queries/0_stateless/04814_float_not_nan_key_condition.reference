@@ -1,0 +1,7 @@
+Float64 NOT greater	1	1
+Float64 NOT greaterOrEquals	1	1
+Float64 NOT less	1	1
+Float64 NOT lessOrEquals	1	1
+Float32 NOT greater	1
+LowCardinality Float64 NOT greater	1
+integer inversion still prunes	0

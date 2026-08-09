@@ -1096,6 +1096,19 @@ static const ActionsDAG::Node * tryRewriteNullIfComparison(
     return &cmp_node;
 }
 
+static bool preserveNotForFloatInequality(
+    std::string_view name, const ActionsDAG::NodeRawConstPtrs & arguments)
+{
+    if (name != "less" && name != "lessOrEquals" && name != "greater" && name != "greaterOrEquals")
+        return false;
+
+    for (const auto * argument : arguments)
+        if (WhichDataType(removeLowCardinalityAndNullable(argument->result_type)).isFloat())
+            return true;
+
+    return false;
+}
+
 static const ActionsDAG::Node & cloneDAGWithInversionPushDown(
     const ActionsDAG::Node & node,
     ActionsDAG & inverted_dag,
@@ -1242,7 +1255,8 @@ static const ActionsDAG::Node & cloneDAGWithInversionPushDown(
                     arg = &cloneDAGWithInversionPushDown(*arg, inverted_dag, inputs_mapping, context, false, child_boolean_context);
 
                 auto it = inverse_relations.find(name);
-                if (it != inverse_relations.end())
+                if (it != inverse_relations.end()
+                    && !(need_inversion && preserveNotForFloatInequality(name, children)))
                 {
                     const auto & func_name = need_inversion ? it->second : it->first;
                     auto function_builder = FunctionFactory::instance().get(func_name, context);
@@ -1429,9 +1443,11 @@ KeyCondition::KeyCondition(
     const Names & key_column_names_,
     const ExpressionActionsPtr & key_expr_,
     bool single_point_,
-    bool skip_analysis_)
+    bool skip_analysis_,
+    bool float_extrema_may_omit_nan_)
     : num_key_columns(key_column_names_.size())
     , single_point(single_point_)
+    , float_extrema_may_omit_nan(float_extrema_may_omit_nan_)
     , date_time_overflow_behavior_ignore(
           context->getSettingsRef()[Setting::date_time_overflow_behavior] == FormatSettings::DateTimeOverflowBehavior::Ignore)
 {
@@ -3579,6 +3595,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
 
         MonotonicFunctionsChain chain;
         std::string func_name = func.getFunctionName();
+        bool key_type_is_float = false;
         bool key_type_is_integer_represented = false;
 
         if (atom_map.find(func_name) == std::end(atom_map))
@@ -3867,6 +3884,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
             else
                 key_expr_type_not_null = key_expr_type;
 
+            key_type_is_float = WhichDataType(key_expr_type_not_null).isFloat();
             key_type_is_integer_represented = key_expr_type_not_null->isValueRepresentedByInteger();
 
             /// Native integers and DateTime/DateTime64 are accurately compared without cast.
@@ -4024,6 +4042,8 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
         const bool atom_created = atom_it->second(out, const_value);
         if (atom_created && key_type_is_integer_represented)
             out.range.shrinkToIncludedIfPossible();
+        if (atom_created && float_extrema_may_omit_nan && key_type_is_float)
+            out.float_extrema_may_omit_nan = true;
         return atom_created;
     }
     if (node.tryGetConstant(const_value, const_type))
@@ -5483,6 +5503,16 @@ static void tupleRangeToBoundingBox(const Range & tuple_range, Float64 & x_min, 
     }
 }
 
+static void adjustForNaN(
+    const Range & key_range, bool may_contain_nan, bool & intersects, bool & contains)
+{
+    /// Float extrema omit NaNs, so a Float range cannot prove the predicate always true.
+    if (unlikely(key_range.left.isNaN()))
+        intersects = false;
+    if (may_contain_nan || unlikely(key_range.left.isNaN()) || unlikely(key_range.right.isNaN()))
+        contains = false;
+}
+
 BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & hyperrectangle,
     const DataTypes & data_types,
@@ -5553,22 +5583,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             bool intersects = element.range.intersectsRange(key_range);
             bool contains = element.range.containsRange(key_range);
 
-            /// NaN doesn't satisfy any comparison condition in SQL (e.g., NaN > 0 is false/NULL).
-            /// In ClickHouse sort order, NaN has a defined position (after +inf), so Range-based
-            /// analysis may incorrectly include NaN values.
-            /// - If left bound is NaN: all values in the range are NaN (NaN sorts last),
-            ///   so no comparison condition can be true.
-            /// - If only right bound is NaN: the range extends into NaN territory,
-            ///   so it cannot be fully contained (NaN values don't satisfy the condition).
-            if (unlikely(key_range.left.isNaN()))
-            {
-                intersects = false;
-                contains = false;
-            }
-            else if (unlikely(key_range.right.isNaN()))
-            {
-                contains = false;
-            }
+            adjustForNaN(key_range, element.float_extrema_may_omit_nan, intersects, contains);
 
             rpn_stack.emplace_back(intersects, !contains);
 
@@ -5991,22 +6006,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                         bool intersects = element.range.intersectsRange(key_range);
                         bool contains   = element.range.containsRange(key_range);
 
-                        /// NaN doesn't satisfy any comparison condition in SQL (e.g., NaN > 0 is false/NULL).
-                        /// In ClickHouse sort order, NaN has a defined position (after +inf), so Range-based
-                        /// analysis may incorrectly include NaN values.
-                        /// - If left bound is NaN: all values in the range are NaN (NaN sorts last),
-                        ///   so no comparison condition can be true.
-                        /// - If only right bound is NaN: the range extends into NaN territory,
-                        ///   so it cannot be fully contained (NaN values don't satisfy the condition).
-                        if (unlikely(key_range.left.isNaN()))
-                        {
-                            intersects = false;
-                            contains = false;
-                        }
-                        else if (unlikely(key_range.right.isNaN()))
-                        {
-                            contains = false;
-                        }
+                        adjustForNaN(key_range, element.float_extrema_may_omit_nan, intersects, contains);
 
                         rpn_stack.emplace_back(intersects, !contains);
                         /// we don't create bloom_filter_data if monotonic_functions_chain is present
@@ -6017,22 +6017,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                     bool intersects = element.range.intersectsRange(key_range);
                     bool contains = element.range.containsRange(key_range);
 
-                    /// NaN doesn't satisfy any comparison condition in SQL (e.g., NaN > 0 is false/NULL).
-                    /// In ClickHouse sort order, NaN has a defined position (after +inf), so Range-based
-                    /// analysis may incorrectly include NaN values.
-                    /// - If left bound is NaN: all values in the range are NaN (NaN sorts last),
-                    ///   so no comparison condition can be true.
-                    /// - If only right bound is NaN: the range extends into NaN territory,
-                    ///   so it cannot be fully contained (NaN values don't satisfy the condition).
-                    if (unlikely(key_range.left.isNaN()))
-                    {
-                        intersects = false;
-                        contains = false;
-                    }
-                    else if (unlikely(key_range.right.isNaN()))
-                    {
-                        contains = false;
-                    }
+                    adjustForNaN(key_range, element.float_extrema_may_omit_nan, intersects, contains);
 
                     rpn_stack.emplace_back(intersects, !contains);
 

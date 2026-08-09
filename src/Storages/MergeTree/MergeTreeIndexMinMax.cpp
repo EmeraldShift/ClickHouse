@@ -198,7 +198,14 @@ namespace
 
 KeyCondition buildCondition(const IndexDescription & index, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context)
 {
-    return KeyCondition{filter_dag, context, index.column_names, index.expression};
+    return KeyCondition{
+        filter_dag,
+        context,
+        index.column_names,
+        index.expression,
+        /* single_point_ = */ false,
+        /* skip_analysis_ = */ false,
+        /* float_extrema_may_omit_nan_ = */ true};
 }
 
 }
