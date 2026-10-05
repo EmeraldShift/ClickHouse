@@ -40,7 +40,7 @@ SELECT x, count() FROM t_dp_otel GROUP BY x FORMAT Null;
 -- only worker-side trace, so the span must carry the failure. `url` forwards the trace context of
 -- its query the same way the dispatch does.
 SET log_comment = 'otel worker spans: failed request', make_distributed_plan = 0, http_max_tries = 1, http_make_head_request = 0;
-SELECT * FROM url('http://localhost:' || toString(getServerPort('interserver_http_port')) || '/?endpoint=no_such_endpoint', RawBLOB, 'd String'); -- { serverError RECEIVED_ERROR_FROM_REMOTE_IO_SERVER }
+SELECT * FROM url('http://localhost:' || toString(getServerPort('interserver_http_port')) || '/?endpoint=no_such_endpoint&compress=false', RawBLOB, 'd String'); -- { serverError RECEIVED_ERROR_FROM_REMOTE_IO_SERVER }
 
 SET opentelemetry_start_trace_probability = 0, log_comment = '';
 SYSTEM FLUSH LOGS query_log, opentelemetry_span_log;
@@ -88,11 +88,13 @@ SELECT 'request spans:';
 SELECT DISTINCT
     s.label, s.operation_name, s.kind,
     'parent: ' || multiIf(p.operation_name LIKE 'StatelessWorker%', p.operation_name, p.span_id != 0, 'a span of the initiator query', 'MISSING'),
-    'endpoint: ' || extract(s.attribute['clickhouse.uri'], 'endpoint=([^&]*)'),
+    'endpoint: ' || extract(decodeURLComponent(s.attribute['clickhouse.uri']), 'endpoint=([^&/]*)'),
     'http.method: ' || s.attribute['http.method'],
     'http_status: ' || s.attribute['clickhouse.http_status'],
-    'exception: ' || if(mapContains(s.attribute, 'clickhouse.exception'), s.attribute['clickhouse.exception'], 'none'),
-    'exception_code: ' || if(mapContains(s.attribute, 'clickhouse.exception_code'), s.attribute['clickhouse.exception_code'], 'none')
+    'exception_code: ' || if(mapContains(s.attribute, 'clickhouse.exception_code'), s.attribute['clickhouse.exception_code'], 'none'),
+    -- The message without the "Code: N. DB::Exception: " prefix: the code is printed above, and the
+    -- harness treats an exception text in the output as a failure of the test.
+    'exception: ' || if(mapContains(s.attribute, 'clickhouse.exception'), extract(s.attribute['clickhouse.exception'], 'DB::Exception: (.*)$'), 'none')
 FROM spans AS s
 LEFT JOIN spans AS p ON p.span_id = s.parent_span_id
 WHERE s.operation_name = 'InterserverIOHTTPHandler'
