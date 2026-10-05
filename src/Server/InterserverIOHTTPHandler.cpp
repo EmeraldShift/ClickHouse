@@ -9,10 +9,12 @@
 #include <Interpreters/InterserverIOHandler.h>
 #include <Server/HTTP/HTMLForm.h>
 #include <Server/HTTP/WriteBufferFromHTTPServerResponse.h>
+#include <Common/Exception.h>
 #include <Common/OpenTelemetryTraceContext.h>
 #include <Common/logger_useful.h>
 #include <Common/maskSensitiveQueryParameters.h>
 #include <Common/setThreadName.h>
+#include <base/scope_guard.h>
 
 #include <Poco/Net/HTTPBasicCredentials.h>
 #include <Poco/String.h>
@@ -116,9 +118,6 @@ void InterserverIOHTTPHandler::processQuery(HTTPServerRequest & request, HTTPSer
 
     LOG_TRACE(log, "Request URI: {}", maskSensitiveQueryParametersInURI(request.getURI()));
 
-    /// Kept alive for the whole request: the trace context is installed on this thread while it exists.
-    OpenTelemetry::TracingContextHolderPtr thread_trace_context = startTracingContext(request);
-
     String endpoint_name = params.get("endpoint");
     bool compress = params.get("compress") == "true";
 
@@ -156,6 +155,16 @@ void InterserverIOHTTPHandler::handleRequest(HTTPServerRequest & request, HTTPSe
     if (request.getVersion() == HTTPServerRequest::HTTP_1_1)
         response.setChunkedTransferEncoding(true);
 
+    /// Spans the whole request, failures included. The trace context is installed on this thread
+    /// while the holder exists. A dispatch that fails before its task starts (authentication, an
+    /// exception in the endpoint) leaves this span as its only worker-side trace, so the failure
+    /// and the HTTP status are recorded on it, the same as `HTTPHandler` does.
+    OpenTelemetry::TracingContextHolderPtr thread_trace_context = startTracingContext(request);
+    SCOPE_EXIT({
+        if (thread_trace_context)
+            thread_trace_context->root_span.addAttribute("clickhouse.http_status", response.getStatus());
+    });
+
     auto output = std::make_shared<WriteBufferFromHTTPServerResponse>(
         response, request.getMethod() == Poco::Net::HTTPRequest::HTTP_HEAD, write_event);
 
@@ -171,6 +180,8 @@ void InterserverIOHTTPHandler::handleRequest(HTTPServerRequest & request, HTTPSe
         else
         {
             LOG_WARNING(log, "Query processing failed request: '{}' authentication failed", maskSensitiveQueryParametersInURI(request.getURI()));
+            if (thread_trace_context)
+                thread_trace_context->root_span.addAttribute(ExecutionStatus(ErrorCodes::REQUIRED_PASSWORD, message));
             output->cancelWithException(request, ErrorCodes::REQUIRED_PASSWORD, message, nullptr);
         }
     }
@@ -184,6 +195,8 @@ void InterserverIOHTTPHandler::handleRequest(HTTPServerRequest & request, HTTPSe
         else
             LOG_INFO(log, message);
 
+        if (thread_trace_context)
+            thread_trace_context->root_span.addAttribute(ExecutionStatus::fromCurrentException("", /* with_stacktrace */ false, /* with_version */ false));
         output->cancelWithException(request, getCurrentExceptionCode(), message.text, nullptr);
     }
     catch (...)
@@ -191,6 +204,8 @@ void InterserverIOHTTPHandler::handleRequest(HTTPServerRequest & request, HTTPSe
         PreformattedMessage message = getCurrentExceptionMessageAndPattern(/* with_stacktrace */ false);
         LOG_ERROR(log, message);
 
+        if (thread_trace_context)
+            thread_trace_context->root_span.addAttribute(ExecutionStatus::fromCurrentException("", /* with_stacktrace */ false, /* with_version */ false));
         output->cancelWithException(request, getCurrentExceptionCode(), message.text, nullptr);
     }
 }

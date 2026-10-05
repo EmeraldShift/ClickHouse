@@ -106,7 +106,16 @@ String sendTask(const String & endpoint_uri, const String & unique_task_id, cons
         serializeTask(task_description, buf);
     };
 
-    return doSendTask(endpoint_uri, unique_task_id, task_serializer, unique_temp_file_path, context);
+    try
+    {
+        return doSendTask(endpoint_uri, unique_task_id, task_serializer, unique_temp_file_path, context);
+    }
+    catch (...)
+    {
+        /// Otherwise a dispatch that never reached the worker leaves a span that looks successful.
+        span.addAttribute(std::current_exception());
+        throw;
+    }
 }
 
 /// Get task status by its id.
