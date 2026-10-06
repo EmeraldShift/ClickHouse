@@ -2465,6 +2465,8 @@ Evaluate minmax skip-index granules in vectorized chunks instead of one at a tim
 
 Unsupported conditions fall back to per-granule evaluation.
 
+The setting only applies to the filtering of marks before reading data. When skip indexes are evaluated during data read ([use_skip_indexes_on_data_read](#use_skip_indexes_on_data_read) = 1), minmax indexes use per-granule evaluation and this setting has no effect.
+
 Possible values:
 
 - 0 — Disabled.
