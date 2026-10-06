@@ -2977,8 +2977,8 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
     }
     else if (bulk_filtering)
     {
-        /// Process granules in bounded chunks to avoid part-sized intermediate storage.
-        constexpr size_t chunk_size_index_granules = DEFAULT_BLOCK_SIZE;
+        /// Process granules in chunks of `max_block_size` to avoid part-sized intermediate storage.
+        const size_t chunk_size_index_granules = reader_settings.bulk_filtering_chunk_size;
 
         /// Bulk evaluation does not write owned-leaf bits for partial-disjunction merging.
         /// Do not bridge rejected gaps here: a later index would otherwise evaluate those marks

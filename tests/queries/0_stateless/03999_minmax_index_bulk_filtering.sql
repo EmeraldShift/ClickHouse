@@ -268,8 +268,8 @@ FROM
 DROP TABLE t_bulk_fixed_string;
 
 -- Exercise survivors immediately on both sides of the chunk boundary: `filterMarksUsingIndex`
--- evaluates the index in chunks of `DEFAULT_BLOCK_SIZE` = 65409 granules, so granule 65408 is the
--- last one of the first chunk and granule 65409 is the first one of the second chunk.
+-- evaluates the index in chunks of `max_block_size` granules, so with `max_block_size = 100` granule 99
+-- is the last one of the first chunk and granule 100 is the first one of the second chunk.
 CREATE TABLE t_bulk_chunk_boundary
 (
     x UInt32,
@@ -279,22 +279,21 @@ ENGINE = MergeTree
 ORDER BY tuple()
 SETTINGS index_granularity = 1;
 
--- A single part, so that the granule number of `x` is `x`. Insert it as one block rather than merging
--- afterwards: a merge of 65538 one-row granules is too slow in the sanitizer builds.
-INSERT INTO t_bulk_chunk_boundary SELECT number FROM numbers(65538)
-    SETTINGS max_block_size = 100000, min_insert_block_size_rows = 100000, min_insert_block_size_bytes = 0, max_insert_threads = 1;
+-- A single part, so that the granule number of `x` is `x`.
+INSERT INTO t_bulk_chunk_boundary SELECT number FROM numbers(300)
+    SETTINGS max_block_size = 1000, min_insert_block_size_rows = 1000, min_insert_block_size_bytes = 0, max_insert_threads = 1;
 SELECT 'bulk chunk boundary parts', count() FROM system.parts WHERE database = currentDatabase() AND table = 't_bulk_chunk_boundary' AND active;
 
 SELECT 'bulk chunk boundary parity',
-    (SELECT count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 65408 AND 65409
-         SETTINGS use_minmax_index_bulk_filtering = 0) =
-    (SELECT count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 65408 AND 65409
-         SETTINGS use_minmax_index_bulk_filtering = 1) AS eq,
-    (SELECT count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 65408 AND 65409) AS count;
+    (SELECT count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 99 AND 100
+         SETTINGS use_minmax_index_bulk_filtering = 0, max_block_size = 100) =
+    (SELECT count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 99 AND 100
+         SETTINGS use_minmax_index_bulk_filtering = 1, max_block_size = 100) AS eq,
+    (SELECT count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 99 AND 100) AS count;
 
 -- Exactly the two granules survive: a granule lost at the handoff changes the count, an extra one exceeds the limit.
-SELECT 'bulk chunk boundary granules', count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 65408 AND 65409
-    SETTINGS use_minmax_index_bulk_filtering = 1, force_data_skipping_indices = 'idx_x', max_rows_to_read = 2, read_overflow_mode = 'throw';
+SELECT 'bulk chunk boundary granules', count() FROM t_bulk_chunk_boundary WHERE x BETWEEN 99 AND 100
+    SETTINGS use_minmax_index_bulk_filtering = 1, max_block_size = 100, force_data_skipping_indices = 'idx_x', max_rows_to_read = 2, read_overflow_mode = 'throw';
 
 DROP TABLE t_bulk_chunk_boundary;
 DROP TABLE t_bulk_num;
