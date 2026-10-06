@@ -10,6 +10,7 @@
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/IDataType.h>
+#include <DataTypes/hasNullable.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
@@ -354,12 +355,13 @@ ExpressionActionsPtr tryBuildMinMaxActions(
     ActionsDAG dag;
 
     /// Nullable inputs produce nullable comparison masks and have a different serialized shape;
-    /// leave them on the scalar path.
+    /// leave them on the scalar path. This includes a nullable type nested in a `Tuple`, e.g.
+    /// `Tuple(Nullable(Int32), Int32)`, whose comparisons return `Nullable(UInt8)` as well.
     std::vector<std::pair<const ActionsDAG::Node *, const ActionsDAG::Node *>> inputs;
     inputs.reserve(index_data_types.size());
     for (size_t i = 0; i < index_data_types.size(); ++i)
     {
-        if (isNullableOrLowCardinalityNullable(index_data_types[i]))
+        if (hasTypeThatCanContainNulls(index_data_types[i]))
             return nullptr;
         /// A `LowCardinality` input would make every comparison node return `LowCardinality(UInt8)`,
         /// and `can_be_true` is consumed as a plain `ColumnUInt8`. The bounds are read as full columns
