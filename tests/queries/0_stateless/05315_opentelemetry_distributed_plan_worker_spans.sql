@@ -45,29 +45,37 @@ SELECT * FROM url('http://localhost:' || toString(getServerPort('interserver_htt
 SET opentelemetry_start_trace_probability = 0, log_comment = '';
 SYSTEM FLUSH LOGS query_log, opentelemetry_span_log;
 
--- The spans of the three traces, labelled by the log_comment of their initiator query.
+-- The spans of the three traces, labelled by the log_comment of their initiator query. The span log
+-- is large on a busy server, so it is never on the build side of a join: the few trace ids are
+-- collected first and the spans are then read with an IN filter, whatever the join settings are.
+CREATE TEMPORARY TABLE traced_queries ENGINE = Memory AS
+SELECT DISTINCT query_id, replaceOne(log_comment, 'otel worker spans: ', '') AS label
+FROM system.query_log
+WHERE current_database = currentDatabase() AND log_comment LIKE 'otel worker spans: %';
+
+CREATE TEMPORARY TABLE traces ENGINE = Memory AS
+SELECT trace_id, label, query_id AS initiator_query_id
+FROM
+(
+    SELECT trace_id, attribute['clickhouse.query_id'] AS query_id
+    FROM system.opentelemetry_span_log
+    WHERE finish_date >= yesterday() AND operation_name = 'query'
+        AND attribute['clickhouse.query_id'] IN (SELECT query_id FROM traced_queries)
+) AS query_spans
+JOIN traced_queries USING (query_id);
+
 CREATE TEMPORARY TABLE spans ENGINE = Memory AS
-WITH
-    traced_queries AS
-    (
-        SELECT DISTINCT query_id, replaceOne(log_comment, 'otel worker spans: ', '') AS label
-        FROM system.query_log
-        WHERE current_database = currentDatabase() AND log_comment LIKE 'otel worker spans: %'
-    ),
-    traces AS
-    (
-        SELECT trace_id, label, traced_queries.query_id AS initiator_query_id
-        FROM system.opentelemetry_span_log
-        JOIN traced_queries ON attribute['clickhouse.query_id'] = traced_queries.query_id
-        WHERE finish_date >= yesterday() AND operation_name = 'query'
-    )
 SELECT
     label, span_id, parent_span_id, operation_name, kind, attribute,
     operation_name = 'query' AND attribute['clickhouse.query_id'] = initiator_query_id AS is_initiator,
     attribute['clickhouse.initial_query_id'] = initiator_query_id AS has_initiator_query_id
-FROM system.opentelemetry_span_log
-JOIN traces USING (trace_id)
-WHERE finish_date >= yesterday();
+FROM
+(
+    SELECT trace_id, span_id, parent_span_id, operation_name, kind, attribute
+    FROM system.opentelemetry_span_log
+    WHERE finish_date >= yesterday() AND trace_id IN (SELECT trace_id FROM traces)
+) AS trace_spans
+JOIN traces USING (trace_id);
 
 SELECT 'traces found:', arraySort(groupUniqArray(label)) FROM spans;
 
