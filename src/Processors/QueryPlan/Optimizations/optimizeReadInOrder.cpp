@@ -1,6 +1,6 @@
 #include <Columns/ColumnConst.h>
 #include <DataTypes/DataTypeLowCardinality.h>
-#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/DataTypeTuple.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
@@ -224,12 +224,31 @@ using FixedColumns = std::unordered_set<const ActionsDAG::Node *>;
 
 /// `equals` compares a `String` with a `FixedString` zero-padded, so `s = toFixedString('a', 2)` holds for
 /// the `String` values `'a'`, `'a\0'` and `'a\0\0'`. They sort differently, so such a condition does not fix `s`.
-/// A `FixedString` column is not affected: all its values have the same length, so at most one of them matches.
-bool equalsMatchesSeveralValues(const ActionsDAG::Node & column, const ActionsDAG::Node & constant)
+/// `Tuple` values are compared element by element with `equals`, so the same holds for a `String` element compared
+/// with a `FixedString` element: `t = tuple(toFixedString('a', 2))` holds for `tuple('a')` and `tuple('a\0')`.
+/// `Array` and `Map` values are cast to a common type and compared byte by byte, so they are not affected.
+/// A `FixedString` column is not affected either: all its values have the same length, so at most one of them matches.
+bool comparesStringWithFixedString(const DataTypePtr & column_type_with_wrappers, const DataTypePtr & constant_type_with_wrappers)
 {
-    auto column_type = removeNullable(removeLowCardinality(column.result_type));
-    auto constant_type = removeNullable(removeLowCardinality(constant.result_type));
-    return isString(column_type) && isFixedString(constant_type);
+    auto column_type = removeLowCardinalityAndNullable(column_type_with_wrappers);
+    auto constant_type = removeLowCardinalityAndNullable(constant_type_with_wrappers);
+    if (isString(column_type) && isFixedString(constant_type))
+        return true;
+
+    const auto * column_tuple = typeid_cast<const DataTypeTuple *>(column_type.get());
+    const auto * constant_tuple = typeid_cast<const DataTypeTuple *>(constant_type.get());
+    if (!column_tuple || !constant_tuple)
+        return false;
+
+    const auto & column_elements = column_tuple->getElements();
+    const auto & constant_elements = constant_tuple->getElements();
+    if (column_elements.size() != constant_elements.size())
+        return false;
+
+    for (size_t i = 0; i < column_elements.size(); ++i)
+        if (comparesStringWithFixedString(column_elements[i], constant_elements[i]))
+            return true;
+    return false;
 }
 
 /// Right now we find only simple cases like 'and(..., and(..., and(column = value, ...), ...'
@@ -270,7 +289,7 @@ void appendFixedColumnsFromFilterExpression(const ActionsDAG::Node & filter_expr
                 }
 
                 if (maybe_fixed_column && num_constant_columns + 1 == node->children.size()
-                    && !equalsMatchesSeveralValues(*maybe_fixed_column, *constant))
+                    && !comparesStringWithFixedString(maybe_fixed_column->result_type, constant->result_type))
                 {
                     //std::cerr << "====== Added fixed column " << maybe_fixed_column->result_name << ' ' << static_cast<const void *>(maybe_fixed_column) << std::endl;
                     fixed_columns.insert(maybe_fixed_column);
