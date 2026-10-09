@@ -9,10 +9,10 @@
 #include <base/sort.h>
 #include <Common/SipHash.h>
 #include <Common/StringUtils.h>
+#include <Common/UnorderedMapWithMemoryTracking.h>
 
 #include <string_view>
 #include <vector>
-#include <unordered_map>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -32,10 +32,7 @@ namespace DB::ErrorCodes
 
 namespace DB::Graphite
 {
-/// A process-wide constant built during static initialization. A `-WithMemoryTracking` container would
-/// charge it to whichever thread's memory tracker happens to be current, and would throw on allocation
-/// failure before any tracker is set up.
-static std::unordered_map<RuleType, const String> ruleTypeMap = /// STYLE_CHECK_ALLOW_STD_CONTAINERS
+static UnorderedMapWithMemoryTracking<RuleType, const String> ruleTypeMap =
 {
    { RuleTypeAll, "all" },
    { RuleTypePlain, "plain" },
