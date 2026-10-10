@@ -941,11 +941,15 @@ fi
             except Exception as ex:
                 print(f"WARNING: Failed to chmod {file}: {ex}")
 
-    def prepare_logs(self, info, all=False):
+    def prepare_logs(self, info, all=False, job_failed=None):
+        # `all` attaches the full debug bundle; `job_failed` decides whether the jemalloc
+        # profiles are rendered. Callers that attach the bundle exactly on failure can omit it.
+        if job_failed is None:
+            job_failed = all
         res = []
         try:
             res = self._get_logs_archives_server()
-            res += self._get_jemalloc_profiles(job_failed=all)
+            res += self._get_jemalloc_profiles(job_failed=job_failed)
             if all:
                 res += self.debug_artifacts
                 res += self.dump_system_tables()
