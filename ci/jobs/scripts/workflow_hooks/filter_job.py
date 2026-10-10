@@ -339,6 +339,27 @@ def _matches_digest_path(path, patterns):
     return False
 
 
+CONTRIB_TSAN_INTEGRATION_JOBS = [
+    j.name for j in JobConfigs.integration_test_contrib_tsan_pr_jobs
+]
+
+
+def _submodule_paths():
+    """The submodule paths from `.gitmodules`. Read at run time: the file is in the checkout."""
+    output = Shell.get_output(
+        "git config -f .gitmodules --get-regexp '^submodule\\..*\\.path$'",
+        verbose=True,
+    )
+    return {line.split(maxsplit=1)[1] for line in output.splitlines() if " " in line}
+
+
+def _has_submodule_changes(changed_files):
+    """True if the PR changes the commit a submodule points to (a gitlink, which shows up
+    as a changed file at the submodule path)."""
+    paths = {f.removeprefix("./") for f in changed_files}
+    return bool(paths & _submodule_paths())
+
+
 def _has_stress_or_fuzzer_changes(changed_files):
     return any(
         _matches_digest_path(f.removeprefix("./"), _STRESS_AND_FUZZER_PATHS)
@@ -629,6 +650,13 @@ def should_skip_job(job_name):
 
     if job_name == JobNames.BUILD_PROFILE_DIFF and only_docs(changed_files):
         return True, "Skipped, only documentation changed"
+
+    # The full TSan integration run is only for the PRs that bump a submodule, see
+    # `JobConfigs.integration_test_contrib_tsan_pr_jobs`. Other PRs get the targeted selection.
+    if job_name in CONTRIB_TSAN_INTEGRATION_JOBS and not _has_submodule_changes(
+        changed_files
+    ):
+        return True, "Skipped, no submodule (gitlink) changes"
 
     # Run Keeper Stress jobs only when there are changes in src/Coordination,
     # tests/stress/keeper, or ci/jobs/keeper_stress_job.py
