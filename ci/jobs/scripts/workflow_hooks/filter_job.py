@@ -346,18 +346,23 @@ CONTRIB_TSAN_INTEGRATION_JOBS = [
 
 def _submodule_paths():
     """The submodule paths from `.gitmodules`. Read at run time: the file is in the checkout."""
-    output = Shell.get_output(
+    output = Shell.get_output_or_raise(
         "git config -f .gitmodules --get-regexp '^submodule\\..*\\.path$'",
         verbose=True,
     )
-    return {line.split(maxsplit=1)[1] for line in output.splitlines() if " " in line}
+    paths = {line.split(maxsplit=1)[1] for line in output.splitlines() if " " in line}
+    # The repository always has submodules: an empty set means the read failed, and would
+    # silently skip the jobs in every PR.
+    assert paths, "No submodule paths read from .gitmodules"
+    return paths
 
 
 def _has_submodule_changes(changed_files):
     """True if the PR changes the commit a submodule points to (a gitlink, which shows up
-    as a changed file at the submodule path)."""
+    as a changed file at the submodule path), or changes `.gitmodules` itself: the paths are
+    read from the head revision, so a removed submodule is only visible there."""
     paths = {f.removeprefix("./") for f in changed_files}
-    return bool(paths & _submodule_paths())
+    return ".gitmodules" in paths or bool(paths & _submodule_paths())
 
 
 def _has_stress_or_fuzzer_changes(changed_files):
