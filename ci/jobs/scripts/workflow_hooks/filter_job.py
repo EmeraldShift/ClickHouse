@@ -653,8 +653,12 @@ def should_skip_job(job_name):
 
     # The full TSan integration run is only for the PRs that bump a submodule, see
     # `JobConfigs.integration_test_contrib_tsan_pr_jobs`. Other PRs get the targeted selection.
-    if job_name in CONTRIB_TSAN_INTEGRATION_JOBS and not _has_submodule_changes(
-        changed_files
+    # The other workflows run the same jobs on every commit, so only the PR workflow is gated.
+    if (
+        job_name in CONTRIB_TSAN_INTEGRATION_JOBS
+        and _info_cache.pr_number > 0
+        and _info_cache.workflow_name == SMALL_PR_WORKFLOW
+        and not _has_submodule_changes(changed_files)
     ):
         return True, "Skipped, no submodule (gitlink) changes"
 
