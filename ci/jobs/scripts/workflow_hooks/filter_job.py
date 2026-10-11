@@ -432,24 +432,19 @@ def _has_fuzzer_target_changes(changed_files):
     )
 
 
-# A small PR that changes any product code still runs one untargeted AST fuzzer and one
-# stress test. A few lines of `src/` can break an invariant that only random queries or
-# concurrent load reach: https://github.com/ClickHouse/ClickHouse/pull/125033 (60 lines)
-# made part pruning by virtual columns evaluate `and` lazily, and the resulting exception
-# `Cannot call function ... columns were captured` was first seen by `AST fuzzer (amd_msan)`
-# and `Stress test (amd_tsan)` on master, because the PR skipped both while its targeted
-# fuzzers passed. `AST fuzzer (amd_debug)` has debug assertions and caught the most PR
-# failures of the untargeted fuzzers over 2026-09-27 to 2026-10-11; `Stress test (amd_tsan)`
-# adds data races under concurrent load, which nothing else in a small PR exercises. Both
-# reuse builds that the PR workflow makes anyway. A PR that changes only tests, docs or CI
-# scripts has no product code lines and keeps skipping everything.
-SMALL_PR_PRODUCT_CODE_JOBS = (
-    f"{JobNames.ASTFUZZER} (amd_debug)",
-    f"{JobNames.STRESS} (amd_tsan)",
-)
+# A small PR that changes any product code still runs one stress test. A few lines of
+# `src/` can break an invariant that only concurrent load reaches, and nothing else in a
+# small PR exercises data races under load. Example: https://github.com/ClickHouse/ClickHouse/pull/125033
+# (60 lines) skipped all stress tests, and its exception `Cannot call function ... columns
+# were captured` was first seen on master, also by `Stress test (amd_tsan)`. An untargeted
+# AST fuzzer is not added: the targeted AST fuzzers already run on small PRs and caught
+# this exception at a higher rate per run (about 1.4% vs 0.8% in PR CI after the merge).
+# `Stress test (amd_tsan)` reuses a build that the PR workflow makes anyway. A PR that
+# changes only tests, docs or CI scripts has no product code lines and keeps skipping it.
+SMALL_PR_PRODUCT_CODE_JOBS = (f"{JobNames.STRESS} (amd_tsan)",)
 
 assert set(SMALL_PR_PRODUCT_CODE_JOBS) <= {
-    j.name for j in (*JobConfigs.ast_fuzzer_jobs, *JobConfigs.stress_test_jobs)
+    j.name for j in JobConfigs.stress_test_jobs
 }, "SMALL_PR_PRODUCT_CODE_JOBS names a job that does not exist"
 
 
