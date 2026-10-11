@@ -90,6 +90,8 @@ class Result(MetaClasses.Serializable):
         FLAKY = "flaky"
         REPRODUCIBLE = "reproducible"
         LOG_CHECK = "log_check"
+        NEW_FAILURE = "new_failure"
+        KNOWN_FLAKY = "known_flaky"
 
     # Default hints rendered as a hover tooltip in praktika.html.
     # Looked up automatically when set_label is called without an explicit hint.
@@ -105,6 +107,8 @@ class Result(MetaClasses.Serializable):
         Label.FLAKY: "Failure is reproducible in less than 100% of reruns",
         Label.REPRODUCIBLE: "Failure is reproducible in 100% of reruns",
         Label.LOG_CHECK: "Server-log / runner health check, not a test case (excluded from bugfix-validation inversion)",
+        Label.NEW_FAILURE: "The test did not fail on master recently or is changed in this PR: likely caused by this PR",
+        Label.KNOWN_FLAKY: "The test also failed on master recently: likely not caused by this PR",
     }
 
     name: str

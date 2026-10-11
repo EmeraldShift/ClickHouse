@@ -72,9 +72,25 @@ FAILED_TESTS_QUERY = """ \
 """
 
 
+MASTER_FAILURES_QUERY = """ \
+select test_name, count()
+from checks
+where head_ref = 'master'
+  and pull_request_number = 0
+  and check_name LIKE '{JOB_TYPE}%'
+  and test_status IN ('FAIL', 'ERROR')
+  and test_name IN ({TEST_NAMES})
+  and check_start_time >= now() - interval {DAYS} day
+group by test_name
+\
+"""
+
+
 class Targeting:
     INTEGRATION_JOB_TYPE = "Integration"
     STATELESS_JOB_TYPE = "Stateless"
+    # How far back a failure on `master` marks a PR failure as not caused by the PR.
+    MASTER_HISTORY_DAYS = 14
 
     def __init__(self, info: Info):
         self.info = info
@@ -470,6 +486,28 @@ class Targeting:
                 )
 
         return sorted(result)
+
+    def get_master_failure_counts(self, test_names):
+        """Return {test_name: failures on `master` in the last `MASTER_HISTORY_DAYS` days}
+        for the given tests. Tests without failures are absent from the result."""
+        assert self.job_type, "Unsupported job type"
+        if not test_names:
+            return {}
+        names = ", ".join(
+            "'" + t.replace("\\", "\\\\").replace("'", "\\'") + "'" for t in test_names
+        )
+        query = MASTER_FAILURES_QUERY.format(
+            JOB_TYPE=self.job_type,
+            TEST_NAMES=names,
+            DAYS=self.MASTER_HISTORY_DAYS,
+        )
+        query_result = self._ci_db().query(query, retries=3, log_level="") or ""
+        counts = {}
+        for line in query_result.strip().split("\n"):
+            parts = line.split("\t")
+            if len(parts) == 2:
+                counts[parts[0]] = int(parts[1])
+        return counts
 
     def get_previously_failed_tests(self):
         assert self.job_type, "Unsupported job type"

@@ -266,6 +266,61 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "targeted": "--flaky-check --no-self-parallel",
 }
 
+
+def label_failures_by_master_history(test_result, targeter, info):
+    """Label each failed test by whether it is likely caused by the PR.
+
+    A test that is new or changed in the PR, or that did not fail on `master`
+    in the last `MASTER_HISTORY_DAYS` days, gets `new_failure`, even if the
+    diagnostics reruns passed: a test the PR made flaky is clean on `master`.
+    A test that also failed on `master` gets `known_flaky`. The rerun outcome
+    stays in the diagnosis text, but the `flaky` label is dropped because it
+    read as "not caused by this PR" for failures that the PR introduced.
+    """
+    failed_tests = sorted(
+        {
+            t.name
+            for t in test_result.results
+            if (t.is_failure() or t.is_error()) and t.name and t.name[0].isdigit()
+        }
+    )
+    if not failed_tests:
+        return
+    try:
+        changed_tests = {t.rstrip(".") for t in targeter.get_changed_tests(strict=True)}
+        master_failures = targeter.get_master_failure_counts(
+            [t for t in failed_tests if t not in changed_tests]
+        )
+    except Exception as ex:
+        # Leave the failures without a history label rather than guess: the
+        # test status is not affected, only the hint for the reader.
+        message = f"Failed to label test failures by master history: {ex}"
+        print(f"WARNING: {message}")
+        traceback.print_exc()
+        info.add_workflow_warning(message)
+        return
+    days = Targeting.MASTER_HISTORY_DAYS
+    for test_case in test_result.results:
+        if test_case.name not in failed_tests:
+            continue
+        test_case.remove_label(Result.Label.FLAKY)
+        if test_case.name in changed_tests:
+            test_case.set_label(
+                Result.Label.NEW_FAILURE,
+                hint="The test is new or changed in this PR",
+            )
+        elif master_failures.get(test_case.name, 0) > 0:
+            test_case.set_label(
+                Result.Label.KNOWN_FLAKY,
+                hint=f"Failed {master_failures[test_case.name]} time(s) on master in the last {days} days, likely not caused by this PR",
+            )
+        else:
+            test_case.set_label(
+                Result.Label.NEW_FAILURE,
+                hint=f"Did not fail on master in the last {days} days, likely caused by this PR even if reruns passed",
+            )
+
+
 def allow_oversubscription(options, test_options, is_flaky_check, is_targeted_check):
     """Whether this job may run more test workers than the runner has cores.
 
@@ -1531,8 +1586,7 @@ def main():
             memory_limit = stateless_memory_limit(Info().job_name)
             # Rerun in the same mode as the main run. Without these flags a
             # failure specific to `DBReplicated` or to the s3/azure/encrypted
-            # disk passes every rerun, is labelled `flaky`, and on coverage
-            # lanes is turned into OK below.
+            # disk passes every rerun and is wrongly diagnosed as flaky.
             diag_mode_args = "".join(
                 f" {flag}"
                 for flag in DIAGNOSTICS_MODE_RUNNER_ARGUMENTS
@@ -1568,13 +1622,6 @@ def main():
                 "flaky": Result.Label.FLAKY,
                 "reproducible": Result.Label.REPRODUCIBLE,
             }
-            # A test that the PR adds or changes is never downgraded: its first
-            # failure is the signal the PR CI exists to report.
-            changed_tests = set()
-            if is_llvm_coverage and info.pr_number > 0:
-                changed_tests = {
-                    t.rstrip(".") for t in targeter.get_changed_tests(strict=True)
-                }
             for test_case in test_result.results:
                 diag = diag_results.get(test_case.name)
                 if not diag:
@@ -1584,16 +1631,6 @@ def main():
                 label_key = diag.get("label", "")
                 if label_key in label_map:
                     test_case.set_label(label_map[label_key])
-                if (
-                    label_key == "flaky"
-                    and is_llvm_coverage
-                    and test_case.name not in changed_tests
-                ):
-                    # Coverage binaries are slow and prone to timing-related flakiness
-                    # (e.g. TIMEOUT_EXCEEDED on SystemLogQueue). Don't penalise them
-                    # for it — mark the test green so it doesn't block coverage jobs.
-                    # See: https://github.com/ClickHouse/ClickHouse/pull/95763
-                    test_case.set_status(Result.Status.OK)
             if diag_exit_code != 0:
                 diag_status = Result.Status.FAIL
                 diag_info = (
@@ -1612,6 +1649,14 @@ def main():
                     info=diag_info,
                 ).set_timing(stopwatch=diag_stopwatch)
             )
+
+    if (
+        test_result
+        and info.pr_number > 0
+        and not info.is_local_run
+        and not is_bugfix_validation
+    ):
+        label_failures_by_master_history(test_result, targeter, info)
 
     if args.debug:
         print("\n\n=== Debug mode enabled, starting clickhouse-client ===\n")
