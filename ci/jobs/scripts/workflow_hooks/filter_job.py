@@ -432,6 +432,33 @@ def _has_fuzzer_target_changes(changed_files):
     )
 
 
+# A small PR that changes any product code still runs one untargeted AST fuzzer and one
+# stress test. A few lines of `src/` can break an invariant that only random queries or
+# concurrent load reach: https://github.com/ClickHouse/ClickHouse/pull/125033 (60 lines)
+# made part pruning by virtual columns evaluate `and` lazily, and the resulting exception
+# `Cannot call function ... columns were captured` was first seen by `AST fuzzer (amd_msan)`
+# and `Stress test (amd_tsan)` on master, because the PR skipped both while its targeted
+# fuzzers passed. `AST fuzzer (amd_debug)` has debug assertions and caught the most PR
+# failures of the untargeted fuzzers over 2026-09-27 to 2026-10-11; `Stress test (amd_tsan)`
+# adds data races under concurrent load, which nothing else in a small PR exercises. Both
+# reuse builds that the PR workflow makes anyway. A PR that changes only tests, docs or CI
+# scripts has no product code lines and keeps skipping everything.
+SMALL_PR_PRODUCT_CODE_JOBS = (
+    f"{JobNames.ASTFUZZER} (amd_debug)",
+    f"{JobNames.STRESS} (amd_tsan)",
+)
+
+assert set(SMALL_PR_PRODUCT_CODE_JOBS) <= {
+    j.name for j in (*JobConfigs.ast_fuzzer_jobs, *JobConfigs.stress_test_jobs)
+}, "SMALL_PR_PRODUCT_CODE_JOBS names a job that does not exist"
+
+
+def _changes_product_code(info):
+    """True if the PR changes at least one line of product code, see `_is_small_pr`."""
+    product_changed_lines = info.get_kv_data("product_changed_lines")
+    return not isinstance(product_changed_lines, int) or product_changed_lines > 0
+
+
 def _is_small_pr(info):
     """True if the PR changes fewer than `SMALL_PR_CHANGED_LINES` lines of product
     code. False when the count is unknown (the pre-hook failed to fetch it), so an
@@ -644,7 +671,8 @@ def should_skip_job(job_name):
     # of these jobs takes up to 1-3 hours and they rarely catch anything a change
     # of this size introduces;
     # the targeted AST fuzzer still runs, and ClickGap fuzzes every merged PR on
-    # master once more. Bypass: the `ci-force-all` label.
+    # master once more. Bypass: the `ci-force-all` label. A PR that changes product
+    # code keeps `SMALL_PR_PRODUCT_CODE_JOBS`.
     # The builds that only the skipped stress tests use go with them, except with the
     # `ci-build` label, which asks for the whole build matrix. A change under `cmake/` or
     # `base/glibc-compatibility/` is never small: like the uncounted build inputs, one line
@@ -661,6 +689,7 @@ def should_skip_job(job_name):
             )
         )
         and _is_small_pr(_info_cache)
+        and not (job_name in SMALL_PR_PRODUCT_CODE_JOBS and _changes_product_code(_info_cache))
         and not _has_uncounted_build_changes(changed_files)
         and not _has_stress_or_fuzzer_changes(changed_files)
         and not _has_arch_sensitive_changes(changed_files)
