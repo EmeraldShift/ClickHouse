@@ -266,61 +266,6 @@ OPTIONS_TO_TEST_RUNNER_ARGUMENTS = {
     "targeted": "--flaky-check --no-self-parallel",
 }
 
-
-def label_failures_by_master_history(test_result, targeter, info):
-    """Label each failed test by whether it is likely caused by the PR.
-
-    A test that is new or changed in the PR, or that did not fail on `master`
-    in the last `MASTER_HISTORY_DAYS` days, gets `new_failure`, even if the
-    diagnostics reruns passed: a test the PR made flaky is clean on `master`.
-    A test that also failed on `master` gets `known_flaky`. The rerun outcome
-    stays in the diagnosis text, but the `flaky` label is dropped because it
-    read as "not caused by this PR" for failures that the PR introduced.
-    """
-    failed_tests = sorted(
-        {
-            t.name
-            for t in test_result.results
-            if (t.is_failure() or t.is_error()) and t.name and t.name[0].isdigit()
-        }
-    )
-    if not failed_tests:
-        return
-    try:
-        changed_tests = {t.rstrip(".") for t in targeter.get_changed_tests(strict=True)}
-        master_failures = targeter.get_master_failure_counts(
-            [t for t in failed_tests if t not in changed_tests]
-        )
-    except Exception as ex:
-        # Leave the failures without a history label rather than guess: the
-        # test status is not affected, only the hint for the reader.
-        message = f"Failed to label test failures by master history: {ex}"
-        print(f"WARNING: {message}")
-        traceback.print_exc()
-        info.add_workflow_warning(message)
-        return
-    days = Targeting.MASTER_HISTORY_DAYS
-    for test_case in test_result.results:
-        if test_case.name not in failed_tests:
-            continue
-        test_case.remove_label(Result.Label.FLAKY)
-        if test_case.name in changed_tests:
-            test_case.set_label(
-                Result.Label.NEW_FAILURE,
-                hint="The test is new or changed in this PR",
-            )
-        elif master_failures.get(test_case.name, 0) > 0:
-            test_case.set_label(
-                Result.Label.KNOWN_FLAKY,
-                hint=f"Failed {master_failures[test_case.name]} time(s) on master in the last {days} days, likely not caused by this PR",
-            )
-        else:
-            test_case.set_label(
-                Result.Label.NEW_FAILURE,
-                hint=f"Did not fail on master in the last {days} days, likely caused by this PR even if reruns passed",
-            )
-
-
 def allow_oversubscription(options, test_options, is_flaky_check, is_targeted_check):
     """Whether this job may run more test workers than the runner has cores.
 
@@ -1649,14 +1594,6 @@ def main():
                     info=diag_info,
                 ).set_timing(stopwatch=diag_stopwatch)
             )
-
-    if (
-        test_result
-        and info.pr_number > 0
-        and not info.is_local_run
-        and not is_bugfix_validation
-    ):
-        label_failures_by_master_history(test_result, targeter, info)
 
     if args.debug:
         print("\n\n=== Debug mode enabled, starting clickhouse-client ===\n")
