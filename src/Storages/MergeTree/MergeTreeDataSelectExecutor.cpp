@@ -2750,7 +2750,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             return {upper, BoolMask(upper.can_be_true, true)};
         };
 
-        search_result = genericExclusionSearch(part_ranges, check, search_settings, /*collect_exact_ranges=*/ exact_ranges != nullptr);
+        auto search_result = genericExclusionSearch(part_ranges, check, search_settings, /*collect_exact_ranges=*/ exact_ranges != nullptr);
 
         if (exact_ranges)
             *exact_ranges = std::move(search_result.exact_ranges);
