@@ -2487,12 +2487,17 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     std::vector<FieldRef> part_offset_left(2);
     std::vector<FieldRef> part_offset_right(2);
 
-    /// The conditions that `check_in_range` evaluates. The generic exclusion search may replace them, see below.
-    const KeyCondition * checked_key_condition = &key_condition;
-    const KeyCondition * checked_part_offset_condition = part_offset_condition;
-    const KeyCondition * checked_total_offset_condition = total_offset_condition;
+    /// The conditions that `check_in_range_with` evaluates. The generic exclusion search may replace them, see below.
+    struct CheckedConditions
+    {
+        const KeyCondition * key = nullptr;
+        const KeyCondition * part_offset = nullptr;
+        const KeyCondition * total_offset = nullptr;
+    };
 
-    auto check_in_range = [&](const MarkRange & range, BoolMask initial_mask = {})
+    const CheckedConditions original_conditions{&key_condition, part_offset_condition, total_offset_condition};
+
+    auto check_in_range_with = [&](const CheckedConditions & conditions, const MarkRange & range, BoolMask initial_mask)
     {
         auto check_key_condition = [&]() -> BoolMask
         {
@@ -2557,7 +2562,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     }
                 }
 
-                return checked_key_condition->checkInRange(
+                return conditions.key->checkInRange(
                     used_key_indices,
                     sparse_key_left.data(),
                     sparse_key_right.data(),
@@ -2605,7 +2610,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     }
                 }
             }
-            return checked_key_condition->checkInRange(
+            return conditions.key->checkInRange(
                 used_key_size, index_left.data(), index_right.data(), key_types, initial_mask, &index_bounds);
         };
 
@@ -2625,7 +2630,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             part_offset_left[1] = part->name;
             part_offset_right[1] = part->name;
 
-            return checked_part_offset_condition->checkInRange(
+            return conditions.part_offset->checkInRange(
                 2, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_mask);
         };
 
@@ -2641,7 +2646,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 
             part_offset_left[0] = begin + part_starting_offset_in_query;
             part_offset_right[0] = end + part_starting_offset_in_query;
-            return checked_total_offset_condition->checkInRange(
+            return conditions.total_offset->checkInRange(
                 1, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_mask);
         };
 
@@ -2657,6 +2662,11 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             result = result & check_total_offset_condition();
 
         return result;
+    };
+
+    auto check_in_range = [&](const MarkRange & range, BoolMask initial_mask = {})
+    {
+        return check_in_range_with(original_conditions, range, initial_mask);
     };
 
     bool key_condition_exact_range = !key_condition_useful || key_condition.matchesExactContinuousRange();
@@ -2684,47 +2694,53 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             .min_marks_for_seek = min_marks_for_seek,
         };
 
-        GenericExclusionSearchResult search_result;
+        /// An atom that cannot be evaluated, for example a condition on a column that is not in the key, gives
+        /// `(true, true)` on every range, and splitting a range never changes that. The search gets an upper mask, where
+        /// every such atom has the value that maximizes the condition, and a lower mask, where it has the value that
+        /// minimizes it. They have the same `can_be_true` and `can_be_false` as the condition, so the search drops the same
+        /// ranges and finds the same exact ranges. It stops splitting a range where the upper mask is certainly true,
+        /// unless it collects exact ranges and the lower mask can still be true.
         std::list<KeyCondition> substituted_conditions;
+        CheckedConditions upper_conditions = original_conditions;
+        CheckedConditions lower_conditions = original_conditions;
+        bool has_unknown_atoms = false;
+
+        auto substitute_unknown_atoms = [&](const KeyCondition *& upper_condition, const KeyCondition *& lower_condition)
+        {
+            if (!upper_condition || !upper_condition->hasUnknownAtoms())
+                return;
+
+            has_unknown_atoms = true;
+            upper_condition = &substituted_conditions.emplace_back(upper_condition->createWithUnknownAtomsAssumed(true));
+
+            /// Only exact ranges need the lower mask.
+            if (exact_ranges)
+                lower_condition = &substituted_conditions.emplace_back(lower_condition->createWithUnknownAtomsAssumed(false));
+        };
+
+        substitute_unknown_atoms(upper_conditions.key, lower_conditions.key);
+        substitute_unknown_atoms(upper_conditions.part_offset, lower_conditions.part_offset);
+        substitute_unknown_atoms(upper_conditions.total_offset, lower_conditions.total_offset);
+
+        auto check = [&](const MarkRange & mark_range) -> MarkRangeCheckResult
+        {
+            BoolMask upper = check_in_range_with(upper_conditions, mark_range, BoolMask());
+            if (!has_unknown_atoms)
+                return upper;
+
+            /// The lower mask is never truer than the upper one. If the upper mask can be false, the range is not exact,
+            /// and the search splits it anyway to try to exclude subranges. So the lower mask is evaluated only where the
+            /// upper mask is certainly true, and a mask that claims everything possible stands in for it elsewhere.
+            if (exact_ranges && upper.can_be_true && !upper.can_be_false)
+                return {upper, check_in_range_with(lower_conditions, mark_range, BoolMask())};
+
+            return {upper, BoolMask(upper.can_be_true, true)};
+        };
+
+        search_result = genericExclusionSearch(part_ranges, check, search_settings, /*collect_exact_ranges=*/ exact_ranges != nullptr);
 
         if (exact_ranges)
-        {
-            search_result = genericExclusionSearch(
-                part_ranges,
-                [&](const MarkRange & mark_range) { return check_in_range(mark_range, BoolMask()); },
-                search_settings,
-                /*collect_exact_ranges=*/ true);
-
             *exact_ranges = std::move(search_result.exact_ranges);
-        }
-        else
-        {
-            /// Without exact ranges only `can_be_true` matters, so the atoms that cannot be evaluated may be assumed true.
-            /// Then a range where no subrange can be excluded is certainly true, and the search does not split it.
-            if (checked_key_condition && checked_key_condition->hasUnknownAtoms())
-            {
-                auto substituted = checked_key_condition->createWithUnknownAtomsAssumedTrue();
-                checked_key_condition = &substituted_conditions.emplace_back(std::move(substituted));
-            }
-
-            if (checked_part_offset_condition && checked_part_offset_condition->hasUnknownAtoms())
-            {
-                auto substituted = checked_part_offset_condition->createWithUnknownAtomsAssumedTrue();
-                checked_part_offset_condition = &substituted_conditions.emplace_back(std::move(substituted));
-            }
-
-            if (checked_total_offset_condition && checked_total_offset_condition->hasUnknownAtoms())
-            {
-                auto substituted = checked_total_offset_condition->createWithUnknownAtomsAssumedTrue();
-                checked_total_offset_condition = &substituted_conditions.emplace_back(std::move(substituted));
-            }
-
-            search_result = genericExclusionSearch(
-                part_ranges,
-                [&](const MarkRange & mark_range) { return check_in_range(mark_range, BoolMask()); },
-                search_settings,
-                /*collect_exact_ranges=*/ false);
-        }
 
         res = std::move(search_result.ranges);
         res.search_algorithm = MarkRanges::SearchAlgorithm::GenericExclusionSearch;

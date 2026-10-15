@@ -1830,7 +1830,7 @@ bool KeyCondition::hasUnknownAtoms() const
     });
 }
 
-KeyCondition KeyCondition::createWithUnknownAtomsAssumedTrue() const
+KeyCondition KeyCondition::createWithUnknownAtomsAssumed(bool value) const
 {
     KeyCondition result = *this;
 
@@ -1848,7 +1848,7 @@ KeyCondition KeyCondition::createWithUnknownAtomsAssumedTrue() const
         else if (element.function == RPNElement::FUNCTION_AND || element.function == RPNElement::FUNCTION_OR)
             positive_stack.insert(positive_stack.end(), {positive, positive});
         else if (element.function == RPNElement::FUNCTION_UNKNOWN)
-            element = RPNElement(positive ? RPNElement::ALWAYS_TRUE : RPNElement::ALWAYS_FALSE);
+            element = RPNElement(positive == value ? RPNElement::ALWAYS_TRUE : RPNElement::ALWAYS_FALSE);
     }
 
     chassert(positive_stack.empty());

@@ -218,9 +218,10 @@ public:
     /// Checks if the condition has unknown atoms.
     bool hasUnknownAtoms() const;
 
-    /// A copy where every atom that cannot be evaluated is replaced with the constant that maximizes the condition.
-    /// It has the same `can_be_true` on every range, but `can_be_false` is not exact, so it must not be used for exact ranges.
-    KeyCondition createWithUnknownAtomsAssumedTrue() const;
+    /// A copy where every atom that cannot be evaluated is replaced with the constant that maximizes the condition if
+    /// `value` is true, or minimizes it if `value` is false. The maximizing copy has the same `can_be_true` on every range,
+    /// and the minimizing copy the same `can_be_false`.
+    KeyCondition createWithUnknownAtomsAssumed(bool value) const;
 
     String toString() const;
 
