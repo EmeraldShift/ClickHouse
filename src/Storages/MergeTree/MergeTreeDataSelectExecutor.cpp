@@ -2294,6 +2294,11 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     /// Number of leading `used_key_indices` entries that refer to key columns loaded in the in-memory index;
     /// only these get per-mark values in `sparse_key_left`/`sparse_key_right`.
     size_t num_sparse_keys_loaded_in_memory = 0;
+
+    /// Key columns that the filter uses but the sparse representation cannot analyse for this part: they are not loaded in
+    /// the in-memory index and have no partition-minmax bound. `KeyCondition` gives `(true, true)` for an atom on only these
+    /// columns on every range. Sorted.
+    std::vector<size_t> unavailable_key_columns;
     std::vector<FieldRef> sparse_key_left;
     std::vector<FieldRef> sparse_key_right;
     DataTypes sparse_key_types;
@@ -2336,12 +2341,9 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         }
 
         /// Keep used_key_indices entries that are loaded, plus unloaded ones covered by a partition-minmax bound.
-        used_key_indices.erase(
-            std::remove_if(
-                used_key_indices.begin(),
-                used_key_indices.end(),
-                [&](size_t idx) { return idx >= num_used_prefix_key_columns_loaded_in_memory && !has_partition_bound(idx); }),
-            used_key_indices.end());
+        const auto is_unavailable = [&](size_t idx) { return idx >= num_used_prefix_key_columns_loaded_in_memory && !has_partition_bound(idx); };
+        std::ranges::copy_if(used_key_indices, std::back_inserter(unavailable_key_columns), is_unavailable);
+        used_key_indices.erase(std::remove_if(used_key_indices.begin(), used_key_indices.end(), is_unavailable), used_key_indices.end());
 
         /// Now we create sparse arrays for efficient processing in `KeyCondition`. The goal is to only send the information
         /// that is needed and avoid creation of `FieldRef`, `Range` both of which under the hood uses Field which are very slow.
@@ -2395,6 +2397,18 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         used_key_size = num_analyzed_key_columns;
         index_left.resize(used_key_size);
         index_right.resize(used_key_size);
+    }
+
+    /// No key column that the filter uses can be analysed for this part, so the key condition is `(true, true)` on every
+    /// range. Leave it out of the analysis instead of searching for ranges that it can never exclude. A range is never
+    /// exact for a condition that can be false on every range, so no exact ranges are collected.
+    if (use_sparse_pk_representation && sparse_keys_size == 0 && key_condition_useful)
+    {
+        key_condition_useful = false;
+        exact_ranges = nullptr;
+
+        if (!part_offset_condition_useful && !total_offset_condition_useful)
+            return part_ranges;
     }
 
     /// If there are no monotonic functions, there is no need to save block reference.
@@ -2506,9 +2520,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 
             if (use_sparse_pk_representation)
             {
-                /// Nothing can be inferred from empty ranges
-                if (sparse_keys_size == 0)
-                    return BoolMask(true, true);
+                chassert(sparse_keys_size > 0);
 
                 if (range.end == marks_count)
                 {
@@ -2694,10 +2706,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             .min_marks_for_seek = min_marks_for_seek,
         };
 
-        /// An atom that cannot be evaluated, for example a condition on a column that is not in the key, gives
-        /// `(true, true)` on every range, and splitting a range never changes that. The search gets an upper mask, where
-        /// every such atom has the value that maximizes the condition, and a lower mask, where it has the value that
-        /// minimizes it. They have the same `can_be_true` and `can_be_false` as the condition, so the search drops the same
+        /// An atom that cannot be evaluated, for example a condition on a column that is not in the key or on key columns in
+        /// `unavailable_key_columns`, gives `(true, true)` on every range, and splitting a range never changes that. The search
+        /// gets an upper mask, where every such atom has the value that maximizes the condition, and a lower mask, where it has
+        /// the value that minimizes it. They have the same `can_be_true` and `can_be_false` as the condition, so the search drops the same
         /// ranges and finds the same exact ranges. It stops splitting a range where the upper mask is certainly true,
         /// unless it collects exact ranges and the lower mask can still be true.
         std::list<KeyCondition> substituted_conditions;
@@ -2705,22 +2717,23 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         CheckedConditions lower_conditions = original_conditions;
         bool has_unknown_atoms = false;
 
-        auto substitute_unknown_atoms = [&](const KeyCondition *& upper_condition, const KeyCondition *& lower_condition)
+        auto substitute_unknown_atoms = [&](const KeyCondition *& upper_condition, const KeyCondition *& lower_condition,
+                                            const std::vector<size_t> & unavailable_columns)
         {
-            if (!upper_condition || !upper_condition->hasUnknownAtoms())
+            if (!upper_condition || !upper_condition->hasUnknownAtoms(unavailable_columns))
                 return;
 
             has_unknown_atoms = true;
-            upper_condition = &substituted_conditions.emplace_back(upper_condition->createWithUnknownAtomsAssumed(true));
+            upper_condition = &substituted_conditions.emplace_back(upper_condition->createWithUnknownAtomsAssumed(true, unavailable_columns));
 
             /// Only exact ranges need the lower mask.
             if (exact_ranges)
-                lower_condition = &substituted_conditions.emplace_back(lower_condition->createWithUnknownAtomsAssumed(false));
+                lower_condition = &substituted_conditions.emplace_back(lower_condition->createWithUnknownAtomsAssumed(false, unavailable_columns));
         };
 
-        substitute_unknown_atoms(upper_conditions.key, lower_conditions.key);
-        substitute_unknown_atoms(upper_conditions.part_offset, lower_conditions.part_offset);
-        substitute_unknown_atoms(upper_conditions.total_offset, lower_conditions.total_offset);
+        substitute_unknown_atoms(upper_conditions.key, lower_conditions.key, unavailable_key_columns);
+        substitute_unknown_atoms(upper_conditions.part_offset, lower_conditions.part_offset, {});
+        substitute_unknown_atoms(upper_conditions.total_offset, lower_conditions.total_offset, {});
 
         auto check = [&](const MarkRange & mark_range) -> MarkRangeCheckResult
         {

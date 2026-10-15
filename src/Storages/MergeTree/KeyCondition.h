@@ -215,13 +215,15 @@ public:
     /// Returns whether there is such a column in the key.
     bool addCondition(const String & column, const Range & range);
 
-    /// Checks if the condition has unknown atoms.
-    bool hasUnknownAtoms() const;
+    /// Checks if the condition has an atom that cannot be evaluated on the index. Unknown atoms cannot be evaluated, and neither
+    /// can atoms that use only key columns from `unavailable_key_columns` (sorted), like columns that a part does not load in
+    /// its primary index.
+    bool hasUnknownAtoms(const std::vector<size_t> & unavailable_key_columns = {}) const;
 
-    /// A copy where every atom that cannot be evaluated is replaced with the constant that maximizes the condition if
-    /// `value` is true, or minimizes it if `value` is false. The maximizing copy has the same `can_be_true` on every range,
-    /// and the minimizing copy the same `can_be_false`.
-    KeyCondition createWithUnknownAtomsAssumed(bool value) const;
+    /// A copy where every atom that cannot be evaluated (see `hasUnknownAtoms`) is replaced with the constant that maximizes
+    /// the condition if `value` is true, or minimizes it if `value` is false. The maximizing copy has the same `can_be_true`
+    /// on every range, and the minimizing copy the same `can_be_false`.
+    KeyCondition createWithUnknownAtomsAssumed(bool value, const std::vector<size_t> & unavailable_key_columns = {}) const;
 
     String toString() const;
 

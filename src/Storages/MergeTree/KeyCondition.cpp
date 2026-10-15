@@ -1822,15 +1822,21 @@ bool KeyCondition::addCondition(const String & column, const Range & range)
     return true;
 }
 
-bool KeyCondition::hasUnknownAtoms() const
+static bool isUnknownAtom(const KeyCondition::RPNElement & element, const std::vector<size_t> & unavailable_key_columns)
 {
-    return std::ranges::any_of(rpn, [](const RPNElement & element)
-    {
-        return element.function == RPNElement::FUNCTION_UNKNOWN;
-    });
+    if (element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
+        return true;
+
+    return !element.key_columns.empty()
+        && std::ranges::all_of(element.key_columns, [&](size_t column) { return std::ranges::binary_search(unavailable_key_columns, column); });
 }
 
-KeyCondition KeyCondition::createWithUnknownAtomsAssumed(bool value) const
+bool KeyCondition::hasUnknownAtoms(const std::vector<size_t> & unavailable_key_columns) const
+{
+    return std::ranges::any_of(rpn, [&](const RPNElement & element) { return isUnknownAtom(element, unavailable_key_columns); });
+}
+
+KeyCondition KeyCondition::createWithUnknownAtomsAssumed(bool value, const std::vector<size_t> & unavailable_key_columns) const
 {
     KeyCondition result = *this;
 
@@ -1847,7 +1853,7 @@ KeyCondition KeyCondition::createWithUnknownAtomsAssumed(bool value) const
             positive_stack.push_back(!positive);
         else if (element.function == RPNElement::FUNCTION_AND || element.function == RPNElement::FUNCTION_OR)
             positive_stack.insert(positive_stack.end(), {positive, positive});
-        else if (element.function == RPNElement::FUNCTION_UNKNOWN)
+        else if (isUnknownAtom(element, unavailable_key_columns))
             element = RPNElement(positive == value ? RPNElement::ALWAYS_TRUE : RPNElement::ALWAYS_FALSE);
     }
 
