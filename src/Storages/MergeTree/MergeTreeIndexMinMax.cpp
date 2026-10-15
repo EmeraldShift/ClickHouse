@@ -211,10 +211,10 @@ MergeTreeIndexConditionMinMax::MergeTreeIndexConditionMinMax(
     const IndexDescription & index, const ActionsDAGWithInversionPushDown & filter_dag, ContextPtr context)
     : index_data_types(index.data_types)
     , condition(buildCondition(index, filter_dag, context))
-    , condition_has_function_not(condition.hasFunctionNot())
 {
     /// The granule bound comes from `getExtremes`, which skips NaN.
     condition.relaxAtomsOverNaNHidingColumns(index_data_types);
+    condition_with_unknown_atoms_true.emplace(condition.createWithUnknownAtomsAssumed(true));
 }
 
 bool MergeTreeIndexConditionMinMax::alwaysUnknownOrTrue() const
@@ -242,7 +242,9 @@ bool MergeTreeIndexConditionMinMax::alwaysTrueOnHyperrectangle(const Hyperrectan
 {
     if (hyperrectangle.size() != index_data_types.size())
         return false;
-    const auto mask = condition.checkInHyperrectangle(hyperrectangle, index_data_types, {}, {}, !condition_has_function_not);
+    /// `condition_with_unknown_atoms_true` has the same `can_be_true` as `condition` on every granule. If it is certainly
+    /// true on the hyperrectangle, it is certainly true on every granule inside it, so the index drops none of them.
+    const auto mask = condition_with_unknown_atoms_true->checkInHyperrectangle(hyperrectangle, index_data_types);
     return mask.can_be_true && !mask.can_be_false;
 }
 

@@ -70,7 +70,8 @@ public:
 private:
     DataTypes index_data_types;
     KeyCondition condition;
-    bool condition_has_function_not;
+    /// `condition` with every unknown atom replaced with the constant that maximizes it.
+    std::optional<KeyCondition> condition_with_unknown_atoms_true;
 };
 
 
