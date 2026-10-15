@@ -1668,15 +1668,17 @@ KeyCondition::KeyCondition(
     , date_time_overflow_behavior_ignore(date_time_overflow_behavior_ignore_)
 {}
 
+static bool isRelaxedAtom(const KeyCondition::RPNElement & elem)
+{
+    return elem.relaxed
+        || elem.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN
+        || ((elem.function == KeyCondition::RPNElement::FUNCTION_IN_SET || elem.function == KeyCondition::RPNElement::FUNCTION_NOT_IN_SET)
+            && elem.set_index->size() > 1);
+}
+
 bool KeyCondition::isRelaxed() const
 {
-    return std::any_of(rpn.begin(), rpn.end(), [](const auto & elem)
-    {
-        return elem.relaxed
-            || elem.function == RPNElement::FUNCTION_UNKNOWN
-            || ((elem.function == RPNElement::FUNCTION_IN_SET || elem.function == RPNElement::FUNCTION_NOT_IN_SET)
-                && elem.set_index->size() > 1);
-    });
+    return std::ranges::any_of(rpn, isRelaxedAtom);
 }
 
 bool KeyCondition::typeMayHideNaN(const DataTypePtr & type)
@@ -1853,7 +1855,7 @@ KeyCondition KeyCondition::createWithUnknownAtomsAssumed(bool value, const std::
             positive_stack.push_back(!positive);
         else if (element.function == RPNElement::FUNCTION_AND || element.function == RPNElement::FUNCTION_OR)
             positive_stack.insert(positive_stack.end(), {positive, positive});
-        else if (isUnknownAtom(element, unavailable_key_columns))
+        else if (isUnknownAtom(element, unavailable_key_columns) || (!value && isRelaxedAtom(element)))
             element = RPNElement(positive == value ? RPNElement::ALWAYS_TRUE : RPNElement::ALWAYS_FALSE);
     }
 

@@ -222,7 +222,9 @@ public:
 
     /// A copy where every atom that cannot be evaluated (see `hasUnknownAtoms`) is replaced with the constant that maximizes
     /// the condition if `value` is true, or minimizes it if `value` is false. The maximizing copy has the same `can_be_true`
-    /// on every range, and the minimizing copy the same `can_be_false`.
+    /// on every range. The minimizing copy also replaces relaxed atoms (see `isRelaxed`). A relaxed atom makes the condition
+    /// true on more rows than the filter, so its `can_be_false` claims nothing, and the minimizing copy can be false on a
+    /// range wherever the filter can.
     KeyCondition createWithUnknownAtomsAssumed(bool value, const std::vector<size_t> & unavailable_key_columns = {}) const;
 
     String toString() const;

@@ -2227,10 +2227,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
         return part_ranges;
 
-    /// If conditions are relaxed, don't fill exact ranges.
-    if (key_condition.isRelaxed() || (part_offset_condition && part_offset_condition->isRelaxed())
-        || (total_offset_condition && total_offset_condition->isRelaxed()))
-        exact_ranges = nullptr;
+    /// A relaxed condition can be certainly true on a range where the filter is not. The generic exclusion search bounds it
+    /// from below to find exact ranges (see below). The binary search does not, so it fills no exact ranges for it.
+    const bool conditions_relaxed = key_condition.isRelaxed() || (part_offset_condition && part_offset_condition->isRelaxed())
+        || (total_offset_condition && total_offset_condition->isRelaxed());
 
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     auto index_columns = std::make_shared<ColumnsWithTypeAndName>();
@@ -2711,24 +2711,33 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         /// gets an upper mask, where every such atom has the value that maximizes the condition, and a lower mask, where it has
         /// the value that minimizes it. They have the same `can_be_true` and `can_be_false` as the condition, so the search drops the same
         /// ranges and finds the same exact ranges. It stops splitting a range where the upper mask is certainly true,
-        /// unless it collects exact ranges and the lower mask can still be true.
+        /// unless it collects exact ranges and the lower mask can still be true. The lower mask also replaces relaxed atoms,
+        /// so exact ranges can be collected for a relaxed condition too.
         std::list<KeyCondition> substituted_conditions;
         CheckedConditions upper_conditions = original_conditions;
         CheckedConditions lower_conditions = original_conditions;
         bool has_unknown_atoms = false;
+        bool has_lower_conditions = false;
 
         auto substitute_unknown_atoms = [&](const KeyCondition *& upper_condition, const KeyCondition *& lower_condition,
                                             const std::vector<size_t> & unavailable_columns)
         {
-            if (!upper_condition || !upper_condition->hasUnknownAtoms(unavailable_columns))
+            if (!upper_condition)
                 return;
 
-            has_unknown_atoms = true;
-            upper_condition = &substituted_conditions.emplace_back(upper_condition->createWithUnknownAtomsAssumed(true, unavailable_columns));
+            const bool unknown_atoms = upper_condition->hasUnknownAtoms(unavailable_columns);
+            if (unknown_atoms)
+            {
+                has_unknown_atoms = true;
+                upper_condition = &substituted_conditions.emplace_back(upper_condition->createWithUnknownAtomsAssumed(true, unavailable_columns));
+            }
 
-            /// Only exact ranges need the lower mask.
-            if (exact_ranges)
+            /// Only exact ranges need the lower mask. It also replaces relaxed atoms.
+            if (exact_ranges && (unknown_atoms || lower_condition->isRelaxed()))
+            {
+                has_lower_conditions = true;
                 lower_condition = &substituted_conditions.emplace_back(lower_condition->createWithUnknownAtomsAssumed(false, unavailable_columns));
+            }
         };
 
         substitute_unknown_atoms(upper_conditions.key, lower_conditions.key, unavailable_key_columns);
@@ -2738,13 +2747,13 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         auto check = [&](const MarkRange & mark_range) -> MarkRangeCheckResult
         {
             BoolMask upper = check_in_range_with(upper_conditions, mark_range, BoolMask());
-            if (!has_unknown_atoms)
+            if (!has_unknown_atoms && !has_lower_conditions)
                 return upper;
 
             /// The lower mask is never truer than the upper one. If the upper mask can be false, the range is not exact,
             /// and the search splits it anyway to try to exclude subranges. So the lower mask is evaluated only where the
             /// upper mask is certainly true, and a mask that claims everything possible stands in for it elsewhere.
-            if (exact_ranges && upper.can_be_true && !upper.can_be_false)
+            if (has_lower_conditions && upper.can_be_true && !upper.can_be_false)
                 return {upper, check_in_range_with(lower_conditions, mark_range, BoolMask())};
 
             return {upper, BoolMask(upper.can_be_true, true)};
@@ -2773,6 +2782,9 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         /// In case when SELECT's predicate defines a single continuous interval of keys,
         /// we can use binary search algorithm to find the left and right endpoint key marks of such interval.
         /// The returned value is the minimum range of marks, containing all keys for which KeyCondition holds
+
+        if (conditions_relaxed)
+            exact_ranges = nullptr;
 
         res.search_algorithm = MarkRanges::SearchAlgorithm::BinarySearch;
         ProfileEvents::increment(ProfileEvents::IndexBinarySearchAlgorithm);

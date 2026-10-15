@@ -1,0 +1,15 @@
+-- { echoOn }
+
+-- A set of more than one element is a relaxed atom.
+SELECT count() FROM t_relaxed_atoms_exact_ranges WHERE b < 3000 OR b IN (5000, 6000, 7000);
+3003
+SELECT count() FROM t_relaxed_atoms_exact_ranges WHERE b < 3000 OR b IN (5000, 6000, 7000) SETTINGS use_primary_key = 0;
+3003
+SELECT count() FROM t_relaxed_atoms_exact_ranges WHERE NOT (b >= 3000 AND b NOT IN (5000, 6000, 7000));
+3003
+SELECT count() FROM t_relaxed_atoms_exact_ranges WHERE NOT (b >= 3000 AND b NOT IN (5000, 6000, 7000)) SETTINGS use_primary_key = 0;
+3003
+SELECT count() FROM t_relaxed_atoms_exact_ranges WHERE b IN (5000, 6000, 7000);
+3
+SELECT count() FROM t_relaxed_atoms_exact_ranges WHERE b IN (5000, 6000, 7000) SETTINGS use_primary_key = 0;
+3
