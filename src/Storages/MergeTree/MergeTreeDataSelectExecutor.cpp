@@ -161,6 +161,51 @@ MergeTreeDataSelectExecutor::MergeTreeDataSelectExecutor(const MergeTreeData & d
             "UNIQUE KEY tables do not support reading via projections");
 }
 
+/// Splits sorted disjoint `ranges` into the marks inside the sorted disjoint `covered` ranges and the other marks.
+static std::pair<MarkRanges, MarkRanges> splitByCoveredRanges(const MarkRanges & ranges, const MarkRanges & covered)
+{
+    MarkRanges inside;
+    MarkRanges outside;
+    size_t i = 0;
+    for (const auto & range : ranges)
+    {
+        size_t begin = range.begin;
+        while (begin < range.end)
+        {
+            while (i < covered.size() && covered[i].end <= begin)
+                ++i;
+            if (i == covered.size() || covered[i].begin >= range.end)
+            {
+                outside.emplace_back(begin, range.end);
+                break;
+            }
+            if (covered[i].begin > begin)
+                outside.emplace_back(begin, covered[i].begin);
+            begin = std::max(begin, covered[i].begin);
+            size_t end = std::min(range.end, covered[i].end);
+            inside.emplace_back(begin, end);
+            begin = end;
+        }
+    }
+    return {std::move(inside), std::move(outside)};
+}
+
+/// The union of two sorted lists of disjoint ranges that do not intersect each other.
+static MarkRanges unionOfDisjointRanges(const MarkRanges & left, const MarkRanges & right)
+{
+    MarkRanges merged;
+    std::merge(left.begin(), left.end(), right.begin(), right.end(), std::back_inserter(merged));
+    MarkRanges res;
+    for (const auto & range : merged)
+    {
+        if (!res.empty() && res.back().end == range.begin)
+            res.back().end = range.end;
+        else
+            res.push_back(range);
+    }
+    return res;
+}
+
 /// Maps each primary-key column position to the slot of the matching column in a part's partition
 /// minmax index (nullopt when the primary-key column is not a partition-minmax column).
 static std::vector<std::optional<size_t>> buildPrimaryKeyToMinMaxSlotMapping(
@@ -1202,6 +1247,11 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                 query_status->checkTimeLimit();
 
             auto & ranges = parts_with_ranges[part_index];
+
+            /// The filter is true on every row of these ranges, so every skip index keeps them, and they are not read.
+            MarkRanges pk_exact_ranges;
+            const bool find_pk_exact_ranges = find_exact_ranges || !skip_indexes.useful_indices.empty();
+
             if (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition)
             {
                 CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithPrimaryKey);
@@ -1218,10 +1268,13 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                     key_condition->generateForPart(ranges.data_part),
                     part_offset_condition ? &part_offset_condition->generateForPart(ranges.data_part) : nullptr,
                     total_offset_condition ? &total_offset_condition->generateForPart(ranges.data_part) : nullptr,
-                    find_exact_ranges ? &ranges.exact_ranges : nullptr,
+                    find_pk_exact_ranges ? &pk_exact_ranges : nullptr,
                     pk_to_minmax_slot_ptr,
                     settings,
                     log);
+
+                if (find_exact_ranges)
+                    ranges.exact_ranges = pk_exact_ranges;
 
                 pk_stat.search_algorithm.store(ranges.ranges.search_algorithm, std::memory_order_relaxed);
                 pk_stat.granules_dropped.fetch_add(total_marks_count - ranges.getMarksCount(), std::memory_order_relaxed);
@@ -1316,12 +1369,20 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
                     if (!is_index_supported_on_data_read(index_and_condition.index))
                     {
+                        /// A vector similarity index keeps only the nearest rows, and a text index can give the values of
+                        /// the filter for reading, so both are read on the exact ranges too.
+                        const bool keep_exact_ranges = !pk_exact_ranges.empty()
+                            && !index_and_condition.index->isVectorSimilarityIndex() && !index_and_condition.index->isTextIndex();
+                        auto [exact_ranges, ranges_to_filter] = keep_exact_ranges
+                            ? splitByCoveredRanges(ranges.ranges, pk_exact_ranges)
+                            : std::pair{MarkRanges{}, ranges.ranges};
+
                         std::tie(ranges.ranges, ranges.read_hints) = filterMarksUsingIndex(
                             index_and_condition.index,
                             index_and_condition.condition_template->generateForPart(ranges.data_part),
                             key_condition_rpn_template->generateForPart(ranges.data_part),
                             part_info_for_reader,
-                            ranges.ranges,
+                            ranges_to_filter,
                             ranges.read_hints,
                             reader_settings,
                             mark_cache.get(),
@@ -1330,6 +1391,9 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                             use_skip_indexes_for_disjunctions,
                             partial_eval_results,
                             log);
+
+                        if (keep_exact_ranges)
+                            ranges.ranges = unionOfDisjointRanges(ranges.ranges, exact_ranges);
                     }
 
                     stat.granules_dropped.fetch_add(total_granules - ranges.getMarksCount(), std::memory_order_relaxed);
