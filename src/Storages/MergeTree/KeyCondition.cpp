@@ -8179,7 +8179,7 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
         }
 
         if (update_partial_disjunction_result_fn && element.position_in_filter_rpn)
-            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().mask().can_be_true, !evaluated);
+            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().mask(), !evaluated);
     }
 
     if (rpn_stack.size() != 1)

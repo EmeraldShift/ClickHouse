@@ -29,7 +29,30 @@ using ProjectionDescriptionRawPtr = const ProjectionDescription *;
 class MergeTreeDataSelectExecutor
 {
 public:
-    using PartialDisjunctionResult = boost::dynamic_bitset<>;
+    /// The mask of each element of the filter RPN on each mark, for `use_skip_indexes_for_disjunctions`. A mask starts as
+    /// (true, true). Every skip index that reports a mask for an element keeps only what that mask allows.
+    class PartialDisjunctionResult
+    {
+    public:
+        void resize(size_t num_marks) { bits.resize(num_marks * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT * 2, true); }
+        size_t numMarks() const { return bits.size() / (MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT * 2); }
+
+        void update(const MarkRange & marks, size_t position, BoolMask mask)
+        {
+            for (size_t mark = marks.begin; mark < marks.end; ++mark)
+            {
+                bits[bit(mark, position)] &= mask.can_be_true;
+                bits[bit(mark, position) + 1] &= mask.can_be_false;
+            }
+        }
+
+        BoolMask get(size_t mark, size_t position) const { return {bits[bit(mark, position)], bits[bit(mark, position) + 1]}; }
+
+    private:
+        static size_t bit(size_t mark, size_t position) { return ((mark * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT) + position) * 2; }
+
+        boost::dynamic_bitset<> bits;
+    };
 
     explicit MergeTreeDataSelectExecutor(const MergeTreeData & data_, ProjectionDescriptionRawPtr projection_ = nullptr);
 
@@ -142,10 +165,10 @@ public:
 
     /// Maximum number of elements in the RPN condition when evaluation of OR-connected filter conditions using skip indexes (setting
     /// 'use_skip_indexes_for_disjunctions') is enabled.
-    /// One bit per RPN element is consumed to store the partial evaluation results.
+    /// One position per RPN element is consumed to store the partial evaluation results, and each position takes two bits.
     /// Example:
-    /// - (A = 5 OR B = 5) requires 3 bits - for A, for B and for OR(A, B).
-    /// - Likewise, (A = 5 OR B = 5) AND (C > 5 OR D > 5) requires 7 bits.
+    /// - (A = 5 OR B = 5) requires 3 positions - for A, for B and for OR(A, B).
+    /// - Likewise, (A = 5 OR B = 5) AND (C > 5 OR D > 5) requires 7 positions.
     static constexpr size_t MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT = 32;
 
 private:

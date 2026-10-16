@@ -311,7 +311,7 @@ bool MergeTreeConditionBloomFilterText::mayBeTrueOnGranule(MergeTreeIndexGranule
 
         if (update_partial_disjunction_result_fn)
         {
-            update_partial_disjunction_result_fn(element_idx, rpn_stack.back().can_be_true, element.function == RPNElement::FUNCTION_UNKNOWN);
+            update_partial_disjunction_result_fn(element_idx, rpn_stack.back(), element.function == RPNElement::FUNCTION_UNKNOWN);
             ++element_idx;
         }
     }
