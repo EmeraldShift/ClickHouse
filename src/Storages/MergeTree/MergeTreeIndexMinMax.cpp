@@ -232,6 +232,11 @@ bool MergeTreeIndexConditionMinMax::alwaysUnknownOrTrue() const
          KeyCondition::RPNElement::ALWAYS_FALSE});
 }
 
+bool MergeTreeIndexConditionMinMax::keepsEveryGranule() const
+{
+    return condition.alwaysUnknownOrTrue();
+}
+
 bool MergeTreeIndexConditionMinMax::mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
     const MergeTreeIndexGranuleMinMax & granule = typeid_cast<const MergeTreeIndexGranuleMinMax &>(*idx_granule);

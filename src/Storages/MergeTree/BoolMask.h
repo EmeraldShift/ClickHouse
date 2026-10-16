@@ -1,8 +1,11 @@
 #pragma once
 
+#include <base/defines.h>
+
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <vector>
 
 /// Multiple Boolean values. That is, two Boolean values: can it be true, can it be false.
 struct BoolMask
@@ -243,6 +246,33 @@ private:
         return fromOutcomes(can_be_null, others_can_be, may_lack, may_be_only);
     }
 };
+
+/// Evaluates a condition in reverse Polish notation with the operators of `Mask`. `atom_mask` gives the mask of each element
+/// other than NOT, AND, and OR.
+template <typename Mask, typename RPNElement, typename AtomMask>
+Mask evaluateRPN(const std::vector<RPNElement> & rpn, AtomMask && atom_mask)
+{
+    std::vector<Mask> stack;
+    for (const auto & element : rpn)
+    {
+        if (element.function == RPNElement::FUNCTION_NOT)
+        {
+            chassert(!stack.empty());
+            stack.back() = !stack.back();
+        }
+        else if (element.function == RPNElement::FUNCTION_AND || element.function == RPNElement::FUNCTION_OR)
+        {
+            chassert(stack.size() >= 2);
+            Mask arg = stack.back();
+            stack.pop_back();
+            stack.back() = element.function == RPNElement::FUNCTION_AND ? (stack.back() & arg) : (stack.back() | arg);
+        }
+        else
+            stack.push_back(atom_mask(element));
+    }
+    chassert(stack.size() == 1);
+    return stack.back();
+}
 
 namespace fmt
 {

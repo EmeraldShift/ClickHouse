@@ -1374,6 +1374,17 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                         continue;
                     }
 
+                    const auto & condition = index_and_condition.condition_template->generateForPart(ranges.data_part);
+                    if (!use_skip_indexes_for_disjunctions && condition->keepsEveryGranule())
+                    {
+                        LOG_TRACE(
+                            log,
+                            "Skipping skip index {} on part {}: it cannot drop granules without other indexes",
+                            backQuote(index_and_condition.index->index.name),
+                            ranges.data_part->name);
+                        continue;
+                    }
+
                     if (!is_index_supported_on_data_read(index_and_condition.index))
                     {
                         /// A vector similarity index keeps only the nearest rows, and a text index can give the values of
@@ -1386,7 +1397,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
                         std::tie(ranges.ranges, ranges.read_hints) = filterMarksUsingIndex(
                             index_and_condition.index,
-                            index_and_condition.condition_template->generateForPart(ranges.data_part),
+                            condition,
                             key_condition_rpn_template->generateForPart(ranges.data_part),
                             part_info_for_reader,
                             ranges_to_filter,
@@ -3444,58 +3455,25 @@ MarkRanges MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions(
                 index_granularity_info.index_granularity_bytes);
 
     /// Evaluate the RPN over all the ranges.
-    auto rpn = rpn_template_for_eval_result.getRPN();
-    std::vector<BoolMask> rpn_stack;
+    const auto & rpn = rpn_template_for_eval_result.getRPN();
     for (auto range : ranges)
     {
         for (auto range_begin = range.begin; range_begin < range.end; range_begin++)
         {
-            rpn_stack.clear();
-            size_t position = 0;
-            for (const auto & element : rpn)
+            /// A bloom filter cannot tell that `x = 'acd'` is certainly true, so it reports `can_be_false` for it, and
+            /// `NOT x = 'acd'` can be true.
+            const BoolMask mask = evaluateRPN<BoolMask>(rpn, [&](const KeyCondition::RPNElement & element)
             {
                 if (element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
-                {
-                    rpn_stack.emplace_back(partial_eval_results.get(range_begin, position));
-                }
-                else if (element.function == KeyCondition::RPNElement::FUNCTION_NOT)
-                {
-                    /// A bloom filter cannot tell that `x = 'acd'` is certainly true, so it reports `can_be_false` for it, and
-                    /// `NOT x = 'acd'` can be true.
-                    rpn_stack.back() = !rpn_stack.back();
-                }
-                else if (element.function == KeyCondition::RPNElement::FUNCTION_OR)
-                {
-                    auto arg1 = rpn_stack.back();
-                    rpn_stack.pop_back();
-                    auto arg2 = rpn_stack.back();
-                    rpn_stack.back() = arg1 | arg2;
-                }
-                else if (element.function == KeyCondition::RPNElement::FUNCTION_AND)
-                {
-                    auto arg1 = rpn_stack.back();
-                    rpn_stack.pop_back();
-                    auto arg2 = rpn_stack.back();
-                    rpn_stack.back() = arg1 & arg2;
-                }
-                else if (element.function == KeyCondition::RPNElement::ALWAYS_TRUE)
-                {
-                    rpn_stack.emplace_back(true, false);
-                }
-                else if (element.function == KeyCondition::RPNElement::ALWAYS_FALSE)
-                {
-                    rpn_stack.emplace_back(false, true);
-                }
-                else
-                    throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type {} in mergePartialResultsForDisjunctions(), RPN = {}", element.function, rpn_template_for_eval_result_string);
+                    return partial_eval_results.get(range_begin, &element - rpn.data());
+                if (element.function == KeyCondition::RPNElement::ALWAYS_TRUE)
+                    return BoolMask(true, false);
+                if (element.function == KeyCondition::RPNElement::ALWAYS_FALSE)
+                    return BoolMask(false, true);
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type {} in mergePartialResultsForDisjunctions(), RPN = {}", element.function, rpn_template_for_eval_result_string);
+            });
 
-                position++;
-            }
-
-            if (rpn_stack.size() != 1)
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size {} in mergePartialResultsForDisjunctions(), RPN = {}", rpn_stack.size(), rpn_template_for_eval_result_string);
-
-            if (rpn_stack[0].can_be_true)
+            if (mask.can_be_true)
             {
                 if (res.empty() || range_begin - res.back().end > min_marks_for_seek)
                     res.push_back({range_begin, range_begin + 1});

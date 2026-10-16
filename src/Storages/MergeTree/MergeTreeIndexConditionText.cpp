@@ -464,16 +464,26 @@ std::optional<String> MergeTreeIndexConditionText::tryGetVirtualColumnName(const
     return fmt::format("{}{}_{}_{}", TEXT_INDEX_VIRTUAL_COLUMN_PREFIX, index_name, query.getFunctionName(), hash_str);
 }
 
+const std::unordered_set<MergeTreeIndexConditionText::RPNElement::Function> & MergeTreeIndexConditionText::matchingFunctions()
+{
+    static const std::unordered_set<RPNElement::Function> functions{
+        RPNElement::FUNCTION_EQUALS,
+        RPNElement::FUNCTION_HAS_ANY_TOKENS,
+        RPNElement::FUNCTION_HAS_ALL_TOKENS,
+        RPNElement::FUNCTION_HAS_PHRASE,
+        RPNElement::FUNCTION_LIKE,
+        RPNElement::FUNCTION_HAS_ANY_ELEMENTS};
+    return functions;
+}
+
 bool MergeTreeIndexConditionText::alwaysUnknownOrTrue() const
 {
-    return rpnEvaluatesAlwaysUnknownOrTrue(
-        rpn,
-        {RPNElement::FUNCTION_EQUALS,
-         RPNElement::FUNCTION_HAS_ANY_TOKENS,
-         RPNElement::FUNCTION_HAS_ALL_TOKENS,
-         RPNElement::FUNCTION_HAS_PHRASE,
-         RPNElement::FUNCTION_LIKE,
-         RPNElement::FUNCTION_HAS_ANY_ELEMENTS});
+    return rpnEvaluatesAlwaysUnknownOrTrue(rpn, matchingFunctions());
+}
+
+bool MergeTreeIndexConditionText::keepsEveryGranule() const
+{
+    return rpnKeepsEveryGranule(rpn, matchingFunctions());
 }
 
 namespace

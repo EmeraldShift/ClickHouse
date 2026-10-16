@@ -167,6 +167,10 @@ public:
     using UpdatePartialDisjunctionResultFn = KeyCondition::UpdatePartialDisjunctionResultFn;
     virtual bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const = 0;
 
+    /// Whether `mayBeTrueOnGranule` keeps every granule. `alwaysUnknownOrTrue` is false for some conditions that drop granules
+    /// only together with other indexes with `use_skip_indexes_for_disjunctions`. An index on `a` for `a = 1 OR b = 1` is one.
+    virtual bool keepsEveryGranule() const { return alwaysUnknownOrTrue(); }
+
     using FilteredGranules = std::vector<size_t>;
     virtual FilteredGranules getPossibleGranules(const MergeTreeIndexBulkGranulesPtr &) const
     {
@@ -180,6 +184,24 @@ public:
     virtual NearestNeighbours calculateApproximateNearestNeighbors(MergeTreeIndexGranulePtr /*granule*/) const
     {
         throw Exception(ErrorCodes::LOGICAL_ERROR, "calculateApproximateNearestNeighbors is not implemented for non-vector-similarity indexes");
+    }
+
+    /// `keepsEveryGranule` for a condition where an atom in `matching_functions` may have any mask on a granule and any other
+    /// atom is unknown.
+    template <typename RPNElement>
+    static bool rpnKeepsEveryGranule(
+        const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matching_functions)
+    {
+        return !evaluateRPN<Truth>(rpn, [&](const RPNElement & element)
+        {
+            if (element.function == RPNElement::ALWAYS_TRUE)
+                return Truth::check(BoolMask(true, false));
+            if (element.function == RPNElement::ALWAYS_FALSE)
+                return Truth::check(BoolMask(false, true));
+            if (matching_functions.contains(element.function))
+                return Truth::check(true, true, true);
+            return Truth::unknown();
+        }).is_true.mayBeNever();
     }
 
     template <typename RPNElement>
