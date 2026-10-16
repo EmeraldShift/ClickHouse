@@ -2446,11 +2446,7 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
         metadata_snapshot,
         inverted_dag,
         local_context,
-        true /* strict */,
         !local_context->getSettingsRef()[Setting::use_partition_pruning] /* skip_analysis */);
-
-    if (partition_pruner.isUseless() && !valid)
-        return {};
 
     std::unordered_set<String> part_values;
     if (valid)
@@ -2467,9 +2463,14 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
     size_t res = 0;
     for (const auto & part : parts)
     {
-        if ((part_values.empty() || part_values.contains(part.data_part->name))
-            && !partition_pruner.canBePruned(*part.data_part))
-            res += part.data_part->rows_count;
+        if ((!part_values.empty() && !part_values.contains(part.data_part->name)) || partition_pruner.canBePruned(*part.data_part))
+            continue;
+
+        /// Without the filter on virtual columns, the predicate must be true on every row of the part's partition.
+        if (!valid && partition_pruner.checkPartition(*part.data_part).is_true.level() != Side::Always)
+            return {};
+
+        res += part.data_part->rows_count;
     }
     return res;
 }
@@ -11211,8 +11212,7 @@ std::optional<std::set<String>> MergeTreeData::getPartitionIdsPrunedByPredicate(
     PartitionPruner partition_pruner(
         metadata_snapshot,
         inverted_dag,
-        execution_context,
-        false /* strict */);
+        execution_context);
 
     if (partition_pruner.isUseless())
         return std::nullopt;
@@ -12783,7 +12783,6 @@ Block MergeTreeData::getMinMaxCountProjectionBlock(
                 metadata_snapshot,
                 inverted_dag,
                 query_context,
-                /*strict=*/false,
                 /*skip_analysis_=*/!query_settings[Setting::use_partition_pruning]);
         }
 

@@ -1,0 +1,82 @@
+-- { echoOn }
+
+-- `sum` disables the exact-count optimization.
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c2
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded only_unloaded budget';
+2000	999000
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c2
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded only_unloaded unlimited';
+2000	999000
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c1 BETWEEN 100 AND 800 AND c2
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded and_unloaded budget';
+1402	630900
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c1 BETWEEN 100 AND 800 AND c2
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded and_unloaded unlimited';
+1402	630900
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c1 < 300 OR c2
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded or_unloaded budget';
+2600	1088700
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c1 < 300 OR c2
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded or_unloaded unlimited';
+2600	1088700
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE NOT (c1 >= 300 AND c2)
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded not_and_unloaded budget';
+2600	1088700
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE NOT (c1 >= 300 AND c2)
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded not_and_unloaded unlimited';
+2600	1088700
+-- A plain `count()` collects exact ranges for the exact-count optimization. The ranges where `c1 < 300` are exact, and
+-- the other ranges are read.
+SELECT count() FROM t_exclusion_search_unloaded_key_columns WHERE c1 < 300 OR c2
+SETTINGS optimize_use_projections = 1, optimize_use_implicit_projections = 1, merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded exact_or_unloaded budget';
+2600
+SELECT count() FROM t_exclusion_search_unloaded_key_columns WHERE c1 < 300 OR c2
+SETTINGS optimize_use_projections = 1, optimize_use_implicit_projections = 1, merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded exact_or_unloaded unlimited';
+2600
+SELECT count() FROM t_exclusion_search_unloaded_key_columns WHERE NOT (c1 >= 300 AND c2)
+SETTINGS optimize_use_projections = 1, optimize_use_implicit_projections = 1, merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded exact_not_and_unloaded budget';
+2600
+SELECT count() FROM t_exclusion_search_unloaded_key_columns WHERE NOT (c1 >= 300 AND c2)
+SETTINGS optimize_use_projections = 1, optimize_use_implicit_projections = 1, merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded exact_not_and_unloaded unlimited';
+2600
+SELECT count() FROM t_exclusion_search_unloaded_key_columns WHERE c2
+SETTINGS optimize_use_projections = 1, optimize_use_implicit_projections = 1, merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded exact_only_unloaded budget';
+2000
+SELECT count() FROM t_exclusion_search_unloaded_key_columns WHERE c2
+SETTINGS optimize_use_projections = 1, optimize_use_implicit_projections = 1, merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded exact_only_unloaded unlimited';
+2000
+SELECT count(), sum(c1) FROM t_exclusion_search_partition_bound WHERE c2 = 1
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded partition_bound budget';
+1000	499500
+SELECT count(), sum(c1) FROM t_exclusion_search_partition_bound WHERE c2 = 1
+SETTINGS merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded partition_bound unlimited';
+1000	499500
+SYSTEM FLUSH LOGS query_log;
+SELECT
+    splitByChar(' ', log_comment)[2] AS test_case,
+    maxIf(ProfileEvents['IndexGenericExclusionSearchStepLimitReached'], splitByChar(' ', log_comment)[3] = 'budget') AS step_limit_reached_with_budget,
+    maxIf(ProfileEvents['SelectedMarks'], splitByChar(' ', log_comment)[3] = 'budget')
+        = maxIf(ProfileEvents['SelectedMarks'], splitByChar(' ', log_comment)[3] = 'unlimited') AS same_marks_as_unlimited
+FROM system.query_log
+WHERE current_database = currentDatabase() AND type = 'QueryFinish' AND log_comment LIKE '05406_unloaded %'
+GROUP BY test_case
+ORDER BY test_case;
+and_unloaded	0	1
+exact_not_and_unloaded	0	1
+exact_only_unloaded	0	1
+exact_or_unloaded	0	1
+not_and_unloaded	0	1
+only_unloaded	0	1
+or_unloaded	0	1
+partition_bound	0	1
+-- The results without the primary key.
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c2 SETTINGS use_primary_key = 0;
+2000	999000
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c1 BETWEEN 100 AND 800 AND c2 SETTINGS use_primary_key = 0;
+1402	630900
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c1 < 300 OR c2 SETTINGS use_primary_key = 0;
+2600	1088700
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE NOT (c1 >= 300 AND c2) SETTINGS use_primary_key = 0;
+2600	1088700
+SELECT count(), sum(c1) FROM t_exclusion_search_partition_bound WHERE c2 = 1 SETTINGS use_primary_key = 0;
+1000	499500

@@ -8,7 +8,6 @@ PartitionPruner::PartitionPruner(
     const StorageMetadataPtr & metadata,
     const ActionsDAGWithInversionPushDown & filter_dag,
     ContextPtr context,
-    bool strict,
     bool skip_analysis,
     bool require_ready_sets)
     : partition_key(MergeTreePartition::adjustPartitionKey(metadata, context))
@@ -20,7 +19,7 @@ PartitionPruner::PartitionPruner(
           true /* single_point */,
           skip_analysis,
           require_ready_sets)
-    , useless((strict && partition_condition.isRelaxed()) || partition_condition.alwaysUnknownOrTrue())
+    , useless(partition_condition.alwaysUnknownOrTrue())
 {
 }
 
@@ -34,36 +33,35 @@ bool PartitionPruner::canBePruned(const IMergeTreeDataPart & part) const
 
 bool PartitionPruner::canPartitionBePruned(const IMergeTreeDataPart & part) const
 {
+    return checkPartition(part).is_true.level() == Side::Never;
+}
+
+Truth PartitionPruner::checkPartition(const IMergeTreeDataPart & part) const
+{
     const auto & partition_id = part.info.getPartitionId();
-    bool is_valid = false;
+    if (auto it = partition_truth_map.find(partition_id); it != partition_truth_map.end())
+        return it->second;
 
-    if (auto it = partition_filter_map.find(partition_id); it != partition_filter_map.end())
+    const auto & partition_value = part.partition.value;
+    std::vector<FieldRef> index_value(partition_value.begin(), partition_value.end());
+    for (auto & field : index_value)
     {
-        is_valid = it->second;
-    }
-    else
-    {
-        const auto & partition_value = part.partition.value;
-        std::vector<FieldRef> index_value(partition_value.begin(), partition_value.end());
-        for (auto & field : index_value)
-        {
-            // NULL_LAST
-            if (field.isNull())
-                field = POSITIVE_INFINITY;
-        }
-
-        is_valid = partition_condition.mayBeTrueInRange(
-            partition_value.size(), index_value.data(), index_value.data(), partition_key.data_types);
-        partition_filter_map.emplace(partition_id, is_valid);
-
-        if (!is_valid)
-        {
-            LOG_TRACE(getLogger("PartitionPruner"), "Partition {} gets pruned",
-                part.partition.serializeToString(partition_key.sample_block));
-        }
+        // NULL_LAST
+        if (field.isNull())
+            field = POSITIVE_INFINITY;
     }
 
-    return !is_valid;
+    const auto truth = partition_condition.checkBoundsInRange(
+        partition_value.size(), index_value.data(), index_value.data(), partition_key.data_types);
+    partition_truth_map.emplace(partition_id, truth);
+
+    if (truth.is_true.level() == Side::Never)
+    {
+        LOG_TRACE(getLogger("PartitionPruner"), "Partition {} gets pruned",
+            part.partition.serializeToString(partition_key.sample_block));
+    }
+
+    return truth;
 }
 
 }
