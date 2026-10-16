@@ -178,7 +178,6 @@ Keys:
 Condition: (p isNull)
 Parts: 1/1
 Granules: 8/8
-Search Algorithm: generic exclusion search
 SELECT trimLeft(explain) FROM (EXPLAIN indexes = 1, actions = 0, pretty = 0 SELECT count() FROM t_pk_minmax_nullable WHERE p IS NULL) WHERE explain LIKE '%Condition%' OR explain LIKE '%Parts%' OR explain LIKE '%Granules%' OR explain LIKE '%Keys%' OR explain LIKE '%Search Algorithm%' OR explain LIKE '%Min-Max%' OR explain LIKE '%Partition%' OR explain LIKE '%PrimaryKey%' SETTINGS use_partition_minmax_for_primary_key_pruning = 0;
 Min-Max
 Keys:
@@ -195,7 +194,6 @@ Keys:
 Condition: (p isNull)
 Parts: 1/1
 Granules: 8/8
-Search Algorithm: generic exclusion search
 SELECT count() FROM t_pk_minmax_nullable WHERE p IS NULL SETTINGS use_partition_minmax_for_primary_key_pruning = 1;
 8
 SELECT count() FROM t_pk_minmax_nullable WHERE p IS NULL SETTINGS use_partition_minmax_for_primary_key_pruning = 0;

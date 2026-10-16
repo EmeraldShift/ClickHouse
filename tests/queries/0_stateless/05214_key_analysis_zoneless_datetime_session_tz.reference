@@ -33,9 +33,6 @@ Granules: 2/3
 -- a timezone-sensitive non-monotonic key: the pruner must look for the key value computed in
 -- the frozen zone (hour 20 in UTC), because that is the zone the stored values were computed in
 1	1
-Condition: (dt in [\'1704225600\', \'1704225600\'])
-Condition: (cityHash64(toHour(dt)) in [1626306447464072420, 1626306447464072420])
-Condition: true
 1626306447464072420
 
 -- a single CAST as the whole key expression

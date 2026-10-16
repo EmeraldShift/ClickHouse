@@ -2,6 +2,8 @@
 -- Tag no-shared-merge-tree: RMT/SMT allocate block numbers starting from 0
 
 SET explain_query_plan_default = 'legacy';
+-- A filter that is true on every row of a part would let `count()` read the exact count projection instead.
+SET optimize_use_implicit_projections = 0;
 DROP TABLE IF EXISTS t;
 
 CREATE TABLE t (id UInt64, p UInt64) ENGINE = MergeTree() PARTITION BY p ORDER BY id

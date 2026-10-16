@@ -453,7 +453,8 @@ SELECT 'oracle_outer_simpleaggregatefunction', count() FROM (SELECT a FROM oracl
 SELECT 'partition_outer_simpleaggregatefunction', count() FROM (SELECT a FROM k_saf_outer WHERE a IN (SELECT [toDateTime(1675195200)]));
 SELECT 'control_outer_simpleaggregatefunction_other_month', count() FROM (SELECT a FROM k_saf_outer WHERE a IN (SELECT [toDateTime(1673000000)]));
 SELECT 'control_outer_simpleaggregatefunction_pruning_used', countIf(explain LIKE '%arraySum%') > 0
-FROM (EXPLAIN indexes = 1 SELECT count() FROM k_saf_outer WHERE a IN (SELECT [toDateTime(1675195200)]));
+FROM (EXPLAIN indexes = 1 SELECT count() FROM k_saf_outer WHERE a IN (SELECT [toDateTime(1675195200)])
+    SETTINGS optimize_use_implicit_projections = 0);
 
 -- The leaf refusal must survive an outer custom name: `Array(UInt8)` is `equals`-equal to
 -- `SimpleAggregateFunction(anyLast, Array(Bool))`, so relabelling the pair before checking its children

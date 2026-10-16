@@ -18,6 +18,8 @@ SET use_statistics_for_part_pruning = 1;
 SET enable_analyzer = 1;
 SET parallel_replicas_local_plan = 1;
 SET optimize_move_to_prewhere = 1;
+-- A filter that is true on every row of a part would let `count()` read the exact count projection instead.
+SET optimize_use_implicit_projections = 0;
 
 -- =============================================================================
 -- Case 1: Float64 with NaN values

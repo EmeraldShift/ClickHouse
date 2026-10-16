@@ -49,7 +49,7 @@ SELECT count()
 FROM test
 WHERE NOT has([toDateTime('2026-01-10 00:00:00')], dt);
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test)
@@ -66,7 +66,8 @@ Expression ((Project names + Projection))
             Condition: (toDate(dt) notIn 1-element set)
             Parts: 40/40
             Granules: 960/960
-          Ranges: 40
+          Ranges: 1
+    ReadFromPreparedSource (_exact_count_projection)
 -- rerun tests with rewrite has to in
 SET optimize_rewrite_has_to_in = 1;
 SELECT count()
@@ -105,7 +106,7 @@ SELECT count()
 FROM test
 WHERE NOT has([toDateTime('2026-01-10 00:00:00')], dt);
 Expression ((Project names + Projection))
-  Aggregating
+  AggregatingProjection
     Expression (Before GROUP BY)
       Filter ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test)
@@ -122,4 +123,5 @@ Expression ((Project names + Projection))
             Condition: (toDate(dt) notIn 1-element set)
             Parts: 40/40
             Granules: 960/960
-          Ranges: 40
+          Ranges: 1
+    ReadFromPreparedSource (_exact_count_projection)
