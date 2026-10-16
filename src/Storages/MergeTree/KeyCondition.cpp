@@ -8560,7 +8560,9 @@ String KeyCondition::RPNElement::toString(const std::vector<String> & key_names)
 
 BoolMaskBounds KeyCondition::checkBoundsOnAnyRange() const
 {
-    return evaluateRPN<ThreeValuedBounds>(rpn, [](const RPNElement & element) -> ThreeValuedBounds
+    /// A negated relaxed atom never decides a range, but `force_primary_key` counts it as using the key, so every atom on
+    /// the key reads as exact here.
+    return evaluateRPN<BoolMaskBounds>(rpn, [](const RPNElement & element) -> BoolMaskBounds
     {
         if (element.function == RPNElement::FUNCTION_UNKNOWN)
             return BoolMaskBounds::unknown();
@@ -8568,8 +8570,8 @@ BoolMaskBounds KeyCondition::checkBoundsOnAnyRange() const
             return BoolMask(true, false);
         if (element.function == RPNElement::ALWAYS_FALSE)
             return BoolMask(false, true);
-        return atomBounds(element, BoolMask(true, true));
-    }).is_true;
+        return BoolMask(true, true);
+    });
 }
 
 bool KeyCondition::alwaysUnknownOrTrue() const
