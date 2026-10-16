@@ -7339,6 +7339,52 @@ bool KeyCondition::fieldHasNullInside(const Field & field)
     }
 }
 
+namespace
+{
+
+/// Bounds on where a condition is true and on where it is false. On a row where the condition is `NULL` it is neither, so
+/// `NOT` swaps them. An atom is false wherever it is not true, except on `NULL` key values, on which `mayReadNullKeyValue`
+/// drops exactness at the end.
+struct ThreeValuedBounds
+{
+    BoolMaskBounds is_true;
+    BoolMaskBounds is_false;
+
+    ThreeValuedBounds(BoolMaskBounds is_true_, BoolMaskBounds is_false_) : is_true(is_true_), is_false(is_false_) { }
+    ThreeValuedBounds(BoolMaskBounds bounds) : is_true(bounds), is_false(!bounds) { } /// NOLINT(google-explicit-constructor)
+    ThreeValuedBounds(BoolMask mask) : ThreeValuedBounds(BoolMaskBounds(mask)) { } /// NOLINT(google-explicit-constructor)
+
+    /// A relaxed range check can read a `NULL` as an ordinary key value that `mayReadNullKeyValue` does not see, like
+    /// `assumeNotNull` in the key does, so it tells nothing about where the atom is false.
+    static ThreeValuedBounds relaxed(BoolMask mask) { return {BoolMaskBounds::relaxed(mask), BoolMaskBounds::unknown()}; }
+
+    static ThreeValuedBounds fixed(const ThreeValuedBounds & bounds)
+    {
+        return {BoolMaskBounds::fixed(bounds.is_true), BoolMaskBounds::fixed(bounds.is_false)};
+    }
+
+    ThreeValuedBounds operator&(const ThreeValuedBounds & other) const { return {is_true & other.is_true, is_false | other.is_false}; }
+    ThreeValuedBounds operator|(const ThreeValuedBounds & other) const { return {is_true | other.is_true, is_false & other.is_false}; }
+    ThreeValuedBounds operator!() const { return {is_false, is_true}; }
+};
+
+/// The bounds of an atom from the bounds of its range check. A negated atom, like `x NOT IN (1, 2)`, checks its positive form.
+ThreeValuedBounds atomBounds(const KeyCondition::RPNElement & element, ThreeValuedBounds range_check)
+{
+    using RPNElement = KeyCondition::RPNElement;
+
+    if (element.relaxed)
+        range_check = ThreeValuedBounds::relaxed(range_check.is_true.upper);
+
+    if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE || element.function == RPNElement::FUNCTION_NOT_IN_SET
+        || element.function == RPNElement::FUNCTION_IS_NULL)
+        return !range_check;
+
+    return range_check;
+}
+
+}
+
 BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & hyperrectangle,
     const DataTypes & data_types,
@@ -7357,7 +7403,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
     const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn,
     const ElementMaskFn & element_mask_fn) const
 {
-    absl::InlinedVector<BoolMaskBounds, 16> rpn_stack;
+    absl::InlinedVector<ThreeValuedBounds, 16> rpn_stack;
 
     auto curve_type = [&](size_t key_column_pos)
     {
@@ -7461,14 +7507,10 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
             rpn_stack.emplace_back(BoolMask(intersects, !contains));
 
             // we don't create bloom_filter_data if monotonic_functions_chain is present
-            if (rpn_stack.back().upper.can_be_true && element.bloom_filter_data && element.monotonic_functions_chain.empty() && !mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf))
+            if (rpn_stack.back().is_true.upper.can_be_true && element.bloom_filter_data && element.monotonic_functions_chain.empty() && !mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf))
                 rpn_stack.back() = BoolMask(false, true);
 
-            if (element.relaxed)
-                rpn_stack.back() = BoolMaskBounds::relaxed(rpn_stack.back().upper);
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
-                rpn_stack.back() = !rpn_stack.back();
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (element.function == RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE)
         {
@@ -7584,6 +7626,8 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
               * This approach is generalizable to any functions, that have preimage of interval
               * represented by a set of hyperrectangles.
               */
+
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (element.function == RPNElement::FUNCTION_POINT_IN_POLYGON)
         {
@@ -7682,11 +7726,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
 
             rpn_stack.emplace_back(BoolMask(intersects, !contains));
 
-            if (element.relaxed)
-                rpn_stack.back() = BoolMaskBounds::relaxed(rpn_stack.back().upper);
-
-            if (element.function == RPNElement::FUNCTION_IS_NULL)
-                rpn_stack.back() = !rpn_stack.back();
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (
             element.function == RPNElement::FUNCTION_IN_SET
@@ -7738,14 +7778,10 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
 
             rpn_stack.emplace_back(element.set_index->checkInRange(hyperrectangle, data_types, single_point));
 
-            if (rpn_stack.back().upper.can_be_true && element.bloom_filter_data && !mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf))
+            if (rpn_stack.back().is_true.upper.can_be_true && element.bloom_filter_data && !mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf))
                 rpn_stack.back() = BoolMask(false, true);
 
-            if (element.relaxed)
-                rpn_stack.back() = BoolMaskBounds::relaxed(rpn_stack.back().upper);
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
-                rpn_stack.back() = !rpn_stack.back();
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (element.function == RPNElement::FUNCTION_NOT)
         {
@@ -7783,18 +7819,19 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type in KeyCondition::RPNElement");
 
         if (update_partial_disjunction_result_fn && element.position_in_filter_rpn)
-            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().outer(), (element.function == RPNElement::FUNCTION_UNKNOWN));
+            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().is_true.outer(), (element.function == RPNElement::FUNCTION_UNKNOWN));
         if (element_mask_fn && element.position_in_filter_rpn)
-            element_mask_fn(&element - rpn.data(), rpn_stack.back());
+            element_mask_fn(&element - rpn.data(), rpn_stack.back().is_true);
     }
 
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
 
-    if (unlikely(!rpn_stack[0].lower.can_be_false && mayReadNullKeyValue(hyperrectangle, data_types)))
-        rpn_stack[0].upper.can_be_false = rpn_stack[0].lower.can_be_false = true;
+    BoolMaskBounds & result = rpn_stack[0].is_true;
+    if (unlikely(!result.lower.can_be_false && mayReadNullKeyValue(hyperrectangle, data_types)))
+        result.upper.can_be_false = result.lower.can_be_false = true;
 
-    return rpn_stack[0];
+    return result;
 }
 
 BoolMask KeyCondition::checkInHyperrectangle(
@@ -7818,7 +7855,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
             && std::ranges::all_of(element.key_columns, [&](size_t column) { return column >= num_refinable_key_columns; });
     };
 
-    absl::InlinedVector<BoolMaskBounds, 16> rpn_stack;
+    absl::InlinedVector<ThreeValuedBounds, 16> rpn_stack;
 
     auto get_sparse_info = [&](size_t key_column) -> std::pair<bool, size_t>
     {
@@ -7916,11 +7953,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
                 }
             }
 
-            if (element.relaxed)
-                rpn_stack.back() = BoolMaskBounds::relaxed(rpn_stack.back().upper);
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
-                rpn_stack.back() = !rpn_stack.back();
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (element.function == RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE)
         {
@@ -8043,6 +8076,8 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
               * This approach is generalizable to any functions, that have preimage of interval
               * represented by a set of hyperrectangles.
               */
+
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (element.function == RPNElement::FUNCTION_POINT_IN_POLYGON)
         {
@@ -8167,11 +8202,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
 
                 rpn_stack.emplace_back(BoolMask(intersects, !contains));
 
-                if (element.relaxed)
-                    rpn_stack.back() = BoolMaskBounds::relaxed(rpn_stack.back().upper);
-
-                if (element.function == RPNElement::FUNCTION_IS_NULL)
-                    rpn_stack.back() = !rpn_stack.back();
+                rpn_stack.back() = atomBounds(element, rpn_stack.back());
             }
         }
         else if (element.function == RPNElement::FUNCTION_IN_SET
@@ -8223,11 +8254,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
 
             rpn_stack.emplace_back(element.set_index->checkInRange(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types, single_point));
 
-            if (element.relaxed)
-                rpn_stack.back() = BoolMaskBounds::relaxed(rpn_stack.back().upper);
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
-                rpn_stack.back() = !rpn_stack.back();
+            rpn_stack.back() = atomBounds(element, rpn_stack.back());
         }
         else if (element.function == RPNElement::FUNCTION_NOT)
         {
@@ -8269,16 +8296,17 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
         }
 
         if (is_fixed_atom(element))
-            rpn_stack.back() = BoolMaskBounds::fixed(rpn_stack.back());
+            rpn_stack.back() = ThreeValuedBounds::fixed(rpn_stack.back());
     }
 
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
 
-    if (unlikely(!rpn_stack[0].lower.can_be_false && mayReadNullKeyValue(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types)))
-        rpn_stack[0].upper.can_be_false = rpn_stack[0].lower.can_be_false = true;
+    BoolMaskBounds & result = rpn_stack[0].is_true;
+    if (unlikely(!result.lower.can_be_false && mayReadNullKeyValue(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types)))
+        result.upper.can_be_false = result.lower.can_be_false = true;
 
-    return rpn_stack[0];
+    return result;
 }
 
 void KeyCondition::prepareBloomFilterData(std::function<std::optional<uint64_t>(size_t column_idx, const Field &)> hash_one,
@@ -8532,7 +8560,7 @@ String KeyCondition::RPNElement::toString(const std::vector<String> & key_names)
 
 BoolMaskBounds KeyCondition::checkBoundsOnAnyRange() const
 {
-    return evaluateRPN<BoolMaskBounds>(rpn, [](const RPNElement & element) -> BoolMaskBounds
+    return evaluateRPN<ThreeValuedBounds>(rpn, [](const RPNElement & element) -> ThreeValuedBounds
     {
         if (element.function == RPNElement::FUNCTION_UNKNOWN)
             return BoolMaskBounds::unknown();
@@ -8540,10 +8568,8 @@ BoolMaskBounds KeyCondition::checkBoundsOnAnyRange() const
             return BoolMask(true, false);
         if (element.function == RPNElement::ALWAYS_FALSE)
             return BoolMask(false, true);
-        if (element.relaxed)
-            return BoolMaskBounds::relaxed(BoolMask(true, true));
-        return BoolMask(true, true);
-    });
+        return atomBounds(element, BoolMask(true, true));
+    }).is_true;
 }
 
 bool KeyCondition::alwaysUnknownOrTrue() const
