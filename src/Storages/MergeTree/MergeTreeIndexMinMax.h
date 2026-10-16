@@ -59,6 +59,7 @@ public:
         ContextPtr context);
 
     bool alwaysUnknownOrTrue() const override;
+    bool keepsEveryGranule() const override;
 
     bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
 

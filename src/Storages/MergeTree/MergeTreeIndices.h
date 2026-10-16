@@ -167,6 +167,10 @@ public:
     using UpdatePartialDisjunctionResultFn = KeyCondition::UpdatePartialDisjunctionResultFn;
     virtual bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const = 0;
 
+    /// Whether `mayBeTrueOnGranule` keeps every granule. `alwaysUnknownOrTrue` is false for some conditions that drop granules
+    /// only together with other indexes with `use_skip_indexes_for_disjunctions`, like `a = 1 OR b = 1` for an index on `a`.
+    virtual bool keepsEveryGranule() const { return alwaysUnknownOrTrue(); }
+
     /// Whether `mayBeTrueOnGranule` keeps every granule whose values lie in the hyperrectangle, and gives
     /// `update_partial_disjunction_result_fn` the same result for each atom on all of those granules. If so, this function
     /// gives `update_partial_disjunction_result_fn` those results once. The axes are the index columns in declared order.
@@ -190,6 +194,24 @@ public:
     virtual NearestNeighbours calculateApproximateNearestNeighbors(MergeTreeIndexGranulePtr /*granule*/) const
     {
         throw Exception(ErrorCodes::LOGICAL_ERROR, "calculateApproximateNearestNeighbors is not implemented for non-vector-similarity indexes");
+    }
+
+    /// `keepsEveryGranule` for a condition where an atom in `matching_functions` may have any mask on a granule and any other
+    /// atom is unknown.
+    template <typename RPNElement>
+    static bool rpnKeepsEveryGranule(
+        const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matching_functions)
+    {
+        return !evaluateRPN<BoolMaskBounds>(rpn, [&](const RPNElement & element) -> BoolMaskBounds
+        {
+            if (element.function == RPNElement::ALWAYS_TRUE)
+                return BoolMask(true, false);
+            if (element.function == RPNElement::ALWAYS_FALSE)
+                return BoolMask(false, true);
+            if (matching_functions.contains(element.function))
+                return BoolMask(true, true);
+            return BoolMaskBounds::unknown();
+        }).upper.can_be_false;
     }
 
     template <typename RPNElement>

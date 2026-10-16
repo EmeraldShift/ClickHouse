@@ -78,6 +78,7 @@ public:
     ~MergeTreeConditionBloomFilterText() override = default;
 
     bool alwaysUnknownOrTrue() const override;
+    bool keepsEveryGranule() const override;
     bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
     std::string getDescription() const override { return ""; }
 
@@ -158,6 +159,9 @@ private:
     std::unique_ptr<ITokenizer> owned_tokenizer;
     TokenizerPtr tokenizer;
     NameSet columns_shadowing_map_subcolumns;
+
+    /// The atoms that the index can evaluate.
+    static const std::unordered_set<RPNElement::Function> & matchingFunctions();
 
     RPN rpn;
 };

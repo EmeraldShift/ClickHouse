@@ -107,6 +107,7 @@ public:
     TextIndexDirectReadMode getDirectReadMode(const String & function_name) const;
 
     bool alwaysUnknownOrTrue() const override;
+    bool keepsEveryGranule() const override;
     bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
     std::string getDescription() const override;
 
@@ -247,6 +248,9 @@ private:
     /// share mutable parsing state; null otherwise.
     std::shared_ptr<const ITokenizer> owned_tokenizer;
     TokenizerPtr tokenizer;
+    /// The atoms that the index can evaluate.
+    static const std::unordered_set<RPNElement::Function> & matchingFunctions();
+
     RPN rpn;
     PreparedSetsPtr prepared_sets;
 

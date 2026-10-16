@@ -8530,153 +8530,30 @@ String KeyCondition::RPNElement::toString(const std::vector<String> & key_names)
 }
 
 
+BoolMaskBounds KeyCondition::checkBoundsOnAnyRange() const
+{
+    return evaluateRPN<BoolMaskBounds>(rpn, [](const RPNElement & element) -> BoolMaskBounds
+    {
+        if (element.function == RPNElement::FUNCTION_UNKNOWN)
+            return BoolMaskBounds::unknown();
+        if (element.function == RPNElement::ALWAYS_TRUE)
+            return BoolMask(true, false);
+        if (element.function == RPNElement::ALWAYS_FALSE)
+            return BoolMask(false, true);
+        if (element.relaxed)
+            return BoolMaskBounds::relaxed(BoolMask(true, true));
+        return BoolMask(true, true);
+    });
+}
+
 bool KeyCondition::alwaysUnknownOrTrue() const
 {
-    return unknownOrAlwaysTrue(false);
-}
-
-bool KeyCondition::anyUnknownOrAlwaysTrue() const
-{
-    return unknownOrAlwaysTrue(true);
-}
-
-bool KeyCondition::unknownOrAlwaysTrue(bool unknown_any) const
-{
-    std::vector<UInt8> rpn_stack;
-
-    for (const auto & element : rpn)
-    {
-        switch (element.function)
-        {
-            case RPNElement::FUNCTION_UNKNOWN:
-                /// If unknown_any is true, return instantly,
-                /// to avoid processing it with FUNCTION_AND, and change the outcome.
-                if (unknown_any)
-                    return true;
-                /// Otherwise, it may be AND'ed via FUNCTION_AND
-                rpn_stack.push_back(true);
-                break;
-            case RPNElement::ALWAYS_TRUE:
-                rpn_stack.push_back(true);
-                break;
-            case RPNElement::FUNCTION_NOT_IN_RANGE:
-            case RPNElement::FUNCTION_IN_RANGE:
-            case RPNElement::FUNCTION_IN_SET:
-            case RPNElement::FUNCTION_NOT_IN_SET:
-            case RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
-            case RPNElement::FUNCTION_POINT_IN_POLYGON:
-            case RPNElement::FUNCTION_IS_NULL:
-            case RPNElement::FUNCTION_IS_NOT_NULL:
-            case RPNElement::ALWAYS_FALSE:
-                rpn_stack.push_back(false);
-                break;
-            case RPNElement::FUNCTION_NOT:
-                break;
-            case RPNElement::FUNCTION_AND:
-            {
-                chassert(!rpn_stack.empty());
-
-                auto arg1 = rpn_stack.back();
-                rpn_stack.pop_back();
-                auto arg2 = rpn_stack.back();
-                rpn_stack.back() = arg1 & arg2;
-                break;
-            }
-            case RPNElement::FUNCTION_OR:
-            {
-                chassert(!rpn_stack.empty());
-
-                auto arg1 = rpn_stack.back();
-                rpn_stack.pop_back();
-                auto arg2 = rpn_stack.back();
-                rpn_stack.back() = arg1 | arg2;
-                break;
-            }
-            /// No `default:` to make the compiler warn if not all enum values are handled.
-        }
-    }
-
-    if (rpn_stack.size() != 1)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::unknownOrAlwaysTrue");
-
-    return rpn_stack[0];
+    return !checkBoundsOnAnyRange().upper.can_be_false;
 }
 
 bool KeyCondition::alwaysFalse() const
 {
-    /// 0: always_false, 1: always_true, 2: non_const
-    std::vector<UInt8> rpn_stack;
-
-    for (const auto & element : rpn)
-    {
-        switch (element.function)
-        {
-            case RPNElement::ALWAYS_TRUE:
-                rpn_stack.push_back(1);
-                break;
-            case RPNElement::ALWAYS_FALSE:
-                rpn_stack.push_back(0);
-                break;
-            case RPNElement::FUNCTION_NOT_IN_RANGE:
-            case RPNElement::FUNCTION_IN_RANGE:
-            case RPNElement::FUNCTION_IN_SET:
-            case RPNElement::FUNCTION_NOT_IN_SET:
-            case RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE:
-            case RPNElement::FUNCTION_POINT_IN_POLYGON:
-            case RPNElement::FUNCTION_IS_NULL:
-            case RPNElement::FUNCTION_IS_NOT_NULL:
-            case RPNElement::FUNCTION_UNKNOWN:
-                rpn_stack.push_back(2);
-                break;
-            case RPNElement::FUNCTION_NOT:
-            {
-                auto & arg = rpn_stack.back();
-                if (arg == 0)
-                    arg = 1;
-                else if (arg == 1)
-                    arg = 0;
-                break;
-            }
-            case RPNElement::FUNCTION_AND:
-            {
-                chassert(!rpn_stack.empty());
-
-                auto arg1 = rpn_stack.back();
-                rpn_stack.pop_back();
-                auto arg2 = rpn_stack.back();
-
-                if (arg1 == 0 || arg2 == 0)
-                    rpn_stack.back() = 0;
-                else if (arg1 == 1 && arg2 == 1)
-                    rpn_stack.back() = 1;
-                else
-                    rpn_stack.back() = 2;
-                break;
-            }
-            case RPNElement::FUNCTION_OR:
-            {
-                chassert(!rpn_stack.empty());
-
-                auto arg1 = rpn_stack.back();
-                rpn_stack.pop_back();
-                auto arg2 = rpn_stack.back();
-
-                if (arg1 == 1 || arg2 == 1)
-                    rpn_stack.back() = 1;
-                else if (arg1 == 0 && arg2 == 0)
-                    rpn_stack.back() = 0;
-                else
-                    rpn_stack.back() = 2;
-                break;
-            }
-            /// No `default:` to make the compiler warn if not all enum values are handled.
-        }
-    }
-
-    if (rpn_stack.size() != 1)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::alwaysFalse");
-
-    return rpn_stack[0] == 0;
+    return !checkBoundsOnAnyRange().upper.can_be_true;
 }
 
 bool KeyCondition::hasMonotonicFunctionsChain() const
