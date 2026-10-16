@@ -383,15 +383,25 @@ MergeTreeIndexConditionBloomFilter::MergeTreeIndexConditionBloomFilter(
     rpn = std::move(builder).extractRPN();
 }
 
+const std::unordered_set<MergeTreeIndexConditionBloomFilter::RPNElement::Function> & MergeTreeIndexConditionBloomFilter::matchingFunctions()
+{
+    static const std::unordered_set<RPNElement::Function> functions{
+        RPNElement::FUNCTION_EQUALS,
+        RPNElement::FUNCTION_HAS,
+        RPNElement::FUNCTION_HAS_ANY,
+        RPNElement::FUNCTION_HAS_ALL,
+        RPNElement::FUNCTION_IN};
+    return functions;
+}
+
 bool MergeTreeIndexConditionBloomFilter::alwaysUnknownOrTrue() const
 {
-    return rpnEvaluatesAlwaysUnknownOrTrue(
-        rpn,
-        {RPNElement::FUNCTION_EQUALS,
-         RPNElement::FUNCTION_HAS,
-         RPNElement::FUNCTION_HAS_ANY,
-         RPNElement::FUNCTION_HAS_ALL,
-         RPNElement::FUNCTION_IN});
+    return rpnEvaluatesAlwaysUnknownOrTrue(rpn, matchingFunctions());
+}
+
+bool MergeTreeIndexConditionBloomFilter::keepsEveryGranule() const
+{
+    return rpnKeepsEveryGranule(rpn, matchingFunctions());
 }
 
 bool MergeTreeIndexConditionBloomFilter::mayBeTrueOnGranule(const MergeTreeIndexGranuleBloomFilter * granule, const UpdatePartialDisjunctionResultFn & update_partial_result_disjuntion_fn) const

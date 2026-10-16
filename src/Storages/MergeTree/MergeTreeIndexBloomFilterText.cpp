@@ -183,20 +183,30 @@ MergeTreeConditionBloomFilterText::MergeTreeConditionBloomFilterText(
     rpn = std::move(builder).extractRPN();
 }
 
+const std::unordered_set<MergeTreeConditionBloomFilterText::RPNElement::Function> & MergeTreeConditionBloomFilterText::matchingFunctions()
+{
+    static const std::unordered_set<RPNElement::Function> functions{
+        RPNElement::FUNCTION_EQUALS,
+        RPNElement::FUNCTION_NOT_EQUALS,
+        RPNElement::FUNCTION_HAS,
+        RPNElement::FUNCTION_IN,
+        RPNElement::FUNCTION_NOT_IN,
+        RPNElement::FUNCTION_MULTI_SEARCH,
+        RPNElement::FUNCTION_MATCH,
+        RPNElement::FUNCTION_HAS_ANY,
+        RPNElement::FUNCTION_HAS_ALL,
+        RPNElement::ALWAYS_FALSE};
+    return functions;
+}
+
 bool MergeTreeConditionBloomFilterText::alwaysUnknownOrTrue() const
 {
-    return rpnEvaluatesAlwaysUnknownOrTrue(
-        rpn,
-        {RPNElement::FUNCTION_EQUALS,
-         RPNElement::FUNCTION_NOT_EQUALS,
-         RPNElement::FUNCTION_HAS,
-         RPNElement::FUNCTION_IN,
-         RPNElement::FUNCTION_NOT_IN,
-         RPNElement::FUNCTION_MULTI_SEARCH,
-         RPNElement::FUNCTION_MATCH,
-         RPNElement::FUNCTION_HAS_ANY,
-         RPNElement::FUNCTION_HAS_ALL,
-         RPNElement::ALWAYS_FALSE});
+    return rpnEvaluatesAlwaysUnknownOrTrue(rpn, matchingFunctions());
+}
+
+bool MergeTreeConditionBloomFilterText::keepsEveryGranule() const
+{
+    return rpnKeepsEveryGranule(rpn, matchingFunctions());
 }
 
 /// Keep in-sync with MergeTreeIndexConditionGin::mayBeTrueOnGranuleInPart

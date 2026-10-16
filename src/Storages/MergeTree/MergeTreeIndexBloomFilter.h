@@ -82,6 +82,7 @@ public:
         JSONIndexArgumentTypes json_argument_types_);
 
     bool alwaysUnknownOrTrue() const override;
+    bool keepsEveryGranule() const override;
 
     bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr granule, const UpdatePartialDisjunctionResultFn & update_partial_result_disjuntion_fn) const override
     {
@@ -100,6 +101,9 @@ private:
     /// Argument types of the JSON index functions of this index, by position in `header`.
     const JSONIndexArgumentTypes json_argument_types;
     const bool validate_enum_literals_in_operators;
+    /// The atoms that the index can evaluate.
+    static const std::unordered_set<RPNElement::Function> & matchingFunctions();
+
     std::vector<RPNElement> rpn;
 
     bool mayBeTrueOnGranule(const MergeTreeIndexGranuleBloomFilter * granule, const UpdatePartialDisjunctionResultFn & update_partial_result_disjuntion_fn) const;
