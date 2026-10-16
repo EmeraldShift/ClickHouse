@@ -2805,17 +2805,18 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                 1, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_bounds);
         };
 
-        /// Each condition is built from the whole filter, so they are three checks of the same condition.
+        /// The key condition is built from the whole filter. An offset condition keeps only the conjuncts on offsets, so it
+        /// is a relaxed check of the filter.
         auto result = BoolMaskBounds::none();
 
         if (key_condition_useful)
             result = BoolMaskBounds::intersect(result, check_key_condition());
 
         if (part_offset_condition_useful)
-            result = BoolMaskBounds::intersect(result, check_part_offset_condition());
+            result = BoolMaskBounds::intersect(result, BoolMaskBounds::relaxed(check_part_offset_condition().upper));
 
         if (total_offset_condition_useful)
-            result = BoolMaskBounds::intersect(result, check_total_offset_condition());
+            result = BoolMaskBounds::intersect(result, BoolMaskBounds::relaxed(check_total_offset_condition().upper));
 
         return result;
     };
