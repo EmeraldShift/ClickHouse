@@ -202,16 +202,16 @@ public:
     static bool rpnKeepsEveryGranule(
         const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matching_functions)
     {
-        return !evaluateRPN<BoolMaskBounds>(rpn, [&](const RPNElement & element) -> BoolMaskBounds
+        return !evaluateRPN<Truth>(rpn, [&](const RPNElement & element)
         {
             if (element.function == RPNElement::ALWAYS_TRUE)
-                return BoolMask(true, false);
+                return Truth::check(BoolMask(true, false));
             if (element.function == RPNElement::ALWAYS_FALSE)
-                return BoolMask(false, true);
+                return Truth::check(BoolMask(false, true));
             if (matching_functions.contains(element.function))
-                return BoolMask(true, true);
-            return BoolMaskBounds::unknown();
-        }).upper.can_be_false;
+                return Truth::check(true, true, true);
+            return Truth::unknown();
+        }).is_true.mayBeNever();
     }
 
     template <typename RPNElement>

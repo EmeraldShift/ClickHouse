@@ -53,8 +53,8 @@ struct GenericExclusionSearchResult
     bool reached_step_limit = false;
 };
 
-/// The result of checking the condition on the rows of a mark range.
-using MarkRangeCheckResult = BoolMaskBounds;
+/// Where the condition is true on the rows of a mark range, see `Truth::is_true`.
+using MarkRangeCheckResult = Side;
 
 using MarkRangeCheck = std::function<MarkRangeCheckResult(const MarkRange &)>;
 

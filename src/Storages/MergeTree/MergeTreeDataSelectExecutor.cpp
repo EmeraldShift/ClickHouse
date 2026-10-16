@@ -2654,13 +2654,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     std::vector<FieldRef> part_offset_left(2);
     std::vector<FieldRef> part_offset_right(2);
 
-    auto check_bounds_in_range = [&](const MarkRange & range, BoolMaskBounds initial_bounds)
+    auto check_bounds_in_range = [&](const MarkRange & range, Truth need)
     {
-        auto check_key_condition = [&]() -> BoolMaskBounds
+        auto check_key_condition = [&]() -> Truth
         {
-            if (!key_condition_useful)
-                return BoolMask(true, true);
-
             if (use_sparse_pk_representation)
             {
                 chassert(sparse_keys_size > 0);
@@ -2723,7 +2720,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     sparse_key_right.data(),
                     sparse_key_types,
                     equal_boundaries_mask,
-                    initial_bounds,
+                    need,
                     &index_bounds);
             }
 
@@ -2766,17 +2763,17 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                 }
             }
             return key_condition.checkBoundsInRange(
-                used_key_size, index_left.data(), index_right.data(), key_types, initial_bounds, &index_bounds);
+                used_key_size, index_left.data(), index_right.data(), key_types, need, &index_bounds);
         };
 
-        auto check_part_offset_condition = [&]() -> BoolMaskBounds
+        auto check_part_offset_condition = [&]() -> Truth
         {
             auto begin = part->index_granularity->getMarkStartingRow(range.begin);
             auto end = part->index_granularity->getMarkStartingRow(range.end) - 1;
             if (begin > end)
             {
                 /// Empty mark (final mark)
-                return BoolMask(false, true);
+                return Truth::check(BoolMask(false, true));
             }
 
             part_offset_left[0] = begin;
@@ -2786,44 +2783,45 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             part_offset_right[1] = part->name;
 
             return part_offset_condition->checkBoundsInRange(
-                2, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_bounds);
+                2, part_offset_left.data(), part_offset_right.data(), part_offset_types, need);
         };
 
-        auto check_total_offset_condition = [&]() -> BoolMaskBounds
+        auto check_total_offset_condition = [&]() -> Truth
         {
             auto begin = part->index_granularity->getMarkStartingRow(range.begin);
             auto end = part->index_granularity->getMarkStartingRow(range.end) - 1;
             if (begin > end)
             {
                 /// Empty mark (final mark)
-                return BoolMask(false, true);
+                return Truth::check(BoolMask(false, true));
             }
 
             part_offset_left[0] = begin + part_starting_offset_in_query;
             part_offset_right[0] = end + part_starting_offset_in_query;
             return total_offset_condition->checkBoundsInRange(
-                1, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_bounds);
+                1, part_offset_left.data(), part_offset_right.data(), part_offset_types, need);
         };
 
-        /// The key condition is built from the whole filter. An offset condition keeps only the conjuncts on offsets, so it
-        /// is a relaxed check of the filter.
-        auto result = BoolMaskBounds::none();
+        /// The key condition is built from the whole filter. An offset condition keeps only the conjuncts on offsets, so the
+        /// filter is their conjunction with a rest that the offset condition does not know. Each check describes the filter
+        /// on the range, so the results `meet`, which reads every side of each result whole.
+        if (part_offset_condition_useful || total_offset_condition_useful)
+            need = {};
 
-        if (key_condition_useful)
-            result = BoolMaskBounds::intersect(result, check_key_condition());
+        Truth result = key_condition_useful ? check_key_condition() : Truth::unknown();
 
         if (part_offset_condition_useful)
-            result = BoolMaskBounds::intersect(result, BoolMaskBounds::relaxed(check_part_offset_condition().upper));
+            result = Truth::meet(result, check_part_offset_condition() & Truth::unknown());
 
         if (total_offset_condition_useful)
-            result = BoolMaskBounds::intersect(result, BoolMaskBounds::relaxed(check_total_offset_condition().upper));
+            result = Truth::meet(result, check_total_offset_condition() & Truth::unknown());
 
         return result;
     };
 
     auto check_in_range = [&](const MarkRange & range, BoolMask initial_mask = {})
     {
-        return check_bounds_in_range(range, BoolMaskBounds::outerOnly(initial_mask)).outer();
+        return check_bounds_in_range(range, Truth::need(initial_mask)).mask();
     };
 
     bool key_condition_exact_range = !key_condition_useful || key_condition.matchesExactContinuousRange();
@@ -2851,9 +2849,10 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             .min_marks_for_seek = min_marks_for_seek,
         };
 
-        /// The search reads `lower.can_be_true` only to collect exact ranges. Without them, setting it lets the check stop earlier.
-        const BoolMaskBounds initial_bounds(BoolMask(), BoolMask(/*can_be_true=*/ !exact_ranges, false));
-        auto check = [&](const MarkRange & mark_range) { return check_bounds_in_range(mark_range, initial_bounds); };
+        /// The search reads whether a subrange can be `Always` only to collect exact ranges, so the check can stop earlier
+        /// without them.
+        const Truth need = Truth::need(Side{Side::Never, exact_ranges ? Side::Always : Side::Sometimes});
+        auto check = [&](const MarkRange & mark_range) { return check_bounds_in_range(mark_range, need).is_true; };
 
         auto search_result = genericExclusionSearch(part_ranges, check, search_settings, /*collect_exact_ranges=*/ exact_ranges != nullptr);
 
@@ -3181,7 +3180,7 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
 
             auto check_in_range = [&may_be_true_on_range](const MarkRange & mark_range)
             {
-                return BoolMask(may_be_true_on_range(mark_range.begin, mark_range.end, nullptr), true);
+                return Side::of(may_be_true_on_range(mark_range.begin, mark_range.end, nullptr), true, true);
             };
 
             auto search_result = genericExclusionSearch(ranges, check_in_range, search_settings, /*collect_exact_ranges=*/ false);
@@ -3392,12 +3391,12 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         counters.num_initial_selected_granules += num_granules;
 
         /// hyperrectangle must come from the part whose metadata built the condition.
-        auto part_bounds = BoolMaskBounds::none();
+        Truth part_truth = Truth::unknown();
         if (minmax_idx_condition)
         {
-            part_bounds = minmax_idx_condition->generateForPart(part_or_projection).checkBoundsInHyperrectangle(
+            part_truth = minmax_idx_condition->generateForPart(part_or_projection).checkBoundsInHyperrectangle(
                 part_or_projection->getMinMaxIndex()->hyperrectangle, minmax_columns_types);
-            if (!part_bounds.upper.can_be_true)
+            if (part_truth.is_true.level() == Side::Never)
                 continue;
         }
 
@@ -3408,7 +3407,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         {
             if (partition_pruner->canBePruned(*part))
                 continue;
-            part_bounds = BoolMaskBounds::intersect(part_bounds, partition_pruner->checkPartition(*part));
+            part_truth = Truth::meet(part_truth, partition_pruner->checkPartition(*part));
         }
 
         counters.num_parts_after_partition_pruner += 1;
@@ -3417,7 +3416,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         res_parts.push_back(prev_part);
 
         /// The filter is true on every row of the part.
-        if (!part_bounds.lower.can_be_false)
+        if (part_truth.is_true.level() == Side::Always)
             res_parts.back().exact_ranges = res_parts.back().ranges;
     }
     return res_parts;

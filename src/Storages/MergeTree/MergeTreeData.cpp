@@ -2432,7 +2432,7 @@ std::optional<UInt64> MergeTreeData::totalRowsByPartitionPredicateImpl(
             continue;
 
         /// Without the filter on virtual columns, the partition key must decide that every row of the part matches.
-        if (!valid && partition_pruner.checkPartition(*part.data_part).lower.can_be_false)
+        if (!valid && partition_pruner.checkPartition(*part.data_part).is_true.level() != Side::Always)
             return {};
 
         res += part.data_part->rows_count;

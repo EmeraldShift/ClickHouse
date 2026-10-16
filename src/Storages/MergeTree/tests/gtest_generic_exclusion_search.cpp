@@ -10,20 +10,27 @@ using namespace DB;
 namespace
 {
 
-std::function<BoolMask(const MarkRange &)> oracleFromFlags(const std::vector<bool> & matching_marks)
+/// Whether some mark of the range matches, and whether some mark does not.
+BoolMask maskOfRange(const std::vector<bool> & matching_marks, const MarkRange & range)
+{
+    bool can_be_true = false;
+    bool can_be_false = false;
+    for (size_t mark = range.begin; mark != range.end; ++mark)
+    {
+        if (matching_marks[mark])
+            can_be_true = true;
+        else
+            can_be_false = true;
+    }
+    return BoolMask(can_be_true, can_be_false);
+}
+
+MarkRangeCheck oracleFromFlags(const std::vector<bool> & matching_marks)
 {
     return [&matching_marks](const MarkRange & range)
     {
-        bool can_be_true = false;
-        bool can_be_false = false;
-        for (size_t mark = range.begin; mark != range.end; ++mark)
-        {
-            if (matching_marks[mark])
-                can_be_true = true;
-            else
-                can_be_false = true;
-        }
-        return BoolMask(can_be_true, can_be_false);
+        const BoolMask mask = maskOfRange(matching_marks, range);
+        return Side::of(mask.can_be_true, mask.can_be_false, true);
     };
 }
 
@@ -594,10 +601,9 @@ TEST(GenericExclusionSearch, NeverExactOracle)
     // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
     std::mt19937 rng(29);
     auto matching = randomFlags(150, 0.4, rng);
-    auto precise = oracleFromFlags(matching);
     MarkRangeCheck never_exact = [&](const MarkRange & range)
     {
-        return BoolMask(precise(range).can_be_true, true);
+        return Side::of(maskOfRange(matching, range).can_be_true, true, true);
     };
 
     for (size_t min_marks_for_seek : {0, 2})
@@ -627,10 +633,9 @@ TEST(GenericExclusionSearch, ConservativeOracle)
     // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
     std::mt19937 rng(11);
     auto matching = randomFlags(128, 0.4, rng);
-    auto precise = oracleFromFlags(matching);
     MarkRangeCheck conservative = [&](const MarkRange & range)
     {
-        return BoolMask(true, precise(range).can_be_false);
+        return Side::of(true, maskOfRange(matching, range).can_be_false, true);
     };
 
     for (size_t max_steps : {0, 25})
@@ -651,9 +656,8 @@ TEST(GenericExclusionSearch, ConservativeOracle)
 TEST(GenericExclusionSearch, UnknownAtomInConjunction)
 {
     /// The condition `a AND u`, where `a` is given by the flags and `u` cannot be evaluated on the
-    /// index. `upper` assumes `u` is true and gives the mask of `a`. `lower` assumes `u` is false, so
-    /// the condition is never true. No range can be exact, and splitting a range on which `a` is
-    /// certainly true cannot exclude anything.
+    /// index, so `u` is `Sometimes` on every range. No range can be exact, and splitting a range on
+    /// which `a` is certainly true cannot exclude anything.
     // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
     std::mt19937 rng(5);
     auto matching = randomFlags(128, 0.9, rng);
@@ -666,13 +670,12 @@ TEST(GenericExclusionSearch, UnknownAtomInConjunction)
         auto conjunction = [](const std::vector<bool> & flags) -> MarkRangeCheck
         {
             auto precise = oracleFromFlags(flags);
-            return [precise](const MarkRange & range) { return MarkRangeCheckResult(precise(range), BoolMask(false, true)); };
+            return [precise](const MarkRange & range) { return precise(range) & Side::point(Side::Sometimes); };
         };
         /// The same condition as a single mask, as the search received it before the bounds were split.
         auto single_mask = [](const std::vector<bool> & flags) -> MarkRangeCheck
         {
-            auto precise = oracleFromFlags(flags);
-            return [precise](const MarkRange & range) { return BoolMask(precise(range).can_be_true, true); };
+            return [&flags](const MarkRange & range) { return Side::of(maskOfRange(flags, range).can_be_true, true, true); };
         };
 
         auto result = genericExclusionSearch(makeRanges({{0, matching.size()}}), conjunction(matching), settings, true);
@@ -697,14 +700,13 @@ TEST(GenericExclusionSearch, UnknownAtomInConjunction)
 TEST(GenericExclusionSearch, UnknownAtomInDisjunction)
 {
     /// The condition `a OR u`, where `a` is given by the flags and `u` cannot be evaluated on the
-    /// index. `upper` assumes `u` is true, so the condition is certainly true and nothing can be
-    /// excluded. `lower` assumes `u` is false and gives the mask of `a`, which proves the marks of
-    /// `a` exact. Splitting is useful only to collect exact ranges.
+    /// index, so `u` is `Sometimes` on every range. Nothing can be excluded, and the marks of `a` are
+    /// exact. Splitting is useful only to collect exact ranges.
     // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
     std::mt19937 rng(7);
     auto matching = randomFlags(128, 0.5, rng);
     auto precise = oracleFromFlags(matching);
-    MarkRangeCheck disjunction = [&](const MarkRange & range) { return MarkRangeCheckResult(BoolMask(true, false), precise(range)); };
+    MarkRangeCheck disjunction = [&](const MarkRange & range) { return precise(range) | Side::point(Side::Sometimes); };
 
     for (size_t min_marks_for_seek : {0, 2})
     {
@@ -719,7 +721,7 @@ TEST(GenericExclusionSearch, UnknownAtomInDisjunction)
         EXPECT_TRUE(no_exact.exact_ranges.empty());
         EXPECT_EQ(no_exact.num_steps, 1u);
 
-        /// Under a budget the exact ranges are still proven by `lower`, and nothing is excluded.
+        /// Under a budget the exact ranges are still proven, and nothing is excluded.
         GenericExclusionSearchSettings limited{.coarse_index_granularity = 8, .max_steps = 20, .min_marks_for_seek = min_marks_for_seek};
         auto truncated = genericExclusionSearch(makeRanges({{0, matching.size()}}), disjunction, limited, true);
         EXPECT_EQ(truncated.ranges, makeRanges({{0, matching.size()}}));

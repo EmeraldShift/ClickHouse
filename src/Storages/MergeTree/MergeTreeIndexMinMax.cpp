@@ -250,32 +250,30 @@ bool MergeTreeIndexConditionMinMax::keepsEveryGranuleInHyperrectangle(
 
     if (!update_partial_disjunction_result_fn)
     {
-        /// `mayBeTrueOnGranule` keeps a granule if the upper bound can be true on it. If the upper bound is certainly true on
-        /// the hyperrectangle, it is certainly true on every granule inside it.
-        const auto upper = condition.checkBoundsInHyperrectangle(hyperrectangle, index_data_types).upper;
-        return upper.can_be_true && !upper.can_be_false;
+        /// `mayBeTrueOnGranule` keeps a granule unless the condition is never true on it.
+        return !condition.checkBoundsInHyperrectangle(hyperrectangle, index_data_types).is_true.mayBeNever();
     }
 
-    /// `mayBeTrueOnGranule` gives each atom's `outer()` mask to `update_partial_disjunction_result_fn`. If the bounds of every
-    /// atom are decided on the hyperrectangle, every granule inside it has the same bounds for each atom and for the condition.
+    /// `mayBeTrueOnGranule` gives each atom's `mask()` to `update_partial_disjunction_result_fn`. If `is_true` of every atom
+    /// is a `Side::point` on the hyperrectangle, every granule inside it gets the same masks.
     const auto & rpn = condition.getRPN();
     bool atoms_decided = true;
     std::vector<std::pair<size_t, BoolMask>> atom_results;
-    const auto bounds = condition.checkBoundsInHyperrectangle(
+    const auto truth = condition.checkBoundsInHyperrectangle(
         hyperrectangle, index_data_types, {}, {},
-        [&](size_t rpn_index, BoolMaskBounds element_bounds)
+        [&](size_t rpn_index, Truth element_truth)
         {
             const auto & element = rpn[rpn_index];
             if (element.function == KeyCondition::RPNElement::FUNCTION_AND || element.function == KeyCondition::RPNElement::FUNCTION_OR
                 || element.function == KeyCondition::RPNElement::FUNCTION_NOT
                 || element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
                 return;
-            if (element_bounds.isDecided())
-                atom_results.emplace_back(*element.position_in_filter_rpn, element_bounds.outer());
+            if (element_truth.is_true.lo == element_truth.is_true.hi)
+                atom_results.emplace_back(*element.position_in_filter_rpn, element_truth.mask());
             else
                 atoms_decided = false;
         });
-    if (!atoms_decided || !bounds.upper.can_be_true)
+    if (!atoms_decided || truth.is_true.level() == Side::Never)
         return false;
 
     for (const auto & [position, mask] : atom_results)

@@ -118,8 +118,8 @@ BoolMask maskOnRows(const Filter & filter, const std::vector<Row> & rows, size_t
 }
 
 /// `checkBoundsInRange` on the key range of a mark range, the way the primary key analysis calls it, against the filter
-/// evaluated on the rows. The filter is never truer than `upper` and never falser than `lower`. A subrange is excluded only
-/// if `upper.can_be_false`, and is exact only if `lower.can_be_true`.
+/// evaluated on the rows, which are never NULL. Each side of the truth of a range allows the rows of the range, and a
+/// subrange is `Never` or `Always` on a side only if the range says it can be.
 TEST(KeyConditionBounds, BoundsHoldOnRandomFilters)
 {
     auto context = getRegisteredContext();
@@ -148,7 +148,7 @@ TEST(KeyConditionBounds, BoundsHoldOnRandomFilters)
 
         /// The key range of marks [begin, end) runs from the first row of `begin` to the first row of `end`, or to the last
         /// row for the last mark.
-        auto bounds = [&](size_t begin, size_t end)
+        auto truth = [&](size_t begin, size_t end)
         {
             const Row & left = rows[begin * rows_per_mark];
             const Row & right = rows[std::min(end * rows_per_mark, rows.size() - 1)];
@@ -162,20 +162,32 @@ TEST(KeyConditionBounds, BoundsHoldOnRandomFilters)
             for (size_t end = begin + 1; end <= num_marks; ++end)
             {
                 SCOPED_TRACE(fmt::format("condition {}, marks [{}, {})", condition.toString(), begin, end));
-                const BoolMaskBounds range_bounds = bounds(begin, end);
+                const Truth range_truth = truth(begin, end);
                 const BoolMask mask = maskOnRows(filter, rows, begin, end);
-                EXPECT_TRUE(!mask.can_be_true || range_bounds.upper.can_be_true);
-                EXPECT_TRUE(!mask.can_be_false || range_bounds.lower.can_be_false);
+                const std::vector<std::pair<Side, BoolMask>> sides{
+                    {range_truth.is_true, mask}, {range_truth.is_false, !mask}, {range_truth.is_null, BoolMask(false, true)}};
+                for (const auto & [side, rows_mask] : sides)
+                {
+                    EXPECT_TRUE(!rows_mask.can_be_true || side.level() != Side::Never);
+                    EXPECT_TRUE(!rows_mask.can_be_false || side.level() != Side::Always);
+                }
 
                 for (size_t sub_begin = begin; sub_begin < end; ++sub_begin)
                 {
                     for (size_t sub_end = sub_begin + 1; sub_end <= end; ++sub_end)
                     {
-                        const BoolMaskBounds sub_bounds = bounds(sub_begin, sub_end);
-                        if (!sub_bounds.upper.can_be_true)
-                            EXPECT_TRUE(range_bounds.upper.can_be_false);
-                        if (!sub_bounds.lower.can_be_false)
-                            EXPECT_TRUE(range_bounds.lower.can_be_true);
+                        const Truth sub_truth = truth(sub_begin, sub_end);
+                        const std::vector<std::pair<Side, Side>> sub_sides{
+                            {sub_truth.is_true, range_truth.is_true},
+                            {sub_truth.is_false, range_truth.is_false},
+                            {sub_truth.is_null, range_truth.is_null}};
+                        for (const auto & [sub_side, side] : sub_sides)
+                        {
+                            if (sub_side.level() == Side::Never)
+                                EXPECT_TRUE(side.mayBeNever());
+                            if (sub_side.level() == Side::Always)
+                                EXPECT_TRUE(side.mayBeAlways());
+                        }
                     }
                 }
             }

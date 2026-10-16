@@ -55,7 +55,7 @@ void splitRange(MarkRange range, size_t coarse_index_granularity, Consume && con
 /// Whether splitting a range can exclude a subrange, or find an exact subrange if exact ranges are collected.
 bool splittingCanRefine(const MarkRangeCheckResult & check, bool collect_exact_ranges)
 {
-    return check.upper.can_be_false || (collect_exact_ranges && check.lower.can_be_true);
+    return check.mayBeNever() || (collect_exact_ranges && check.mayBeAlways());
 }
 
 /// The classic exhaustive algorithm. The stack holds the mark ranges that still have to be
@@ -83,10 +83,10 @@ void searchUnlimited(
 
             MarkRangeCheckResult check = check_in_range(range);
 
-            if (!check.upper.can_be_true)
+            if (check.level() == Side::Never)
                 continue;
 
-            bool exact = !check.lower.can_be_false;
+            bool exact = check.level() == Side::Always;
             if (exact || range.end == range.begin + 1 || !splittingCanRefine(check, collect_exact_ranges))
             {
                 appendWithMaxGap(result.ranges, range, search_settings.min_marks_for_seek);
@@ -145,10 +145,10 @@ void searchLimited(
 
         MarkRangeCheckResult check = check_in_range(range);
 
-        if (!check.upper.can_be_true)
+        if (check.level() == Side::Never)
             continue;
 
-        bool exact = !check.lower.can_be_false;
+        bool exact = check.level() == Side::Always;
         if (exact || range.end == range.begin + 1 || !splittingCanRefine(check, collect_exact_ranges))
         {
             accepted.push_back(range);

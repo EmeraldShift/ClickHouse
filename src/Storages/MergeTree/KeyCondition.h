@@ -133,8 +133,8 @@ public:
     /// granule is computed in MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions()
     using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, BoolMask mask, bool is_unknown)>;
 
-    /// Receives the bounds of an element of `getRPN()`, given by its index there.
-    using ElementMaskFn = std::function<void (size_t rpn_index, BoolMaskBounds bounds)>;
+    /// Receives the truth of an element of `getRPN()`, given by its index there.
+    using ElementMaskFn = std::function<void (size_t rpn_index, Truth truth)>;
 
     /// Whether the condition and its negation are feasible in the direct product of single column ranges specified by `hyperrectangle`.
     /// `element_mask_fn` gets the mask of each element that `update_partial_disjunction_result_fn` gets a result for.
@@ -145,9 +145,9 @@ public:
         const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr,
         const ElementMaskFn & element_mask_fn = nullptr) const;
 
-    /// The bounds that `checkInHyperrectangle` returns the `outer()` of. An atom on a column the hyperrectangle does not have
+    /// The truth that `checkInHyperrectangle` returns the `mask()` of. An atom on a column the hyperrectangle does not have
     /// counts as unknown.
-    BoolMaskBounds checkBoundsInHyperrectangle(
+    Truth checkBoundsInHyperrectangle(
         const Hyperrectangle & hyperrectangle,
         const DataTypes & data_types,
         const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
@@ -163,9 +163,9 @@ public:
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types) const;
 
-    /// An atom only on key columns from `num_refinable_key_columns` on is fixed (see `BoolMaskBounds::fixed`): the caller
+    /// An atom only on key columns from `num_refinable_key_columns` on is fixed (see `Truth::fixed`): the caller
     /// gives those columns the same range on every call.
-    BoolMaskBounds checkBoundsInHyperrectangle(
+    Truth checkBoundsInHyperrectangle(
         const std::vector<int> & key_col_to_sparse_pos,
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types,
@@ -186,12 +186,13 @@ public:
         BoolMask initial_mask = BoolMask(false, false),
         const Hyperrectangle * key_bounds = nullptr) const;
 
-    BoolMaskBounds checkBoundsInRange(
+    /// The truth that `checkInRange` returns the `mask()` of. The check stops once its value covers `need`, see `Truth::covers`.
+    Truth checkBoundsInRange(
         size_t key_size,
         const FieldRef * left_keys,
         const FieldRef * right_keys,
         const DataTypes & data_types,
-        BoolMaskBounds initial_bounds = {},
+        const Truth & need = {},
         const Hyperrectangle * key_bounds = nullptr) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
@@ -219,15 +220,15 @@ public:
         BoolMask initial_mask,
         const Hyperrectangle * key_bounds = nullptr) const;
 
-    /// Atoms only on the constant coordinates are fixed (see `BoolMaskBounds::fixed`), and so are atoms only on columns
+    /// Atoms only on the constant coordinates are fixed (see `Truth::fixed`), and so are atoms only on columns
     /// missing from `sparse_key_indices`.
-    BoolMaskBounds checkBoundsInRange(
+    Truth checkBoundsInRange(
         const std::vector<size_t> & sparse_key_indices,
         const FieldRef * sparse_left_keys,
         const FieldRef * sparse_right_keys,
         const DataTypes & sparse_data_types,
         const std::vector<UInt8> & equal_boundaries_mask,
-        BoolMaskBounds initial_bounds = {},
+        const Truth & need = {},
         const Hyperrectangle * key_bounds = nullptr) const;
 
     const KeyOrder & getKeyOrder() const { return key_order; }
@@ -240,8 +241,8 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types) const;
 
-    /// Bounds that hold on every range, where an atom the index can evaluate may have any mask.
-    BoolMaskBounds checkBoundsOnAnyRange() const;
+    /// The truth on every range, where an atom the index can evaluate may have any outcome.
+    Truth checkBoundsOnAnyRange() const;
 
     /// Checks that the index can not be used: no range check can exclude a range.
     bool alwaysUnknownOrTrue() const;
@@ -564,15 +565,6 @@ public:
         bool date_time_overflow_behavior_ignore_);
 
 private:
-    /// Whether any atom reads a `Nullable` key column whose analysed range may hold a NULL value.
-    /// A NULL satisfies neither a comparison nor its negation, which the two-valued range algebra of
-    /// `checkInHyperrectangle` cannot express, so it costs the analysis its `can_be_false` claim.
-    bool mayReadNullKeyValue(const Hyperrectangle & hyperrectangle, const DataTypes & key_types) const;
-    bool mayReadNullKeyValue(
-        const std::vector<int> & key_col_to_sparse_pos,
-        const Hyperrectangle & sparse_hyperrectangle,
-        const DataTypes & sparse_key_types) const;
-
     /// Information used when building a KeyCondition out of ActionsDAG.
     struct BuildInfo
     {

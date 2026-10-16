@@ -30,9 +30,9 @@ public:
     /// rows on another replica, and pruning it by that part would let them escape the mutation.
     bool canPartitionBePruned(const IMergeTreeDataPart & part) const;
 
-    /// Bounds of the predicate on the rows of the part's partition. The part is pruned if `upper` is certainly false, and the
-    /// predicate accepts every row of the part if `lower` is certainly true.
-    BoolMaskBounds checkPartition(const IMergeTreeDataPart & part) const;
+    /// The truth of the predicate on the rows of the part's partition. The part is pruned if `is_true` is `Never`, and the
+    /// predicate accepts every row of the part if `is_true` is `Always`.
+    Truth checkPartition(const IMergeTreeDataPart & part) const;
 
     bool isUseless() const { return useless; }
 
@@ -40,7 +40,7 @@ public:
 
 private:
     /// Cache already analyzed partitions.
-    mutable std::unordered_map<String, BoolMaskBounds> partition_bounds_map;
+    mutable std::unordered_map<String, Truth> partition_truth_map;
 
     /// partition_key is adjusted here (with substitution from modulo to moduloLegacy).
     KeyDescription partition_key;

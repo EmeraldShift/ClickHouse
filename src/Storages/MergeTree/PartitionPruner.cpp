@@ -33,13 +33,13 @@ bool PartitionPruner::canBePruned(const IMergeTreeDataPart & part) const
 
 bool PartitionPruner::canPartitionBePruned(const IMergeTreeDataPart & part) const
 {
-    return !checkPartition(part).upper.can_be_true;
+    return checkPartition(part).is_true.level() == Side::Never;
 }
 
-BoolMaskBounds PartitionPruner::checkPartition(const IMergeTreeDataPart & part) const
+Truth PartitionPruner::checkPartition(const IMergeTreeDataPart & part) const
 {
     const auto & partition_id = part.info.getPartitionId();
-    if (auto it = partition_bounds_map.find(partition_id); it != partition_bounds_map.end())
+    if (auto it = partition_truth_map.find(partition_id); it != partition_truth_map.end())
         return it->second;
 
     const auto & partition_value = part.partition.value;
@@ -51,17 +51,17 @@ BoolMaskBounds PartitionPruner::checkPartition(const IMergeTreeDataPart & part) 
             field = POSITIVE_INFINITY;
     }
 
-    const auto bounds = partition_condition.checkBoundsInRange(
+    const auto truth = partition_condition.checkBoundsInRange(
         partition_value.size(), index_value.data(), index_value.data(), partition_key.data_types);
-    partition_bounds_map.emplace(partition_id, bounds);
+    partition_truth_map.emplace(partition_id, truth);
 
-    if (!bounds.upper.can_be_true)
+    if (truth.is_true.level() == Side::Never)
     {
         LOG_TRACE(getLogger("PartitionPruner"), "Partition {} gets pruned",
             part.partition.serializeToString(partition_key.sample_block));
     }
 
-    return bounds;
+    return truth;
 }
 
 }

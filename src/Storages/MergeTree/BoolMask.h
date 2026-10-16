@@ -4,6 +4,7 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <vector>
 
 /// Multiple Boolean values. That is, two Boolean values: can it be true, can it be false.
@@ -42,70 +43,180 @@ struct BoolMask
     static const BoolMask consider_only_can_be_false;
 };
 
-/// Bounds on the mask of a condition on a range, when splitting the range cannot tell more about some atoms. For example,
-/// an index cannot evaluate an atom on a column it does not store. `upper` reads each such atom as the value that makes the
-/// condition truest, and `lower` as the value that makes it falsest. The condition is never truer than `upper` and never
-/// falser than `lower`.
-///
-/// `outer()` is the mask of the condition itself. The other two bits say whether more work on the range, like splitting it
-/// or reading an index on it, can change a decision. A subrange can be excluded only if `upper.can_be_false`, and a subrange
-/// can be exact only if `lower.can_be_true`.
-struct BoolMaskBounds
+/// The answer to a yes-or-no question about the rows of a range, like "is the condition true on the row", on the range and
+/// on the subranges a search can split it into. The level says whether no row, some rows or every row answers yes. `lo` is
+/// the lowest level a subrange can have and `hi` the highest. The range itself is at `lo` if `lo == hi`, and at `Sometimes`
+/// otherwise.
+struct Side
 {
-    BoolMask upper;
-    BoolMask lower;
+    enum Level : uint8_t { Never, Sometimes, Always };
 
-    BoolMaskBounds() = default;
-    BoolMaskBounds(BoolMask upper_, BoolMask lower_) : upper(upper_), lower(lower_) { }
+    Level lo = Never;
+    Level hi = Always;
 
-    /// The rows the range check describes are exactly the rows that match.
-    BoolMaskBounds(BoolMask mask) : upper(mask), lower(mask) { } /// NOLINT(google-explicit-constructor)
+    static Side point(Level level) { return {level, level}; }
 
-    /// The range check describes a superset of the rows that match, like a prefix range for `LIKE 'ab%c'`.
-    static BoolMaskBounds relaxed(BoolMask mask) { return {mask, BoolMask(false, true)}; }
+    /// The value that `hull` leaves unchanged.
+    static Side none() { return {Always, Never}; }
 
-    /// `bounds` hold on the range, and splitting it cannot tell more. Unknown atoms are `fixed(BoolMask(true, true))`.
-    static BoolMaskBounds fixed(BoolMaskBounds bounds)
+    /// `refinable` tells whether a subrange can answer differently from the range.
+    static Side of(bool some_yes, bool some_no, bool refinable)
     {
-        bool can_be_true = bounds.upper.can_be_true;
-        bool can_be_false = bounds.lower.can_be_false;
-        return {BoolMask(can_be_true, !can_be_true), BoolMask(!can_be_false, can_be_false)};
+        if (!some_yes)
+            return point(Never);
+        if (!some_no)
+            return point(Always);
+        return refinable ? Side{Never, Always} : point(Sometimes);
     }
 
-    static BoolMaskBounds unknown() { return fixed(BoolMask(true, true)); }
+    Level level() const { return lo == hi ? lo : Sometimes; }
 
-    BoolMaskBounds operator&(const BoolMaskBounds & other) const { return {upper & other.upper, lower & other.lower}; }
-    BoolMaskBounds operator|(const BoolMaskBounds & other) const { return {upper | other.upper, lower | other.lower}; }
-    BoolMaskBounds operator!() const { return {!lower, !upper}; }
+    /// Whether some subrange can be at `Never`, or at `Always`.
+    bool mayBeNever() const { return lo == Never; }
+    bool mayBeAlways() const { return hi == Always; }
 
-    BoolMask outer() const { return {upper.can_be_true, lower.can_be_false}; }
+    /// The question "are both yes" and the question "is either yes".
+    Side operator&(Side other) const { return {std::min(lo, other.lo), std::min(hi, other.hi)}; }
+    Side operator|(Side other) const { return {std::max(lo, other.lo), std::max(hi, other.hi)}; }
 
-    bool isComplete() const { return upper.isComplete() && lower.isComplete(); }
+    /// The side of a range that is the union of the two ranges.
+    static Side hull(Side left, Side right) { return {std::min(left.lo, right.lo), std::max(left.hi, right.hi)}; }
 
-    /// Whether each mask is certainly true or certainly false. Then every nonempty subrange has the same bounds.
-    bool isDecided() const { return upper.can_be_true != upper.can_be_false && lower.can_be_true != lower.can_be_false; }
+    /// Whether more `hull`s can no longer change what a caller reads. The caller reads `lo` down to `need.lo` and `hi` up to
+    /// `need.hi`, so it reads nothing for `none()`.
+    bool covers(Side need) const { return lo <= need.lo && hi >= need.hi; }
 
-    /// Bounds from two checks of the same condition on the same range, like checks on two indexes. The range is dropped if
-    /// either check drops it, and it is exact if either check says it is. `none()` changes nothing.
-    static BoolMaskBounds intersect(const BoolMaskBounds & left, const BoolMaskBounds & right)
+    bool operator==(const Side &) const = default;
+};
+
+/// What an index tells about a condition on a range of rows. A condition is true, false or NULL on a row, and `WHERE` keeps
+/// the rows where it is true. Each outcome has a `Side`. `NOT` swaps `is_true` and `is_false` and keeps `is_null`, so a NULL
+/// row stays neither true nor false.
+///
+/// A range can be dropped when `is_true` is `Never`, and every row of it matches when `is_true` is `Always`. Splitting the
+/// range can drop a part of it only if `is_true.mayBeNever()`, and find a part where every row matches only if
+/// `is_true.mayBeAlways()`. The default value says that every outcome is possible and splitting can tell more.
+struct Truth
+{
+    Side is_true;
+    Side is_false;
+    Side is_null;
+
+    /// A check that finds which outcomes the rows of the range can have, and that gives sharper answers on smaller ranges,
+    /// like a key range check.
+    static Truth check(bool can_be_true, bool can_be_false, bool can_be_null)
     {
-        return {left.upper & right.upper, left.lower | right.lower};
+        return {
+            Side::of(can_be_true, can_be_false || can_be_null, true),
+            Side::of(can_be_false, can_be_true || can_be_null, true),
+            Side::of(can_be_null, can_be_true || can_be_false, true)};
     }
 
-    /// Bounds that say nothing about the condition.
-    static BoolMaskBounds none() { return {BoolMask(true, false), BoolMask(false, true)}; }
+    /// The same for a check on rows that are never NULL.
+    static Truth check(BoolMask mask) { return check(mask.can_be_true, mask.can_be_false, false); }
 
-    /// An initial value for `combine` with every bit except those of `outer()` set. A search that starts from it stops once
-    /// it knows `outer()`, for callers that use only `outer()`.
-    static BoolMaskBounds outerOnly(BoolMask initial_mask)
+    /// Every outcome is possible, on the range and on every subrange, like for a condition on a column the index does
+    /// not store.
+    static Truth unknown() { return {Side::point(Side::Sometimes), Side::point(Side::Sometimes), Side::point(Side::Sometimes)}; }
+
+    /// The value that `hull` leaves unchanged.
+    static Truth none() { return {Side::none(), Side::none(), Side::none()}; }
+
+    /// The same outcomes, on every subrange, like for an atom on a column that is constant over the part.
+    Truth fixed() const { return {fixed(is_true), fixed(is_false), fixed(is_null)}; }
+
+    /// For a check that finds a superset of the rows where the condition is true, like a prefix range for `LIKE 'ab%c'`.
+    /// Any row may be false.
+    Truth relaxed() const { return *this & Truth{Side::point(Side::Sometimes), Side::point(Side::Sometimes), Side::point(Side::Never)}; }
+
+    /// For a range that may hold NULL rows that smaller ranges can tell apart, like the end of the range of a `Nullable`
+    /// key column, where the key order puts NULLs.
+    Truth withNull() const
     {
-        return {BoolMask(initial_mask.can_be_true, true), BoolMask(true, initial_mask.can_be_false)};
+        return {
+            {Side::Never, is_true.hi},
+            {Side::Never, is_false.hi},
+            {is_null.lo, Side::Always}};
     }
 
-    /// Bounds on a range that is the union of the two ranges.
-    static BoolMaskBounds combine(const BoolMaskBounds & left, const BoolMaskBounds & right)
+    /// For a check that cannot see some NULL rows, like a check of the key `assumeNotNull(x)`, which stores a NULL `x` as an
+    /// ordinary value. Any row may be NULL instead of what the check says.
+    Truth withHiddenNull() const
     {
-        return {BoolMask::combine(left.upper, right.upper), BoolMask::combine(left.lower, right.lower)};
+        auto may_be_null = [](Side side) -> Side { return {std::min(side.lo, Side::Sometimes), std::min(side.hi, Side::Sometimes)}; };
+        return {may_be_null(is_true), may_be_null(is_false), {std::max(is_null.lo, Side::Sometimes), std::max(is_null.hi, Side::Sometimes)}};
+    }
+
+    Truth operator&(const Truth & other) const { return {is_true & other.is_true, is_false | other.is_false, nullOfAnd(*this, other)}; }
+    Truth operator|(const Truth & other) const { return !(!*this & !other); }
+    Truth operator!() const { return {is_false, is_true, is_null}; }
+
+    /// The value on a range that is the union of the two ranges.
+    static Truth hull(const Truth & left, const Truth & right)
+    {
+        return {Side::hull(left.is_true, right.is_true), Side::hull(left.is_false, right.is_false), Side::hull(left.is_null, right.is_null)};
+    }
+
+    /// The value from two checks of the same condition on the same range, like checks on two indexes. A row can have an
+    /// outcome only if both checks allow it. Both values must describe the whole range, not a `hull` that stopped early
+    /// at `covers`.
+    static Truth meet(const Truth & left, const Truth & right)
+    {
+        auto can_be = [](Side l, Side r) { return l.level() != Side::Never && r.level() != Side::Never; };
+        auto may_lack = [](Side l, Side r) { return l.mayBeNever() || r.mayBeNever(); };
+        const bool t = can_be(left.is_true, right.is_true);
+        const bool f = can_be(left.is_false, right.is_false);
+        const bool n = can_be(left.is_null, right.is_null);
+        const bool no_t = may_lack(left.is_true, right.is_true);
+        const bool no_f = may_lack(left.is_false, right.is_false);
+        const bool no_n = may_lack(left.is_null, right.is_null);
+        return {
+            fromOutcomes(t, f || n, no_t, no_f && no_n),
+            fromOutcomes(f, t || n, no_f, no_t && no_n),
+            fromOutcomes(n, t || f, no_n, no_t && no_f)};
+    }
+
+    /// Whether more `hull`s can no longer change any side where a caller reads it, see `Side::covers`. A caller that reads
+    /// every side whole, like `meet`, needs `Truth{}`.
+    bool covers(const Truth & need) const
+    {
+        return is_true.covers(need.is_true) && is_false.covers(need.is_false) && is_null.covers(need.is_null);
+    }
+
+    /// The `need` of a caller that reads only `is_true`.
+    static Truth need(Side is_true) { return {is_true, Side::none(), Side::none()}; }
+
+    /// The `need` of a caller that reads only `mask()`, with the bits that `initial_mask` sets already known.
+    static Truth need(BoolMask initial_mask)
+    {
+        return need(Side{initial_mask.can_be_false ? Side::Always : Side::Sometimes, initial_mask.can_be_true ? Side::Never : Side::Sometimes});
+    }
+
+    /// Whether some row can match, and whether some row can fail to match.
+    BoolMask mask() const { return {is_true.level() != Side::Never, is_true.level() != Side::Always}; }
+
+private:
+    static Side fixed(Side side) { return side.lo == side.hi ? side : Side::point(Side::Sometimes); }
+
+    static Side fromOutcomes(bool can_be, bool others_can_be, bool may_lack, bool may_be_only)
+    {
+        if (!can_be)
+            return Side::point(Side::Never);
+        if (!others_can_be)
+            return Side::point(Side::Always);
+        return {may_lack ? Side::Never : Side::Sometimes, may_be_only ? Side::Always : Side::Sometimes};
+    }
+
+    /// A row of `a AND b` is NULL where one of them is NULL and the other is not false.
+    static Side nullOfAnd(const Truth & a, const Truth & b)
+    {
+        auto can_be = [](Side side) { return side.level() != Side::Never; };
+        auto only = [](Side side) { return side.level() == Side::Always; };
+        const bool can_be_null = (can_be(a.is_null) && !only(b.is_false)) || (can_be(b.is_null) && !only(a.is_false));
+        const bool others_can_be = can_be(a.is_false) || can_be(b.is_false) || !(only(a.is_null) || only(b.is_null));
+        const bool may_lack = (a.is_null.mayBeNever() && b.is_null.mayBeNever()) || a.is_false.mayBeAlways() || b.is_false.mayBeAlways();
+        const bool may_be_only = (a.is_null.mayBeAlways() && b.is_false.mayBeNever()) || (a.is_false.mayBeNever() && b.is_null.mayBeAlways());
+        return fromOutcomes(can_be_null, others_can_be, may_lack, may_be_only);
     }
 };
 
