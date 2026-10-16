@@ -1249,10 +1249,17 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
             auto & ranges = parts_with_ranges[part_index];
 
             /// The filter is true on every row of these ranges, so every skip index keeps them, and they are not read.
-            MarkRanges pk_exact_ranges;
+            /// `selectPartsToRead` sets `exact_ranges` to the whole part if the partition minmax decides the filter.
+            MarkRanges pk_exact_ranges = std::move(ranges.exact_ranges);
+            ranges.exact_ranges.clear();
             const bool find_pk_exact_ranges = find_exact_ranges || !skip_indexes.useful_indices.empty();
 
-            if (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition)
+            if (!pk_exact_ranges.empty())
+            {
+                if (find_exact_ranges)
+                    ranges.exact_ranges = pk_exact_ranges;
+            }
+            else if (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition)
             {
                 CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithPrimaryKey);
                 ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithPrimaryKeyMicroseconds);
@@ -3322,8 +3329,14 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         counters.num_initial_selected_granules += num_granules;
 
         /// hyperrectangle must come from the part whose metadata built the condition.
-        if (minmax_idx_condition && !minmax_idx_condition->generateForPart(part_or_projection).checkInHyperrectangle(part_or_projection->getMinMaxIndex()->hyperrectangle, minmax_columns_types).can_be_true)
-            continue;
+        Truth part_truth;
+        if (minmax_idx_condition)
+        {
+            part_truth = minmax_idx_condition->generateForPart(part_or_projection).checkBoundsInHyperrectangle(
+                part_or_projection->getMinMaxIndex()->hyperrectangle, minmax_columns_types);
+            if (part_truth.is_true.level() == Side::Never)
+                continue;
+        }
 
         counters.num_parts_after_minmax += 1;
         counters.num_granules_after_minmax += num_granules;
@@ -3332,12 +3345,17 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         {
             if (partition_pruner->canBePruned(*part))
                 continue;
+            part_truth = Truth::meet(part_truth, partition_pruner->checkPartition(*part));
         }
 
         counters.num_parts_after_partition_pruner += 1;
         counters.num_granules_after_partition_pruner += num_granules;
 
         res_parts.push_back(prev_part);
+
+        /// The filter is true on every row of the part.
+        if (part_truth.is_true.level() == Side::Always)
+            res_parts.back().exact_ranges = res_parts.back().ranges;
     }
     return res_parts;
 }
