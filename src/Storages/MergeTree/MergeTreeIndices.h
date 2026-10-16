@@ -22,60 +22,6 @@ class IDataPartStorage;
 class IMergeTreeDataPart;
 class IMergeTreeDataPartInfoForReader;
 
-namespace Internal
-{
-
-enum class RPNEvaluationIndexUsefulnessState : uint8_t
-{
-    // the following states indicate if the index might be useful
-    TRUE,
-    FALSE,
-    // the following states indicate RPN always evaluates to TRUE or FALSE, they are used for short-circuit.
-    ALWAYS_TRUE,
-    ALWAYS_FALSE
-};
-
-[[nodiscard]] inline RPNEvaluationIndexUsefulnessState
-evalAndRpnIndexStates(RPNEvaluationIndexUsefulnessState lhs, RPNEvaluationIndexUsefulnessState rhs)
-{
-    if (lhs == RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE || rhs == RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE)
-    {
-        // short circuit
-        return RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE;
-    }
-    else if (lhs == RPNEvaluationIndexUsefulnessState::TRUE || rhs == RPNEvaluationIndexUsefulnessState::TRUE)
-    {
-        return RPNEvaluationIndexUsefulnessState::TRUE;
-    }
-    else if (lhs == RPNEvaluationIndexUsefulnessState::FALSE || rhs == RPNEvaluationIndexUsefulnessState::FALSE)
-    {
-        return RPNEvaluationIndexUsefulnessState::FALSE;
-    }
-    chassert(lhs == RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE && rhs == RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE);
-    return RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE;
-}
-
-[[nodiscard]] inline RPNEvaluationIndexUsefulnessState
-evalOrRpnIndexStates(RPNEvaluationIndexUsefulnessState lhs, RPNEvaluationIndexUsefulnessState rhs)
-{
-    if (lhs == RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE || rhs == RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE)
-    {
-        // short circuit
-        return RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE;
-    }
-    else if (lhs == RPNEvaluationIndexUsefulnessState::TRUE || rhs == RPNEvaluationIndexUsefulnessState::TRUE)
-    {
-        return RPNEvaluationIndexUsefulnessState::TRUE;
-    }
-    else if (lhs == RPNEvaluationIndexUsefulnessState::FALSE || rhs == RPNEvaluationIndexUsefulnessState::FALSE)
-    {
-        return RPNEvaluationIndexUsefulnessState::FALSE;
-    }
-    chassert(lhs == RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE && rhs == RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE);
-    return RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE;
-}
-}
-
 class ActionsDAG;
 class Block;
 struct MergeTreeWriterSettings;
@@ -186,77 +132,38 @@ public:
         throw Exception(ErrorCodes::LOGICAL_ERROR, "calculateApproximateNearestNeighbors is not implemented for non-vector-similarity indexes");
     }
 
-    /// `keepsEveryGranule` for a condition where an atom in `matching_functions` may have any mask on a granule and any other
-    /// atom is unknown.
-    template <typename RPNElement>
-    static bool rpnKeepsEveryGranule(
-        const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matching_functions)
+    /// Whether the condition can drop a granule when `is_checked` tells which atoms are checked on it and the other atoms
+    /// are unknown.
+    template <typename RPNElement, typename IsChecked>
+    static bool rpnMayDropGranules(const std::vector<RPNElement> & rpn, IsChecked && is_checked)
     {
-        return !evaluateRPN<Truth>(rpn, [&](const RPNElement & element)
+        return evaluateRPN<Truth>(rpn, [&](const RPNElement & element)
         {
             if (element.function == RPNElement::ALWAYS_TRUE)
                 return Truth::check(BoolMask(true, false));
             if (element.function == RPNElement::ALWAYS_FALSE)
                 return Truth::check(BoolMask(false, true));
-            if (matching_functions.contains(element.function))
-                return Truth::check(true, true, true);
-            return Truth::unknown();
+            return is_checked(element.function) ? Truth::check(true, true, true) : Truth::unknown();
         }).is_true.mayBeNever();
     }
 
+    /// `keepsEveryGranule` for an index that checks the atoms in `matching_functions`.
     template <typename RPNElement>
-    bool rpnEvaluatesAlwaysUnknownOrTrue(
-        const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matchingFunctions) const
+    static bool rpnKeepsEveryGranule(
+        const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matching_functions)
     {
-        std::vector<Internal::RPNEvaluationIndexUsefulnessState> rpn_stack;
-        rpn_stack.reserve(rpn.size() - 1);
+        return !rpnMayDropGranules(rpn, [&](auto function) { return matching_functions.contains(function); });
+    }
 
-        for (const auto & element : rpn)
-        {
-            if (element.function == RPNElement::ALWAYS_TRUE)
-            {
-                rpn_stack.emplace_back(Internal::RPNEvaluationIndexUsefulnessState::ALWAYS_TRUE);
-            }
-            else if (element.function == RPNElement::ALWAYS_FALSE)
-            {
-                rpn_stack.emplace_back(Internal::RPNEvaluationIndexUsefulnessState::ALWAYS_FALSE);
-            }
-            else if (element.function == RPNElement::FUNCTION_UNKNOWN)
-            {
-                rpn_stack.emplace_back(Internal::RPNEvaluationIndexUsefulnessState::FALSE);
-            }
-            else if (matchingFunctions.contains(element.function))
-            {
-                rpn_stack.push_back(Internal::RPNEvaluationIndexUsefulnessState::TRUE);
-            }
-            else if (element.function == RPNElement::FUNCTION_NOT)
-            {
-                // do nothing
-            }
-            else if (element.function == RPNElement::FUNCTION_AND)
-            {
-                auto lhs = rpn_stack.back();
-                rpn_stack.pop_back();
-                auto rhs = rpn_stack.back();
-                rpn_stack.back() = evalAndRpnIndexStates(lhs, rhs);
-            }
-            else if (element.function == RPNElement::FUNCTION_OR)
-            {
-                auto lhs = rpn_stack.back();
-                rpn_stack.pop_back();
-                auto rhs = rpn_stack.back();
-                rpn_stack.back() = evalOrRpnIndexStates(lhs, rhs);
-            }
-            else
-                throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type in RPNElement");
-        }
-
-        chassert(rpn_stack.size() == 1);
-        /*
-         * In case the result is `ALWAYS_TRUE`, it means we don't need any indices at all, it might be a constant result.
-         * Thus, we only check against the `TRUE` to determine the usefulness of the index condition.
-         */
-        return rpn_stack.front() != Internal::RPNEvaluationIndexUsefulnessState::TRUE;
+    /// `alwaysUnknownOrTrue` for an index that checks the atoms in `matching_functions`. With
+    /// `use_skip_indexes_for_disjunctions`, other indexes may check the other atoms. The index is useful if checking its
+    /// atoms lets the condition drop a granule that checking only the other atoms can't.
+    template <typename RPNElement>
+    static bool rpnEvaluatesAlwaysUnknownOrTrue(
+        const std::vector<RPNElement> & rpn, const std::unordered_set<typename RPNElement::Function> & matching_functions)
+    {
+        return !rpnMayDropGranules(rpn, [](auto) { return true; })
+            || rpnMayDropGranules(rpn, [&](auto function) { return !matching_functions.contains(function); });
     }
 
     virtual std::string getDescription() const = 0;
