@@ -53,9 +53,10 @@ struct GenericExclusionSearchResult
     bool reached_step_limit = false;
 };
 
-/// Returns a BoolMask telling whether the condition can be true and whether it can be false for the
-/// rows of the given mark range.
-using MarkRangeCheck = std::function<BoolMask(const MarkRange &)>;
+/// Returns where the condition is true on the rows of the given mark range, see `Truth::is_true`. `bound` is the check of
+/// the range that the search split to get this range, or `Side{}` for an initial range. The check of a range lies within
+/// the check of every range that holds it, so the callback doesn't have to find a level outside `bound`.
+using MarkRangeCheck = std::function<Side(const MarkRange & range, Side bound)>;
 
 /// The initial ranges must be sorted and non-intersecting.
 GenericExclusionSearchResult genericExclusionSearch(

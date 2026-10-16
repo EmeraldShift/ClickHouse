@@ -52,12 +52,21 @@ void splitRange(MarkRange range, size_t coarse_index_granularity, Consume && con
     consume(MarkRange(range.begin, end));
 }
 
+/// Whether splitting a range can exclude a subrange, or find an exact subrange if exact ranges are collected. A subrange
+/// may be excluded if `lo` is `Never`, and may be exact if `hi` is `Always`. A range at `{Sometimes, Sometimes}` is never
+/// split.
+bool splittingCanRefine(Side check, bool collect_exact_ranges)
+{
+    return check.mayBeNever() || (collect_exact_ranges && check.mayBeAlways());
+}
+
 /// The classic exhaustive algorithm. The stack holds the mark ranges that still have to be
 /// analyzed, disjoint and ordered so that the leftmost one is on top (at the back). Each iteration
 /// pops the leftmost range and asks the check callback about it. A range where no row can match the
-/// condition is discarded. A range where every row matches, or a range of a single mark, is added
-/// to the result. Any other range may contain both matching and non-matching rows, so it is split
-/// into smaller subranges, which are pushed onto the stack for the same treatment.
+/// condition is discarded. A range where every row matches, a range of a single mark, or a range
+/// where splitting cannot exclude or find exact subranges, is added to the result. Any other range
+/// is split into smaller subranges, which are pushed onto the stack for the same treatment, each with
+/// the check of the range as its bound.
 void searchUnlimited(
     const MarkRanges & initial_ranges,
     const MarkRangeCheck & check_in_range,
@@ -67,21 +76,21 @@ void searchUnlimited(
 {
     for (const auto & initial_range : initial_ranges)
     {
-        std::vector<MarkRange> ranges_stack = {initial_range};
+        std::vector<std::pair<MarkRange, Side>> ranges_stack = {{initial_range, Side{}}};
         while (!ranges_stack.empty())
         {
-            MarkRange range = ranges_stack.back();
+            const auto [range, bound] = ranges_stack.back();
             ranges_stack.pop_back();
 
             ++result.num_steps;
 
-            BoolMask mask = check_in_range(range);
+            Side check = check_in_range(range, bound);
 
-            if (!mask.can_be_true)
+            if (check.level() == Side::Never)
                 continue;
 
-            bool exact = !mask.can_be_false;
-            if (exact || range.end == range.begin + 1)
+            bool exact = check.level() == Side::Always;
+            if (exact || range.end == range.begin + 1 || !splittingCanRefine(check, collect_exact_ranges))
             {
                 appendWithMaxGap(result.ranges, range, search_settings.min_marks_for_seek);
 
@@ -93,20 +102,27 @@ void searchUnlimited(
             }
             else
             {
-                splitRange(range, search_settings.coarse_index_granularity, [&](MarkRange subrange) { ranges_stack.push_back(subrange); });
+                splitRange(range, search_settings.coarse_index_granularity, [&](MarkRange subrange) { ranges_stack.emplace_back(subrange, check); });
             }
         }
     }
 }
 
+/// A range that the step-limited search still has to check, with the check of the range it was split from.
+struct PendingRange
+{
+    MarkRange range;
+    Side bound;
+};
+
 /// Orders the queue of the step-limited search: the largest range comes first.
 struct LessBySize
 {
-    bool operator()(const MarkRange & lhs, const MarkRange & rhs) const
+    bool operator()(const PendingRange & lhs, const PendingRange & rhs) const
     {
-        size_t lhs_size = lhs.end - lhs.begin;
-        size_t rhs_size = rhs.end - rhs.begin;
-        return std::tie(lhs_size, rhs.begin) < std::tie(rhs_size, lhs.begin);
+        size_t lhs_size = lhs.range.end - lhs.range.begin;
+        size_t rhs_size = rhs.range.end - rhs.range.begin;
+        return std::tie(lhs_size, rhs.range.begin) < std::tie(rhs_size, lhs.range.begin);
     }
 };
 
@@ -123,8 +139,11 @@ void searchLimited(
     bool collect_exact_ranges,
     GenericExclusionSearchResult & result)
 {
-    std::vector<MarkRange> heap_storage(initial_ranges.begin(), initial_ranges.end());
-    std::priority_queue<MarkRange, std::vector<MarkRange>, LessBySize> queue(LessBySize{}, std::move(heap_storage));
+    std::vector<PendingRange> heap_storage;
+    heap_storage.reserve(initial_ranges.size());
+    for (const auto & range : initial_ranges)
+        heap_storage.push_back({range, Side{}});
+    std::priority_queue<PendingRange, std::vector<PendingRange>, LessBySize> queue(LessBySize{}, std::move(heap_storage));
 
     /// Ranges are accepted out of spatial order, so they are collected raw and merged after sorting.
     std::vector<MarkRange> accepted;
@@ -132,18 +151,18 @@ void searchLimited(
 
     while (!queue.empty())
     {
-        MarkRange range = queue.top();
+        const auto [range, bound] = queue.top();
         queue.pop();
 
         ++result.num_steps;
 
-        BoolMask mask = check_in_range(range);
+        Side check = check_in_range(range, bound);
 
-        if (!mask.can_be_true)
+        if (check.level() == Side::Never)
             continue;
 
-        bool exact = !mask.can_be_false;
-        if (exact || range.end == range.begin + 1)
+        bool exact = check.level() == Side::Always;
+        if (exact || range.end == range.begin + 1 || !splittingCanRefine(check, collect_exact_ranges))
         {
             accepted.push_back(range);
             if (collect_exact_ranges && exact)
@@ -158,7 +177,7 @@ void searchLimited(
             continue;
         }
 
-        splitRange(range, search_settings.coarse_index_granularity, [&](MarkRange subrange) { queue.push(subrange); });
+        splitRange(range, search_settings.coarse_index_granularity, [&](MarkRange subrange) { queue.push({subrange, check}); });
     }
 
     /// The number of checks never exceeds the budget by more than the fan-out of the last allowed

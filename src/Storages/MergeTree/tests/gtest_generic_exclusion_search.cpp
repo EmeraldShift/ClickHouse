@@ -2,6 +2,7 @@
 
 #include <Storages/MergeTree/GenericExclusionSearch.h>
 
+#include <algorithm>
 #include <limits>
 #include <random>
 
@@ -10,20 +11,27 @@ using namespace DB;
 namespace
 {
 
+/// Whether some mark of the range matches, and whether some mark does not.
+BoolMask maskOfRange(const std::vector<bool> & matching_marks, const MarkRange & range)
+{
+    bool can_be_true = false;
+    bool can_be_false = false;
+    for (size_t mark = range.begin; mark != range.end; ++mark)
+    {
+        if (matching_marks[mark])
+            can_be_true = true;
+        else
+            can_be_false = true;
+    }
+    return BoolMask(can_be_true, can_be_false);
+}
+
 MarkRangeCheck oracleFromFlags(const std::vector<bool> & matching_marks)
 {
-    return [&matching_marks](const MarkRange & range)
+    return [&matching_marks](const MarkRange & range, Side)
     {
-        bool can_be_true = false;
-        bool can_be_false = false;
-        for (size_t mark = range.begin; mark != range.end; ++mark)
-        {
-            if (matching_marks[mark])
-                can_be_true = true;
-            else
-                can_be_false = true;
-        }
-        return BoolMask(can_be_true, can_be_false);
+        const BoolMask mask = maskOfRange(matching_marks, range);
+        return Side::of(mask.can_be_true, mask.can_be_false, true);
     };
 }
 
@@ -246,10 +254,10 @@ TEST(GenericExclusionSearch, EqualSizeRangesCheckedLeftToRight)
     /// deterministic independently of the heap implementation.
     std::vector<bool> matching(200);
     std::vector<MarkRange> checked_order;
-    MarkRangeCheck recording_oracle = [&](const MarkRange & range)
+    MarkRangeCheck recording_oracle = [&](const MarkRange & range, Side bound)
     {
         checked_order.push_back(range);
-        return oracleFromFlags(matching)(range);
+        return oracleFromFlags(matching)(range, bound);
     };
 
     GenericExclusionSearchSettings settings{.coarse_index_granularity = 8, .max_steps = 100, .min_marks_for_seek = 0};
@@ -272,10 +280,10 @@ TEST(GenericExclusionSearch, StepLimitBoundsCheckCount)
     auto oracle = oracleFromFlags(matching);
 
     size_t unlimited_checks = 0;
-    MarkRangeCheck counting_unlimited_oracle = [&](const MarkRange & range)
+    MarkRangeCheck counting_unlimited_oracle = [&](const MarkRange & range, Side bound)
     {
         ++unlimited_checks;
-        return oracle(range);
+        return oracle(range, bound);
     };
 
     GenericExclusionSearchSettings unlimited{.coarse_index_granularity = 8, .max_steps = 0, .min_marks_for_seek = 0};
@@ -290,10 +298,10 @@ TEST(GenericExclusionSearch, StepLimitBoundsCheckCount)
     for (size_t max_steps : budgets)
     {
         size_t checks = 0;
-        MarkRangeCheck counting_oracle = [&](const MarkRange & range)
+        MarkRangeCheck counting_oracle = [&](const MarkRange & range, Side bound)
         {
             ++checks;
-            return oracle(range);
+            return oracle(range, bound);
         };
 
         GenericExclusionSearchSettings settings{.coarse_index_granularity = 8, .max_steps = max_steps, .min_marks_for_seek = 0};
@@ -363,10 +371,10 @@ TEST(GenericExclusionSearch, StepLimitBoundsWithUnevenSplits)
 
     size_t checks = 0;
     auto oracle = oracleFromFlags(matching);
-    MarkRangeCheck counting_oracle = [&](const MarkRange & range)
+    MarkRangeCheck counting_oracle = [&](const MarkRange & range, Side bound)
     {
         ++checks;
-        return oracle(range);
+        return oracle(range, bound);
     };
 
     /// A budget of five allows the top split (one check is spent, the queue is empty) and its five
@@ -594,10 +602,9 @@ TEST(GenericExclusionSearch, NeverExactOracle)
     // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
     std::mt19937 rng(29);
     auto matching = randomFlags(150, 0.4, rng);
-    auto precise = oracleFromFlags(matching);
-    MarkRangeCheck never_exact = [&](const MarkRange & range)
+    MarkRangeCheck never_exact = [&](const MarkRange & range, Side)
     {
-        return BoolMask(precise(range).can_be_true, true);
+        return Side::of(maskOfRange(matching, range).can_be_true, true, true);
     };
 
     for (size_t min_marks_for_seek : {0, 2})
@@ -627,10 +634,9 @@ TEST(GenericExclusionSearch, ConservativeOracle)
     // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
     std::mt19937 rng(11);
     auto matching = randomFlags(128, 0.4, rng);
-    auto precise = oracleFromFlags(matching);
-    MarkRangeCheck conservative = [&](const MarkRange & range)
+    MarkRangeCheck conservative = [&](const MarkRange & range, Side)
     {
-        return BoolMask(true, precise(range).can_be_false);
+        return Side::of(true, maskOfRange(matching, range).can_be_false, true);
     };
 
     for (size_t max_steps : {0, 25})
@@ -645,5 +651,131 @@ TEST(GenericExclusionSearch, ConservativeOracle)
         for (const auto & range : result.exact_ranges)
             for (size_t mark = range.begin; mark != range.end; ++mark)
                 EXPECT_TRUE(matching[mark]);
+    }
+}
+
+TEST(GenericExclusionSearch, UnknownAtomInConjunction)
+{
+    /// The condition `a AND u`, where `a` is given by the flags and `u` cannot be evaluated on the
+    /// index, so `u` is `Sometimes` on every range. No range can be exact, and splitting a range on
+    /// which `a` is certainly true cannot exclude anything.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
+    std::mt19937 rng(5);
+    auto matching = randomFlags(128, 0.9, rng);
+    std::vector<bool> all_matching(128, true);
+
+    for (size_t max_steps : {0, 1000})
+    {
+        GenericExclusionSearchSettings settings{.coarse_index_granularity = 8, .max_steps = max_steps, .min_marks_for_seek = 0};
+
+        auto conjunction = [](const std::vector<bool> & flags) -> MarkRangeCheck
+        {
+            auto precise = oracleFromFlags(flags);
+            return [precise](const MarkRange & range, Side bound) { return precise(range, bound) & Side::point(Side::Sometimes); };
+        };
+        /// The same condition as a single mask, as the search received it before the bounds were split.
+        auto single_mask = [](const std::vector<bool> & flags) -> MarkRangeCheck
+        {
+            return [&flags](const MarkRange & range, Side) { return Side::of(maskOfRange(flags, range).can_be_true, true, true); };
+        };
+
+        auto result = genericExclusionSearch(makeRanges({{0, matching.size()}}), conjunction(matching), settings, true);
+        auto single_mask_result = genericExclusionSearch(makeRanges({{0, matching.size()}}), single_mask(matching), settings, true);
+        EXPECT_EQ(result.ranges, runsOfMatchingMarks(matching, 0));
+        EXPECT_EQ(result.ranges, single_mask_result.ranges);
+        EXPECT_TRUE(result.exact_ranges.empty());
+        EXPECT_LT(result.num_steps, single_mask_result.num_steps);
+
+        auto everything = genericExclusionSearch(makeRanges({{0, all_matching.size()}}), conjunction(all_matching), settings, true);
+        EXPECT_EQ(everything.ranges, makeRanges({{0, all_matching.size()}}));
+        EXPECT_TRUE(everything.exact_ranges.empty());
+        EXPECT_EQ(everything.num_steps, 1u);
+        EXPECT_FALSE(everything.reached_step_limit);
+
+        auto everything_single_mask = genericExclusionSearch(makeRanges({{0, all_matching.size()}}), single_mask(all_matching), settings, true);
+        EXPECT_EQ(everything_single_mask.ranges, makeRanges({{0, all_matching.size()}}));
+        EXPECT_GT(everything_single_mask.num_steps, all_matching.size());
+    }
+}
+
+TEST(GenericExclusionSearch, UnknownAtomInDisjunction)
+{
+    /// The condition `a OR u`, where `a` is given by the flags and `u` cannot be evaluated on the
+    /// index, so `u` is `Sometimes` on every range. Nothing can be excluded, and the marks of `a` are
+    /// exact. Splitting is useful only to collect exact ranges.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
+    std::mt19937 rng(7);
+    auto matching = randomFlags(128, 0.5, rng);
+    auto precise = oracleFromFlags(matching);
+    MarkRangeCheck disjunction = [&](const MarkRange & range, Side bound) { return precise(range, bound) | Side::point(Side::Sometimes); };
+
+    for (size_t min_marks_for_seek : {0, 2})
+    {
+        GenericExclusionSearchSettings unlimited{.coarse_index_granularity = 8, .max_steps = 0, .min_marks_for_seek = min_marks_for_seek};
+
+        auto exact = genericExclusionSearch(makeRanges({{0, matching.size()}}), disjunction, unlimited, true);
+        EXPECT_EQ(exact.ranges, makeRanges({{0, matching.size()}}));
+        EXPECT_EQ(exact.exact_ranges, runsOfMatchingMarks(matching, 0));
+
+        auto no_exact = genericExclusionSearch(makeRanges({{0, matching.size()}}), disjunction, unlimited, false);
+        EXPECT_EQ(no_exact.ranges, makeRanges({{0, matching.size()}}));
+        EXPECT_TRUE(no_exact.exact_ranges.empty());
+        EXPECT_EQ(no_exact.num_steps, 1u);
+
+        /// Under a budget the exact ranges are still found, and nothing is excluded.
+        GenericExclusionSearchSettings limited{.coarse_index_granularity = 8, .max_steps = 20, .min_marks_for_seek = min_marks_for_seek};
+        auto truncated = genericExclusionSearch(makeRanges({{0, matching.size()}}), disjunction, limited, true);
+        EXPECT_EQ(truncated.ranges, makeRanges({{0, matching.size()}}));
+        EXPECT_NO_THROW(assertSortedAndNonIntersecting(truncated.exact_ranges));
+        for (const auto & range : truncated.exact_ranges)
+            for (size_t mark = range.begin; mark != range.end; ++mark)
+                EXPECT_TRUE(matching[mark]) << "mark " << mark;
+    }
+}
+
+TEST(GenericExclusionSearch, SubrangeBoundIsCheckOfSplitRange)
+{
+    /// The search passes `Side{}` as the bound of an initial range, and the check of the split range as the bound of each
+    /// of its subranges.
+    // NOLINTNEXTLINE(bugprone-random-generator-seed,cert-msc32-c,cert-msc51-cpp) — deterministic test fixture
+    std::mt19937 rng(13);
+    auto matching = randomFlags(200, 0.3, rng);
+    auto oracle = oracleFromFlags(matching);
+    const auto initial = makeRanges({{0, 100}, {120, 200}});
+
+    for (size_t max_steps : {0, 30})
+    {
+        std::vector<std::pair<MarkRange, Side>> checks;
+        std::vector<std::pair<MarkRange, Side>> bounds;
+        MarkRangeCheck recording_oracle = [&](const MarkRange & range, Side bound)
+        {
+            bounds.emplace_back(range, bound);
+            checks.emplace_back(range, oracle(range, bound));
+            return checks.back().second;
+        };
+
+        GenericExclusionSearchSettings settings{.coarse_index_granularity = 8, .max_steps = max_steps, .min_marks_for_seek = 0};
+        genericExclusionSearch(initial, recording_oracle, settings, true);
+
+        for (const auto & [range, bound] : bounds)
+        {
+            if (std::ranges::find(initial, range) != initial.end())
+            {
+                EXPECT_EQ(bound, Side{});
+                continue;
+            }
+
+            /// The split range is the smallest checked range that holds this one.
+            const std::pair<MarkRange, Side> * split = nullptr;
+            for (const auto & check : checks)
+            {
+                const auto & holder = check.first;
+                if (holder != range && holder.begin <= range.begin && range.end <= holder.end
+                    && (!split || holder.end - holder.begin < split->first.end - split->first.begin))
+                    split = &check;
+            }
+            ASSERT_NE(split, nullptr);
+            EXPECT_EQ(bound, split->second);
+        }
     }
 }

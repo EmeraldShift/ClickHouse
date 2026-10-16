@@ -17,7 +17,6 @@ public:
         const StorageMetadataPtr & metadata,
         const ActionsDAGWithInversionPushDown & filter_dag,
         ContextPtr context,
-        bool strict = false,
         bool skip_analysis = false,
         bool require_ready_sets = false);
 
@@ -31,13 +30,17 @@ public:
     /// rows on another replica, and pruning it by that part would let them escape the mutation.
     bool canPartitionBePruned(const IMergeTreeDataPart & part) const;
 
+    /// The truth of the predicate on the rows of the part's partition. The part is pruned if `is_true` is `Never`, and the
+    /// predicate accepts every row of the part if `is_true` is `Always`.
+    Truth checkPartition(const IMergeTreeDataPart & part) const;
+
     bool isUseless() const { return useless; }
 
     const KeyCondition & getKeyCondition() const { return partition_condition; }
 
 private:
     /// Cache already analyzed partitions.
-    mutable std::unordered_map<String, bool> partition_filter_map;
+    mutable std::unordered_map<String, Truth> partition_truth_map;
 
     /// partition_key is adjusted here (with substitution from modulo to moduloLegacy).
     KeyDescription partition_key;
