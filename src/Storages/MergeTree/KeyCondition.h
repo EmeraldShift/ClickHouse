@@ -401,6 +401,9 @@ public:
         /// Whether to relax the key condition (e.g., for LIKE queries without a perfect prefix).
         bool relaxed = false;
 
+        /// Whether the key stores some rows where the atom is NULL as ordinary values, like `assumeNotNull(x)` does for a NULL `x`.
+        bool hides_null = false;
+
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();
 
@@ -456,66 +459,6 @@ public:
 
     const RPN & getRPN() const { return rpn; }
     const ColumnIndices & getKeyColumns() const { return key_columns; }
-
-    /// Whether this key condition is relaxed (computed from the RPN atoms). When a key
-    /// condition is relaxed, it is considered weakened. This is because keys may not
-    /// always align perfectly with the condition specified in the query, and the aim is
-    /// to enhance the usefulness of different types of key expressions across various
-    /// scenarios.
-    ///
-    /// For instance, in a scenario with one granule of key column toDate(a), where
-    /// the hyperrectangle is toDate(a) ∊ [x, y], the result of a ∊ [u, v] can be
-    /// deduced as toDate(a) ∊ [toDate(u), toDate(v)] due to the monotonic
-    /// non-decreasing nature of the toDate function. Similarly, for a ∊ (u, v), the
-    /// transformed outcome remains toDate(a) ∊ [toDate(u), toDate(v)] as toDate
-    /// does not strictly follow a monotonically increasing transformation. This is
-    /// one of the main use case about key condition relaxation.
-    ///
-    /// During the KeyCondition::checkInRange process, relaxing the key condition
-    /// can lead to a loosened result. For example, when transitioning from (u, v)
-    /// to [u, v], if a key is within the range [u, u], BoolMask::can_be_true will
-    /// be true instead of false, causing us to not skip this granule. This behavior
-    /// is acceptable as we can still filter it later on. Conversely, if the key is
-    /// within the range [u, v], BoolMask::can_be_false will be false instead of
-    /// true, indicating a stricter condition where all elements of the granule
-    /// satisfy the key condition. Hence, when the key condition is relaxed, we
-    /// cannot rely on BoolMask::can_be_false. One significant use case of
-    /// BoolMask::can_be_false is in trivial count optimization.
-    ///
-    /// Now let's review all the cases of key condition relaxation across different
-    /// atom types.
-    ///
-    /// 1. Not applicable: ALWAYS_FALSE, ALWAYS_TRUE, FUNCTION_NOT,
-    /// FUNCTION_AND, FUNCTION_OR.
-    ///
-    /// These atoms are either never relaxed or are relaxed by their children.
-    ///
-    /// 2. Constant transformed: FUNCTION_IN_RANGE, FUNCTION_NOT_IN_RANGE,
-    /// FUNCTION_IS_NULL. FUNCTION_IS_NOT_NULL, FUNCTION_IN_SET (1 element),
-    /// FUNCTION_NOT_IN_SET (1 element)
-    ///
-    /// These atoms are relaxed when the associated constants undergo
-    /// transformation by monotonic functions, as illustrated in the example
-    /// mentioned earlier. Two NaN rules relax them as well, each for the bound
-    /// its condition is evaluated against: a right-unbounded FUNCTION_IN_RANGE
-    /// atom over a key column that can hold a NaN inside a Tuple (see
-    /// relaxRangeAtomsOverNaNHidingTupleColumns), and, for a condition built
-    /// over a getExtremes-derived hyperrectangle, a range or single-element set
-    /// atom over any key column that can hide a NaN (see
-    /// relaxAtomsOverNaNHidingColumns).
-    ///
-    /// 3. Always relaxed: FUNCTION_UNKNOWN, FUNCTION_IN_SET (>1 elements),
-    /// FUNCTION_NOT_IN_SET (>1 elements), FUNCTION_ARGS_IN_HYPERRECTANGLE
-    ///
-    /// These atoms are always considered relaxed for the sake of implementation
-    /// simplicity, as there may be "gaps" within the atom's hyperrectangle that the
-    /// granule's hyperrectangle may or may not intersect.
-    ///
-    /// NOTE: we also need to examine special functions that generate atoms. For
-    /// example, the `match` function can produce a FUNCTION_IN_RANGE atom based
-    /// on a given regular expression. Such an atom is relaxed unless the regular
-    /// expression has a perfect or an exact prefix, e.g. "^abc.*" or "^abc$".
-    bool isRelaxed() const;
 
     /// Whether a value of this type can be a NaN that an aggregated `getExtremes` bound does not show, and
     /// whose ordering comparisons are therefore all false rather than complementary. `Tuple` qualifies, per
@@ -613,6 +556,7 @@ private:
         DataTypePtr & out_key_column_type,
         MonotonicFunctionsChain & out_functions_chain,
         bool & out_chain_is_positive,
+        bool & out_chain_is_injective,
         std::function<bool(const IFunctionBase &, const IDataType &)> always_monotonic) const;
 
 
@@ -630,7 +574,8 @@ private:
         DataTypePtr & out_key_column_type,
         Field & out_value,
         DataTypePtr & out_type,
-        bool & out_chain_is_positive);
+        bool & out_chain_is_positive,
+        bool & out_atom_is_exact);
 
     bool canConstantBeWrappedByDeterministicFunctions(
         const RPNBuilderTreeNode & node,
@@ -639,7 +584,6 @@ private:
         DataTypePtr & out_key_column_type,
         Field & out_value,
         DataTypePtr & out_type,
-        bool nested_null_is_ordinary_value,
         bool & out_atom_is_exact);
 
     /// Checks if node is a subexpression of any of key columns expressions,
@@ -673,7 +617,8 @@ private:
         DataTypes & data_types,
         size_t & args_count,
         const BuildInfo & info,
-        bool & out_relaxed);
+        bool & out_relaxed,
+        bool & out_hides_null);
 
     /** Iterates over RPN and collapses FUNCTION_IN_RANGE over the arguments of space-filling curve function
       * into atom of type FUNCTION_ARGS_IN_HYPERRECTANGLE.

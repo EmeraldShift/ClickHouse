@@ -294,34 +294,10 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             "notLike",
             [] (RPNElement & out, const Field & value)
             {
-                if (value.getType() != Field::Types::String)
+                if (!atom_map.at("like")(out, value))
                     return false;
-
-                auto prefix = extractFixedPrefixFromLikePattern(value.safeGet<String>(), /*requires_perfect_prefix*/ true);
-
-                /// A pattern without wildcards is equivalent to an inequality, so exclude an exact point range.
-                /// This must come before the empty-prefix bailout below: the empty pattern is wildcard-free
-                /// and equivalent to `value != ''`, so it needs the exact empty-string point exclusion too.
-                if (prefix.is_exact)
-                {
-                    out.function = RPNElement::FUNCTION_NOT_IN_RANGE;
-                    out.range = Range(prefix.prefix);
-                    return true;
-                }
-
-                /// A non-exact pattern with an empty prefix (e.g. '%' or '_foo') gives no usable bound.
-                if (prefix.prefix.empty())
-                    return false;
-
-                chassert(prefix.is_perfect);
-
-                String right_bound = firstStringThatIsGreaterThanAllStringsWithPrefix(prefix.prefix);
 
                 out.function = RPNElement::FUNCTION_NOT_IN_RANGE;
-                out.range = !right_bound.empty()
-                    ? Range(prefix.prefix, true, right_bound, false)
-                    : Range::createLeftBounded(prefix.prefix, true);
-
                 return true;
             }
         },
@@ -457,15 +433,6 @@ static bool monotonicChainSupportsNullAtom(const KeyCondition::MonotonicFunction
 {
     return chain.empty();
 }
-
-/// Functions with range inversion cannot be relaxed. It will become stricter instead.
-/// For example:
-/// create table test(d Date, k Int64, s String) Engine=MergeTree order by toYYYYMM(d);
-/// insert into test values ('2020-01-01', 1, '');
-/// insert into test values ('2020-01-02', 1, '');
-/// select * from test where d != '2020-01-01'; -- If relaxed, no record will return
-static const std::set<std::string_view> no_relaxed_atom_functions
-    = {"notLike", "notIn", "globalNotIn", "notNullIn", "globalNotNullIn", "notEquals", "notEmpty", "notHas"};
 
 static const std::map<std::string, std::string> inverse_relations =
 {
@@ -1668,17 +1635,6 @@ KeyCondition::KeyCondition(
     , date_time_overflow_behavior_ignore(date_time_overflow_behavior_ignore_)
 {}
 
-bool KeyCondition::isRelaxed() const
-{
-    return std::any_of(rpn.begin(), rpn.end(), [](const auto & elem)
-    {
-        return elem.relaxed
-            || elem.function == RPNElement::FUNCTION_UNKNOWN
-            || ((elem.function == RPNElement::FUNCTION_IN_SET || elem.function == RPNElement::FUNCTION_NOT_IN_SET)
-                && elem.set_index->size() > 1);
-    });
-}
-
 bool KeyCondition::typeMayHideNaN(const DataTypePtr & type)
 {
     if (!type)
@@ -1918,18 +1874,24 @@ static std::optional<FieldRef> applyFunction(const FunctionBasePtr & func, const
     return FieldRef(field.columns, field.row_idx, result_idx);
 }
 
+static bool castColumnWithoutNulls(ColumnPtr & column, DataTypePtr & type, const DataTypePtr & target_type, bool & out_is_exact);
+
 /// Sequentially applies functions to the column, returns `true`
 /// if all function arguments are compatible with functions
 /// signatures, and none of the functions produce `NULL` output.
 ///
 /// After functions chain execution, fills result column and its type.
+/// `out_cast_is_exact` reports whether the cast to the argument type of the first function kept every value.
 static bool applyFunctionChainToColumn(
     const ColumnPtr & in_column,
     const DataTypePtr & in_data_type,
     const std::vector<FunctionBasePtr> & functions,
     ColumnPtr & out_column,
-    DataTypePtr & out_data_type)
+    DataTypePtr & out_data_type,
+    bool & out_cast_is_exact)
 {
+    out_cast_is_exact = true;
+
     auto result_column = in_column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality();
     auto result_type = removeLowCardinality(in_data_type);
 
@@ -1949,39 +1911,8 @@ static bool applyFunctionChainToColumn(
 
     /// And cast it to the argument type of the first function in the chain
     auto in_argument_type = removeLowCardinality(getArgumentTypeOfMonotonicFunction(*functions[0]));
-    if (canBeSafelyCast(result_type, in_argument_type))
-    {
-        result_column = castColumnAccurate({result_column, result_type, ""}, in_argument_type);
-        result_type = in_argument_type;
-    }
-    else if ((!in_argument_type->isNullable() && !in_argument_type->canBeInsideNullable())
-             || !canBeAccurateCastOrNullTarget(in_argument_type))
-    {
-        /// We cannot apply castColumnAccurateOrNull() because it will throw exception
+    if (!castColumnWithoutNulls(result_column, result_type, in_argument_type, out_cast_is_exact))
         return false;
-    }
-    /// If column cannot be cast accurate, casting with OrNull, and in case all
-    /// values has been cast (no nulls), unpacking nested column from nullable.
-    /// In case any further functions require Nullable input, they'll be able
-    /// to cast it.
-    else
-    {
-        result_column = castColumnAccurateOrNull({result_column, result_type, ""}, in_argument_type);
-        /// `castColumnAccurateOrNull` is implemented on top of `FunctionCast` whose wrappers can
-        /// return `ColumnConst` for a 1-row input — same hazard as the post-`func->execute` case
-        /// below. Unwrap defensively so the `assert_cast<const ColumnNullable &>` always sees a
-        /// plain `ColumnNullable`.
-        result_column = result_column->convertToFullColumnIfConst();
-        const auto & result_column_nullable = assert_cast<const ColumnNullable &>(*result_column);
-        const auto & null_map_data = result_column_nullable.getNullMapData();
-        for (char8_t i : null_map_data)
-        {
-            if (i != 0)
-                return false;
-        }
-        result_column = result_column_nullable.getNestedColumnPtr();
-        result_type = removeNullable(in_argument_type);
-    }
 
     for (const auto & func : functions)
     {
@@ -2189,9 +2120,11 @@ bool KeyCondition::canConstantBeWrappedByMonotonicFunctions(
     DataTypePtr & out_key_column_type,
     Field & out_value,
     DataTypePtr & out_type,
-    bool & out_chain_is_positive)
+    bool & out_chain_is_positive,
+    bool & out_atom_is_exact)
 {
     out_chain_is_positive = true;
+    out_atom_is_exact = false;
 
     String expr_name = node.getColumnName();
 
@@ -2203,6 +2136,7 @@ bool KeyCondition::canConstantBeWrappedByMonotonicFunctions(
 
     /// Track whether the function chain preserves or reverses comparison order.
     bool chain_is_positive = true;
+    bool chain_is_injective = true;
     MonotonicFunctionsChain transform_functions;
     auto can_transform_constant = extractMonotonicFunctionsChainFromKey(
         node.getContext(),
@@ -2212,6 +2146,7 @@ bool KeyCondition::canConstantBeWrappedByMonotonicFunctions(
         out_key_column_type,
         transform_functions,
         chain_is_positive,
+        chain_is_injective,
         [this](const IFunctionBase & func, const IDataType & type)
         {
             if (!func.hasInformationAboutMonotonicity())
@@ -2264,10 +2199,8 @@ bool KeyCondition::canConstantBeWrappedByMonotonicFunctions(
             ///
             /// So the rewrite may over-read, but it does not incorrectly prune matching rows.
             ///
-            /// The same argument applies to `>`, `>=`, `<=`, and `=`.
-            /// It does not apply to `!=`: `notEquals` is in `no_relaxed_atom_functions`, so if
-            /// analysis would need to push the constant through a monotonic function chain, we do
-            /// not create a relaxed atom for `!=` on this path.
+            /// The same argument applies to `>`, `>=`, `<=`, and `=`. `!=` is checked as the negation
+            /// of the relaxed `=`.
             if (func.getName() == "assumeNotNull")
                 return true;
 
@@ -2300,12 +2233,14 @@ bool KeyCondition::canConstantBeWrappedByMonotonicFunctions(
 
     ColumnPtr transformed_const_column;
     DataTypePtr transformed_const_type;
+    bool cast_is_exact = true;
     bool constant_transformed = applyFunctionChainToColumn(
         const_column,
         const_value_type,
         transform_functions,
         transformed_const_column,
-        transformed_const_type);
+        transformed_const_type,
+        cast_is_exact);
 
     if (!constant_transformed)
         return false;
@@ -2313,6 +2248,9 @@ bool KeyCondition::canConstantBeWrappedByMonotonicFunctions(
     out_value = (*transformed_const_column)[0];
     out_type = transformed_const_type;
     out_chain_is_positive = chain_is_positive;
+    /// An injective monotonic chain is strictly monotonic. Comparing the key with the transformed constant then gives the
+    /// same answer as comparing the argument with the constant, as long as the cast kept the value of the constant.
+    out_atom_is_exact = chain_is_injective && cast_is_exact;
     return true;
 }
 
@@ -2599,7 +2537,9 @@ static bool castColumnWithoutNulls(
         return false;
     }
 
-    ColumnPtr probe_column = castColumnAccurateOrNull({column, type, ""}, probe_type);
+    /// `castColumnAccurateOrNull` is implemented on top of `FunctionCast` whose wrappers can return `ColumnConst` for a
+    /// 1-row input. Unwrap the result so the `assert_cast` below sees a plain `ColumnNullable`.
+    ColumnPtr probe_column = castColumnAccurateOrNull({column, type, ""}, probe_type)->convertToFullColumnIfConst();
     const auto & n = assert_cast<const ColumnNullable &>(*probe_column);
 
     /// If we have any NULLs after cast, that means cast could not be applied accurately for all values
@@ -3054,7 +2994,6 @@ bool KeyCondition::canConstantBeWrappedByDeterministicFunctions(
     DataTypePtr & out_key_column_type,
     Field & out_value,
     DataTypePtr & out_type,
-    bool nested_null_is_ordinary_value,
     bool & out_atom_is_exact)
 {
     out_atom_is_exact = false;
@@ -3148,17 +3087,10 @@ bool KeyCondition::canConstantBeWrappedByDeterministicFunctions(
     /// NaN equals no value, not even itself. The transform maps it to an ordinary key value that the index
     /// compares as equal, so the atom is stricter than the predicate and its `can_be_false` is not usable.
     ///
-    /// A `NULL` inside a value of that column makes the comparison `NULL` at row level, which `WHERE`
-    /// rejects. When the transform maps such a value to an ordinary key value, the index compares it as
-    /// unequal to the constant, so a negated atom claims the row as matching, and the key type does not
-    /// show the `NULL`. The atom is not exact then either. A null-safe comparison never
-    /// answers `NULL`, so a `NULL` nested in a `Tuple` does not matter for it.
-    ///
     /// A normalization that lost information leaves the key point with more than one preimage, so the
     /// atom is stricter than the predicate for the same reason a non-injective transform is.
     out_atom_is_exact = isDeterministicTransformInjective(dag.actions->getActionsDAG(), expr_name, dag.output_name)
         && !transform_input_has_nan
-        && !deterministicTransformMayHideNull(dag.input_type, out_key_column_type, nested_null_is_ordinary_value)
         && cast_is_exact;
 
     Field transformed_value = (*transformed_const_column)[0];
@@ -3229,7 +3161,8 @@ void KeyCondition::analyzeKeyExpressionForSetIndex(const RPNBuilderTreeNode & ar
         DataTypes & data_types,
         size_t & args_count,
         const BuildInfo & info,
-        bool & out_relaxed)
+        bool & out_relaxed,
+        bool & out_hides_null)
 {
     auto get_key_tuple_position_mapping = [&](const RPNBuilderTreeNode & node, size_t tuple_index)
     {
@@ -3257,6 +3190,8 @@ void KeyCondition::analyzeKeyExpressionForSetIndex(const RPNBuilderTreeNode & ar
                 set_transforming_dags.push_back(std::move(set_transforming_dag));
                 if (!is_injective)
                     out_relaxed = true;
+                if (deterministicTransformMayHideNull(node.getDAGNode()->result_type, data_type, false))
+                    out_hides_null = true;
             }
         }
     };
@@ -3798,7 +3733,8 @@ bool KeyCondition::tryPrepareSetIndexForIn(
         data_types,
         left_args_count,
         info,
-        out.relaxed);
+        out.relaxed,
+        out.hides_null);
 
     if (indexes_mapping.empty())
         return false;
@@ -3866,14 +3802,7 @@ bool KeyCondition::tryPrepareSetIndexForIn(
     /// unknown whether the transform maps distinct key values onto distinct transformed ones: `toString`
     /// claims that for every type, yet it folds NaN payloads and fall-back hours.
     if (repacked_only_by_transform_input)
-    {
-        const auto & function_name = func.getFunctionName();
-        if (function_name == "notIn" || function_name == "notNullIn" || function_name == "globalNotIn"
-            || function_name == "globalNotNullIn")
-            return false;
-
         out.relaxed = true;
-    }
 
     bool set_is_exact = true;
     if (!tryPrepareSetColumnsForIndex(
@@ -3962,8 +3891,11 @@ bool KeyCondition::tryPrepareSetIndexForHas(
     DataTypes data_types;
     size_t key_args_count = 0;
 
+    /// `has` is false, not NULL, for a NULL argument, so an argument the key stores as an ordinary value makes the atom relaxed.
+    bool hides_null = false;
     analyzeKeyExpressionForSetIndex(
-        key_arg, indexes_mapping, set_transforming_dags, data_types, key_args_count, info, out.relaxed);
+        key_arg, indexes_mapping, set_transforming_dags, data_types, key_args_count, info, out.relaxed, hides_null);
+    out.relaxed = out.relaxed || hides_null;
 
     if (indexes_mapping.empty())
         return false;
@@ -4437,6 +4369,7 @@ bool KeyCondition::extractMonotonicFunctionsChainFromKey(
     DataTypePtr & out_key_column_type,
     MonotonicFunctionsChain & out_functions_chain,
     bool & out_chain_is_positive,
+    bool & out_chain_is_injective,
     std::function<bool(const IFunctionBase &, const IDataType &)> always_monotonic) const
 {
     out_chain_is_positive = true;
@@ -4493,6 +4426,7 @@ bool KeyCondition::extractMonotonicFunctionsChainFromKey(
             if (is_valid_chain)
             {
                 bool chain_is_positive = true;
+                bool chain_is_injective = true;
                 while (!chain.empty())
                 {
                     const auto * func = chain.top();
@@ -4518,6 +4452,11 @@ bool KeyCondition::extractMonotonicFunctionsChainFromKey(
                     auto monotonicity = func_base->getMonotonicityForRange(*input_child->result_type, Field(), Field());
                     if (!monotonicity.is_positive)
                         chain_is_positive = !chain_is_positive;
+
+                    ColumnsWithTypeAndName arguments;
+                    for (const auto * child : func->children)
+                        arguments.push_back({child->column, child->result_type, child->result_name});
+                    chain_is_injective = chain_is_injective && func_base->isInjective(arguments);
 
                     ColumnWithTypeAndName const_arg;
                     FunctionWithOptionalConstArg::Kind kind = FunctionWithOptionalConstArg::Kind::NO_CONST;
@@ -4575,6 +4514,7 @@ bool KeyCondition::extractMonotonicFunctionsChainFromKey(
                 out_key_column_num = it->second;
                 out_key_column_type = sample_block.getByName(it->first).type;
                 out_chain_is_positive = chain_is_positive;
+                out_chain_is_injective = chain_is_injective;
                 return true;
             }
         }
@@ -5356,6 +5296,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
             /// So if we looked only at the bounds, we would incorrectly skip this mark.
             /// If `single_point` is true (`left mark == right mark`), `f` can be any deterministic function, not necessarily
             /// monotonic, because we evaluate only one value. In that case, monotonicity direction does not matter.
+            bool atom_is_exact = false;
             if (isKeyPossiblyWrappedByMonotonicFunctions(
                     key_arg,
                     info,
@@ -5367,20 +5308,23 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
             {
             }
             else if (
-                !no_relaxed_atom_functions.contains(func_name)
-                && canConstantBeWrappedByMonotonicFunctions(
-                    key_arg, info, key_column_num, key_expr_type, const_value, const_type, constant_chain_is_positive))
+                canConstantBeWrappedByMonotonicFunctions(
+                    key_arg, info, key_column_num, key_expr_type, const_value, const_type, constant_chain_is_positive, atom_is_exact)
+                || ((func_name == "equals" || func_name == "notEquals" || func_name == "isNotDistinctFrom")
+                    && canConstantBeWrappedByDeterministicFunctions(
+                        key_arg, info, key_column_num, key_expr_type, const_value, const_type, atom_is_exact)))
             {
-                condition_is_relaxed = true;
-            }
-            else if (func_name == "equals" || func_name == "notEquals" || func_name == "isNotDistinctFrom")
-            {
-                bool atom_is_exact = false;
-                if (!canConstantBeWrappedByDeterministicFunctions(
-                        key_arg, info, key_column_num, key_expr_type, const_value, const_type, nested_null_is_ordinary_value, atom_is_exact))
-                    return false;
-
                 condition_is_relaxed = !atom_is_exact;
+
+                /// The key may store a NULL argument as an ordinary value, like `assumeNotNull(x)` does. The atom is NULL on
+                /// such a row. `<=>` is false on such a row instead, so its atom is relaxed.
+                if (deterministicTransformMayHideNull(key_arg.getDAGNode()->result_type, key_expr_type, nested_null_is_ordinary_value))
+                {
+                    if (nested_null_is_ordinary_value)
+                        condition_is_relaxed = true;
+                    else
+                        out.hides_null = true;
+                }
             }
             else
                 return false;
@@ -6926,8 +6870,8 @@ bool KeyCondition::extractPlainRanges(Ranges & ranges) const
         /// `FUNCTION_IS_NULL`, `FUNCTION_IS_NOT_NULL`, ...) and any future atom that introduces
         /// relaxation handling. Operator elements (`FUNCTION_AND`, `FUNCTION_OR`, `FUNCTION_NOT`,
         /// `ALWAYS_TRUE`, `ALWAYS_FALSE`) are never set as relaxed; relaxation propagates through them
-        /// via their child atoms (see the comment on `KeyCondition::isRelaxed` in `KeyCondition.h`).
-        if (element.relaxed)
+        /// via their child atoms. An atom that hides NULLs does not yield exact ranges either.
+        if (element.relaxed || element.hides_null)
             return false;
 
         if (element.function == RPNElement::FUNCTION_AND)
@@ -7261,10 +7205,11 @@ Truth atomTruth(const KeyCondition::RPNElement & element, Truth range_check, boo
 {
     using RPNElement = KeyCondition::RPNElement;
 
-    /// A relaxed check can also read a NULL as an ordinary value that `may_be_null` does not see, like `assumeNotNull` in
-    /// the key does.
     if (element.relaxed)
-        range_check = range_check.relaxed().withHiddenNull();
+        range_check = range_check.relaxed();
+
+    if (element.hides_null)
+        range_check = range_check.withHiddenNull();
 
     if (may_be_null)
         range_check = range_check.withNull();

@@ -2985,19 +2985,14 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 #ifndef NDEBUG
                             if (used_key_prefix_loaded_in_memory && !boundary_pair_inexact)
                             {
-                                auto describe_condition = [](const KeyCondition & condition)
-                                {
-                                    return fmt::format("(relaxed: {}): {}", condition.isRelaxed(), condition.toString());
-                                };
-
                                 String conditions_description = fmt::format(
-                                    "key condition (useful: {}) {}", key_condition_useful, describe_condition(key_condition));
+                                    "key condition (useful: {}) {}", key_condition_useful, key_condition.toString());
                                 if (part_offset_condition_useful)
                                     conditions_description
-                                        += fmt::format("; part offset condition {}", describe_condition(*part_offset_condition));
+                                        += fmt::format("; part offset condition {}", part_offset_condition->toString());
                                 if (total_offset_condition_useful)
                                     conditions_description
-                                        += fmt::format("; total offset condition {}", describe_condition(*total_offset_condition));
+                                        += fmt::format("; total offset condition {}", total_offset_condition->toString());
 
                                 LOG_ERROR(
                                     log,

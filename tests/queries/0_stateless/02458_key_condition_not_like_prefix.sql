@@ -6,8 +6,9 @@ SELECT count() FROM data WHERE str NOT LIKE 'a%' SETTINGS force_primary_key=1;
 SELECT count() FROM data WHERE str NOT LIKE 'a%%' SETTINGS force_primary_key=1;
 -- A pattern without wildcards is equivalent to an inequality, so the primary key is used (exact point range).
 SELECT count() FROM data WHERE str NOT LIKE 'a' SETTINGS force_primary_key=1;
+-- An imperfect prefix is used too, as the negation of the relaxed `LIKE` range.
+SELECT count() FROM data WHERE str NOT LIKE 'a_' SETTINGS force_primary_key=1;
+SELECT count() FROM data WHERE str NOT LIKE 'a%_' SETTINGS force_primary_key=1;
+SELECT count() FROM data WHERE str NOT LIKE 'a%\_' SETTINGS force_primary_key=1;
 SELECT count() FROM data WHERE str NOT LIKE '%a' SETTINGS force_primary_key=1; -- { serverError INDEX_NOT_USED }
-SELECT count() FROM data WHERE str NOT LIKE 'a_' SETTINGS force_primary_key=1; -- { serverError INDEX_NOT_USED }
-SELECT count() FROM data WHERE str NOT LIKE 'a%_' SETTINGS force_primary_key=1; -- { serverError INDEX_NOT_USED }
 SELECT count() FROM data WHERE str NOT LIKE '_a' SETTINGS force_primary_key=1; -- { serverError INDEX_NOT_USED }
-SELECT count() FROM data WHERE str NOT LIKE 'a%\_' SETTINGS force_primary_key=1; -- { serverError INDEX_NOT_USED }
