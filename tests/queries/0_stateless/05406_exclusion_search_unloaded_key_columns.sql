@@ -72,6 +72,17 @@ SETTINGS merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '054
 SELECT count(), sum(c1) FROM t_exclusion_search_partition_bound WHERE c2 = 1
 SETTINGS merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded partition_bound unlimited';
 
+-- The full representation of the key, which `use_lightweight_primary_key_index_analysis = 0` asks for, isn't used for a
+-- part that doesn't load every key column of the condition.
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c2
+SETTINGS use_lightweight_primary_key_index_analysis = 0, merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded dense_only_unloaded budget';
+SELECT count(), sum(c1) FROM t_exclusion_search_unloaded_key_columns WHERE c2
+SETTINGS use_lightweight_primary_key_index_analysis = 0, merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded dense_only_unloaded unlimited';
+SELECT count(), sum(c1) FROM t_exclusion_search_partition_bound WHERE c2 = 1
+SETTINGS use_lightweight_primary_key_index_analysis = 0, merge_tree_generic_exclusion_search_max_steps = 500, log_comment = '05406_unloaded dense_partition_bound budget';
+SELECT count(), sum(c1) FROM t_exclusion_search_partition_bound WHERE c2 = 1
+SETTINGS use_lightweight_primary_key_index_analysis = 0, merge_tree_generic_exclusion_search_max_steps = 0, log_comment = '05406_unloaded dense_partition_bound unlimited';
+
 SYSTEM FLUSH LOGS query_log;
 
 SELECT

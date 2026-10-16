@@ -2365,12 +2365,16 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     chassert(key_order.matchesPrefix(metadata_snapshot->getSortingKey().reverse_flags, primary_key.column_names.size()));
 
     const auto index = part->getIndex();
-    const bool use_sparse_pk_representation
-        = settings[Setting::use_lightweight_primary_key_index_analysis];
 
     /// If until index 4 of PK key columns is used in the filter, then used_key_prefix_size would be 5.
     /// There is no need to process later key columns.
     const size_t used_key_prefix_size = key_condition.getUsedKeyPrefixSize();
+
+    /// The sparse representation leaves out the key columns that the part doesn't load in memory, and `KeyCondition` fixes
+    /// an atom only on those columns. The full representation gives those columns the whole universe on every range, and the
+    /// generic exclusion search would split ranges down to single marks.
+    const bool use_sparse_pk_representation
+        = settings[Setting::use_lightweight_primary_key_index_analysis] || index->size() < used_key_prefix_size;
 
     /// Whether every key column the filter references has per-mark values in the in-memory primary index.
     /// A part may hold only a prefix of the key in memory (see the `MergeTree` setting
