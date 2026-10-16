@@ -2312,11 +2312,6 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
         return part_ranges;
 
-    /// If conditions are relaxed, don't fill exact ranges.
-    if (key_condition.isRelaxed() || (part_offset_condition && part_offset_condition->isRelaxed())
-        || (total_offset_condition && total_offset_condition->isRelaxed()))
-        exact_ranges = nullptr;
-
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     auto index_columns = std::make_shared<ColumnsWithTypeAndName>();
 
@@ -2380,10 +2375,6 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     /// only these get per-mark values in `sparse_key_left`/`sparse_key_right`.
     size_t num_sparse_keys_loaded_in_memory = 0;
 
-    /// Key columns that the filter uses but the sparse representation cannot analyse for this part: they are not loaded in
-    /// the in-memory index and have no partition-minmax bound. `KeyCondition` gives `(true, true)` for an atom on only these
-    /// columns on every range. Sorted.
-    std::vector<size_t> unavailable_key_columns;
     std::vector<FieldRef> sparse_key_left;
     std::vector<FieldRef> sparse_key_right;
     DataTypes sparse_key_types;
@@ -2425,9 +2416,9 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             index_columns->emplace_back(index->at(i), primary_key.data_types[i], primary_key.column_names[i]);
         }
 
-        /// Keep used_key_indices entries that are loaded, plus unloaded ones covered by a partition-minmax bound.
+        /// Keep used_key_indices entries that are loaded, plus unloaded ones covered by a partition-minmax bound. `KeyCondition`
+        /// treats an atom on only the dropped columns as unknown.
         const auto is_unavailable = [&](size_t idx) { return idx >= num_used_prefix_key_columns_loaded_in_memory && !has_partition_bound(idx); };
-        std::ranges::copy_if(used_key_indices, std::back_inserter(unavailable_key_columns), is_unavailable);
         used_key_indices.erase(std::remove_if(used_key_indices.begin(), used_key_indices.end(), is_unavailable), used_key_indices.end());
 
         /// Now we create sparse arrays for efficient processing in `KeyCondition`. The goal is to only send the information
@@ -2586,19 +2577,9 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     std::vector<FieldRef> part_offset_left(2);
     std::vector<FieldRef> part_offset_right(2);
 
-    /// The conditions that `check_in_range_with` evaluates. The generic exclusion search may replace them, see below.
-    struct CheckedConditions
+    auto check_bounds_in_range = [&](const MarkRange & range, BoolMaskBounds initial_bounds)
     {
-        const KeyCondition * key = nullptr;
-        const KeyCondition * part_offset = nullptr;
-        const KeyCondition * total_offset = nullptr;
-    };
-
-    const CheckedConditions original_conditions{&key_condition, part_offset_condition, total_offset_condition};
-
-    auto check_in_range_with = [&](const CheckedConditions & conditions, const MarkRange & range, BoolMask initial_mask)
-    {
-        auto check_key_condition = [&]() -> BoolMask
+        auto check_key_condition = [&]() -> BoolMaskBounds
         {
             if (!key_condition_useful)
                 return BoolMask(true, true);
@@ -2659,13 +2640,13 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     }
                 }
 
-                return conditions.key->checkInRange(
+                return key_condition.checkBoundsInRange(
                     used_key_indices,
                     sparse_key_left.data(),
                     sparse_key_right.data(),
                     sparse_key_types,
                     equal_boundaries_mask,
-                    initial_mask,
+                    initial_bounds,
                     &index_bounds);
             }
 
@@ -2707,11 +2688,11 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     }
                 }
             }
-            return conditions.key->checkInRange(
-                used_key_size, index_left.data(), index_right.data(), key_types, initial_mask, &index_bounds);
+            return key_condition.checkBoundsInRange(
+                used_key_size, index_left.data(), index_right.data(), key_types, initial_bounds, &index_bounds);
         };
 
-        auto check_part_offset_condition = [&]()
+        auto check_part_offset_condition = [&]() -> BoolMaskBounds
         {
             auto begin = part->index_granularity->getMarkStartingRow(range.begin);
             auto end = part->index_granularity->getMarkStartingRow(range.end) - 1;
@@ -2727,11 +2708,11 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             part_offset_left[1] = part->name;
             part_offset_right[1] = part->name;
 
-            return conditions.part_offset->checkInRange(
-                2, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_mask);
+            return part_offset_condition->checkBoundsInRange(
+                2, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_bounds);
         };
 
-        auto check_total_offset_condition = [&]()
+        auto check_total_offset_condition = [&]() -> BoolMaskBounds
         {
             auto begin = part->index_granularity->getMarkStartingRow(range.begin);
             auto end = part->index_granularity->getMarkStartingRow(range.end) - 1;
@@ -2743,27 +2724,28 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 
             part_offset_left[0] = begin + part_starting_offset_in_query;
             part_offset_right[0] = end + part_starting_offset_in_query;
-            return conditions.total_offset->checkInRange(
-                1, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_mask);
+            return total_offset_condition->checkBoundsInRange(
+                1, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_bounds);
         };
 
-        BoolMask result(true, false);
+        /// Each condition is built from the whole filter, so they are three checks of the same condition.
+        auto result = BoolMaskBounds::none();
 
         if (key_condition_useful)
-            result = result & check_key_condition();
+            result = BoolMaskBounds::intersect(result, check_key_condition());
 
         if (part_offset_condition_useful)
-            result = result & check_part_offset_condition();
+            result = BoolMaskBounds::intersect(result, check_part_offset_condition());
 
         if (total_offset_condition_useful)
-            result = result & check_total_offset_condition();
+            result = BoolMaskBounds::intersect(result, check_total_offset_condition());
 
         return result;
     };
 
     auto check_in_range = [&](const MarkRange & range, BoolMask initial_mask = {})
     {
-        return check_in_range_with(original_conditions, range, initial_mask);
+        return check_bounds_in_range(range, BoolMaskBounds::outerOnly(initial_mask)).outer();
     };
 
     bool key_condition_exact_range = !key_condition_useful || key_condition.matchesExactContinuousRange();
@@ -2791,49 +2773,9 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             .min_marks_for_seek = min_marks_for_seek,
         };
 
-        /// An atom that cannot be evaluated, for example a condition on a column that is not in the key or on key columns in
-        /// `unavailable_key_columns`, gives `(true, true)` on every range, and splitting a range never changes that. The search
-        /// gets an upper mask, where every such atom has the value that maximizes the condition, and a lower mask, where it has
-        /// the value that minimizes it. They have the same `can_be_true` and `can_be_false` as the condition, so the search drops the same
-        /// ranges and finds the same exact ranges. It stops splitting a range where the upper mask is certainly true,
-        /// unless it collects exact ranges and the lower mask can still be true.
-        std::list<KeyCondition> substituted_conditions;
-        CheckedConditions upper_conditions = original_conditions;
-        CheckedConditions lower_conditions = original_conditions;
-        bool has_unknown_atoms = false;
-
-        auto substitute_unknown_atoms = [&](const KeyCondition *& upper_condition, const KeyCondition *& lower_condition,
-                                            const std::vector<size_t> & unavailable_columns)
-        {
-            if (!upper_condition || !upper_condition->hasUnknownAtoms(unavailable_columns))
-                return;
-
-            has_unknown_atoms = true;
-            upper_condition = &substituted_conditions.emplace_back(upper_condition->createWithUnknownAtomsAssumed(true, unavailable_columns));
-
-            /// Only exact ranges need the lower mask.
-            if (exact_ranges)
-                lower_condition = &substituted_conditions.emplace_back(lower_condition->createWithUnknownAtomsAssumed(false, unavailable_columns));
-        };
-
-        substitute_unknown_atoms(upper_conditions.key, lower_conditions.key, unavailable_key_columns);
-        substitute_unknown_atoms(upper_conditions.part_offset, lower_conditions.part_offset, {});
-        substitute_unknown_atoms(upper_conditions.total_offset, lower_conditions.total_offset, {});
-
-        auto check = [&](const MarkRange & mark_range) -> MarkRangeCheckResult
-        {
-            BoolMask upper = check_in_range_with(upper_conditions, mark_range, BoolMask());
-            if (!has_unknown_atoms)
-                return upper;
-
-            /// The lower mask is never truer than the upper one. If the upper mask can be false, the range is not exact,
-            /// and the search splits it anyway to try to exclude subranges. So the lower mask is evaluated only where the
-            /// upper mask is certainly true, and a mask that claims everything possible stands in for it elsewhere.
-            if (exact_ranges && upper.can_be_true && !upper.can_be_false)
-                return {upper, check_in_range_with(lower_conditions, mark_range, BoolMask())};
-
-            return {upper, BoolMask(upper.can_be_true, true)};
-        };
+        /// The search reads `lower.can_be_true` only to collect exact ranges. Without them, setting it lets the check stop earlier.
+        const BoolMaskBounds initial_bounds(BoolMask(), BoolMask(/*can_be_true=*/ !exact_ranges, false));
+        auto check = [&](const MarkRange & mark_range) { return check_bounds_in_range(mark_range, initial_bounds); };
 
         auto search_result = genericExclusionSearch(part_ranges, check, search_settings, /*collect_exact_ranges=*/ exact_ranges != nullptr);
 

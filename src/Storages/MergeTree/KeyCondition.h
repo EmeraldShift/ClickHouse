@@ -133,12 +133,21 @@ public:
     /// granule is computed in MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions()
     using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, bool result, bool is_unknown)>;
 
-    /// Receives the mask of an element of `getRPN()`, given by its index there.
-    using ElementMaskFn = std::function<void (size_t rpn_index, BoolMask mask)>;
+    /// Receives the bounds of an element of `getRPN()`, given by its index there.
+    using ElementMaskFn = std::function<void (size_t rpn_index, BoolMaskBounds bounds)>;
 
     /// Whether the condition and its negation are feasible in the direct product of single column ranges specified by `hyperrectangle`.
     /// `element_mask_fn` gets the mask of each element that `update_partial_disjunction_result_fn` gets a result for.
     BoolMask checkInHyperrectangle(
+        const Hyperrectangle & hyperrectangle,
+        const DataTypes & data_types,
+        const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr,
+        const ElementMaskFn & element_mask_fn = nullptr) const;
+
+    /// The bounds that `checkInHyperrectangle` returns the `outer()` of. An atom on a column the hyperrectangle does not have
+    /// counts as unknown.
+    BoolMaskBounds checkBoundsInHyperrectangle(
         const Hyperrectangle & hyperrectangle,
         const DataTypes & data_types,
         const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
@@ -154,6 +163,14 @@ public:
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types) const;
 
+    /// An atom only on key columns from `num_refinable_key_columns` on is fixed (see `BoolMaskBounds::fixed`): the caller
+    /// gives those columns the same range on every call.
+    BoolMaskBounds checkBoundsInHyperrectangle(
+        const std::vector<int> & key_col_to_sparse_pos,
+        const Hyperrectangle & sparse_hyperrectangle,
+        const DataTypes & sparse_data_types,
+        size_t num_refinable_key_columns) const;
+
     /// Whether the condition and its negation are (independently) feasible in the key range.
     /// left_key and right_key must contain all fields in the sort_descr in the appropriate order.
     /// data_types - the types of the key columns.
@@ -167,6 +184,14 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types,
         BoolMask initial_mask = BoolMask(false, false),
+        const Hyperrectangle * key_bounds = nullptr) const;
+
+    BoolMaskBounds checkBoundsInRange(
+        size_t key_size,
+        const FieldRef * left_keys,
+        const FieldRef * right_keys,
+        const DataTypes & data_types,
+        BoolMaskBounds initial_bounds = {},
         const Hyperrectangle * key_bounds = nullptr) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
@@ -194,6 +219,17 @@ public:
         BoolMask initial_mask,
         const Hyperrectangle * key_bounds = nullptr) const;
 
+    /// Atoms only on the constant coordinates are fixed (see `BoolMaskBounds::fixed`), and so are atoms only on columns
+    /// missing from `sparse_key_indices`.
+    BoolMaskBounds checkBoundsInRange(
+        const std::vector<size_t> & sparse_key_indices,
+        const FieldRef * sparse_left_keys,
+        const FieldRef * sparse_right_keys,
+        const DataTypes & sparse_data_types,
+        const std::vector<UInt8> & equal_boundaries_mask,
+        BoolMaskBounds initial_bounds = {},
+        const Hyperrectangle * key_bounds = nullptr) const;
+
     const KeyOrder & getKeyOrder() const { return key_order; }
 
     /// Same as checkInRange, but calculate only may_be_true component of a result.
@@ -219,16 +255,6 @@ public:
     /// Impose an additional condition: the value in the column `column` must be in the range `range`.
     /// Returns whether there is such a column in the key.
     bool addCondition(const String & column, const Range & range);
-
-    /// Checks if the condition has an atom that cannot be evaluated on the index. Unknown atoms cannot be evaluated, and neither
-    /// can atoms that use only key columns from `unavailable_key_columns` (sorted), like columns that a part does not load in
-    /// its primary index.
-    bool hasUnknownAtoms(const std::vector<size_t> & unavailable_key_columns = {}) const;
-
-    /// A copy where every atom that cannot be evaluated (see `hasUnknownAtoms`) is replaced with the constant that maximizes
-    /// the condition if `value` is true, or minimizes it if `value` is false. The maximizing copy has the same `can_be_true`
-    /// on every range, and the minimizing copy the same `can_be_false`.
-    KeyCondition createWithUnknownAtomsAssumed(bool value, const std::vector<size_t> & unavailable_key_columns = {}) const;
 
     String toString() const;
 

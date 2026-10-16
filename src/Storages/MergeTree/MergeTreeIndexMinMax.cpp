@@ -214,7 +214,6 @@ MergeTreeIndexConditionMinMax::MergeTreeIndexConditionMinMax(
 {
     /// The granule bound comes from `getExtremes`, which skips NaN.
     condition.relaxAtomsOverNaNHidingColumns(index_data_types);
-    condition_with_unknown_atoms_true.emplace(condition.createWithUnknownAtomsAssumed(true));
 }
 
 bool MergeTreeIndexConditionMinMax::alwaysUnknownOrTrue() const
@@ -246,33 +245,34 @@ bool MergeTreeIndexConditionMinMax::keepsEveryGranuleInHyperrectangle(
 
     if (!update_partial_disjunction_result_fn)
     {
-        /// `condition_with_unknown_atoms_true` has the same `can_be_true` as `condition` on every granule. If it is certainly
-        /// true on the hyperrectangle, it is certainly true on every granule inside it, so the index drops none of them.
-        const auto mask = condition_with_unknown_atoms_true->checkInHyperrectangle(hyperrectangle, index_data_types);
-        return mask.can_be_true && !mask.can_be_false;
+        /// `mayBeTrueOnGranule` keeps a granule if the upper bound can be true on it. If the upper bound is certainly true on
+        /// the hyperrectangle, it is certainly true on every granule inside it.
+        const auto upper = condition.checkBoundsInHyperrectangle(hyperrectangle, index_data_types).upper;
+        return upper.can_be_true && !upper.can_be_false;
     }
 
-    /// An atom that is certainly true or certainly false on the hyperrectangle has the same mask on every granule inside
-    /// it. If every atom of `condition` is like that, every element of `condition` has the same mask on those granules as
-    /// on the hyperrectangle.
+    /// `mayBeTrueOnGranule` gives each atom's upper bound `can_be_true` to `update_partial_disjunction_result_fn`. An upper
+    /// bound that is certainly true or certainly false on the hyperrectangle is the same on every granule inside it. If
+    /// every atom is like that, so is the condition.
     const auto & rpn = condition.getRPN();
     bool atoms_decided = true;
     std::vector<std::pair<size_t, bool>> atom_results;
-    const auto mask = condition.checkInHyperrectangle(
+    const auto bounds = condition.checkBoundsInHyperrectangle(
         hyperrectangle, index_data_types, {}, {},
-        [&](size_t rpn_index, BoolMask element_mask)
+        [&](size_t rpn_index, BoolMaskBounds element_bounds)
         {
             const auto & element = rpn[rpn_index];
             if (element.function == KeyCondition::RPNElement::FUNCTION_AND || element.function == KeyCondition::RPNElement::FUNCTION_OR
                 || element.function == KeyCondition::RPNElement::FUNCTION_NOT
                 || element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
                 return;
-            if (element_mask.can_be_true && element_mask.can_be_false)
+            const auto upper = element_bounds.upper;
+            if (upper.can_be_true && upper.can_be_false)
                 atoms_decided = false;
             else
-                atom_results.emplace_back(*element.position_in_filter_rpn, element_mask.can_be_true);
+                atom_results.emplace_back(*element.position_in_filter_rpn, upper.can_be_true);
         });
-    if (!atoms_decided || !mask.can_be_true)
+    if (!atoms_decided || !bounds.upper.can_be_true)
         return false;
 
     for (const auto & [position, result] : atom_results)

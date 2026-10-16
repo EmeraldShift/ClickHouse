@@ -54,24 +54,7 @@ struct GenericExclusionSearchResult
 };
 
 /// The result of checking the condition on the rows of a mark range.
-///
-/// Some atoms of the condition may not be evaluable on the index at all, for example a comparison of a
-/// column that is not in the key. Splitting a range never changes what such an atom gives. `upper` is
-/// the mask with every such atom replaced with the value that maximizes the condition, and `lower` the
-/// mask with every such atom replaced with the value that minimizes it. Without such atoms the two masks
-/// are the same.
-///
-/// The condition can be true on the range only if `upper.can_be_true`, and can be false only if
-/// `lower.can_be_false`. Splitting the range can exclude a subrange only if `upper.can_be_false`, and
-/// can find an exact subrange only if `lower.can_be_true`. Either mask may claim more than is possible.
-struct MarkRangeCheckResult
-{
-    MarkRangeCheckResult(BoolMask mask) : upper(mask), lower(mask) { } /// NOLINT(google-explicit-constructor)
-    MarkRangeCheckResult(BoolMask upper_, BoolMask lower_) : upper(upper_), lower(lower_) { }
-
-    BoolMask upper;
-    BoolMask lower;
-};
+using MarkRangeCheckResult = BoolMaskBounds;
 
 using MarkRangeCheck = std::function<MarkRangeCheckResult(const MarkRange &)>;
 
