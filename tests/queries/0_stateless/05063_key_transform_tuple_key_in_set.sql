@@ -89,9 +89,8 @@ SELECT extract(explain, 'Condition:.*') FROM (
     EXPLAIN indexes = 1 SELECT count() FROM t_float WHERE k IN (tuple(toFloat64(3), toFloat64(1)))
 ) WHERE explain ILIKE '%Condition:%';
 
--- 9. `NOT IN` over a newly admitted layout falls back to a scan, since the transform is not known to
--- keep distinct key values distinct; the count must stay right either way. The `Condition:` line is
--- what separates that fall-back from an atom admitted as a relaxed one, which counts right as well.
+-- 9. The transform is not known to keep distinct key values distinct, so its `IN` atom is relaxed. `NOT IN` over a
+-- newly admitted layout is checked as the negation of that atom. The count must stay right.
 SELECT count() FROM t_float WHERE k NOT IN (tuple(toFloat64(3), toFloat64(1)));
 SELECT extract(explain, 'Condition:.*') FROM (
     EXPLAIN indexes = 1 SELECT * FROM t_float WHERE k NOT IN (tuple(toFloat64(3), toFloat64(1)))

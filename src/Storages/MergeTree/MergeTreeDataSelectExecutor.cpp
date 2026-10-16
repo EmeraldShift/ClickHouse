@@ -2267,11 +2267,6 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
         return part_ranges;
 
-    /// If conditions are relaxed, don't fill exact ranges.
-    if (key_condition.isRelaxed() || (part_offset_condition && part_offset_condition->isRelaxed())
-        || (total_offset_condition && total_offset_condition->isRelaxed()))
-        exact_ranges = nullptr;
-
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     auto index_columns = std::make_shared<ColumnsWithTypeAndName>();
 
@@ -2527,23 +2522,15 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     std::vector<FieldRef> part_offset_left(2);
     std::vector<FieldRef> part_offset_right(2);
 
-    /// The conditions that `check_in_range` evaluates. The generic exclusion search may replace them, see below.
-    const KeyCondition * checked_key_condition = &key_condition;
-    const KeyCondition * checked_part_offset_condition = part_offset_condition;
-    const KeyCondition * checked_total_offset_condition = total_offset_condition;
-
-    auto check_in_range = [&](const MarkRange & range, BoolMask initial_mask = {})
+    auto check_bounds_in_range = [&](const MarkRange & range, Truth need)
     {
-        auto check_key_condition = [&]() -> BoolMask
+        auto check_key_condition = [&]() -> Truth
         {
-            if (!key_condition_useful)
-                return BoolMask(true, true);
-
             if (use_sparse_pk_representation)
             {
                 /// Nothing can be inferred from empty ranges
                 if (sparse_keys_size == 0)
-                    return BoolMask(true, true);
+                    return Truth::unknown();
 
                 if (range.end == marks_count)
                 {
@@ -2597,13 +2584,13 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     }
                 }
 
-                return checked_key_condition->checkInRange(
+                return key_condition.checkBoundsInRange(
                     used_key_indices,
                     sparse_key_left.data(),
                     sparse_key_right.data(),
                     sparse_key_types,
                     equal_boundaries_mask,
-                    initial_mask,
+                    need,
                     &index_bounds);
             }
 
@@ -2645,18 +2632,18 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     }
                 }
             }
-            return checked_key_condition->checkInRange(
-                used_key_size, index_left.data(), index_right.data(), key_types, initial_mask, &index_bounds);
+            return key_condition.checkBoundsInRange(
+                used_key_size, index_left.data(), index_right.data(), key_types, need, &index_bounds);
         };
 
-        auto check_part_offset_condition = [&]()
+        auto check_part_offset_condition = [&]() -> Truth
         {
             auto begin = part->index_granularity->getMarkStartingRow(range.begin);
             auto end = part->index_granularity->getMarkStartingRow(range.end) - 1;
             if (begin > end)
             {
                 /// Empty mark (final mark)
-                return BoolMask(false, true);
+                return Truth::check(BoolMask(false, true));
             }
 
             part_offset_left[0] = begin;
@@ -2665,38 +2652,46 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             part_offset_left[1] = part->name;
             part_offset_right[1] = part->name;
 
-            return checked_part_offset_condition->checkInRange(
-                2, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_mask);
+            return part_offset_condition->checkBoundsInRange(
+                2, part_offset_left.data(), part_offset_right.data(), part_offset_types, need);
         };
 
-        auto check_total_offset_condition = [&]()
+        auto check_total_offset_condition = [&]() -> Truth
         {
             auto begin = part->index_granularity->getMarkStartingRow(range.begin);
             auto end = part->index_granularity->getMarkStartingRow(range.end) - 1;
             if (begin > end)
             {
                 /// Empty mark (final mark)
-                return BoolMask(false, true);
+                return Truth::check(BoolMask(false, true));
             }
 
             part_offset_left[0] = begin + part_starting_offset_in_query;
             part_offset_right[0] = end + part_starting_offset_in_query;
-            return checked_total_offset_condition->checkInRange(
-                1, part_offset_left.data(), part_offset_right.data(), part_offset_types, initial_mask);
+            return total_offset_condition->checkBoundsInRange(
+                1, part_offset_left.data(), part_offset_right.data(), part_offset_types, need);
         };
 
-        BoolMask result(true, false);
+        /// The key condition is built from the whole filter. An offset condition keeps only the conjuncts on offsets, so the
+        /// filter is their conjunction with a rest that the offset condition does not know. Each check describes the filter
+        /// on the range, so the results `meet`, which reads every side of each result whole.
+        if (part_offset_condition_useful || total_offset_condition_useful)
+            need = {};
 
-        if (key_condition_useful)
-            result = result & check_key_condition();
+        Truth result = key_condition_useful ? check_key_condition() : Truth::unknown();
 
         if (part_offset_condition_useful)
-            result = result & check_part_offset_condition();
+            result = Truth::meet(result, check_part_offset_condition() & Truth::unknown());
 
         if (total_offset_condition_useful)
-            result = result & check_total_offset_condition();
+            result = Truth::meet(result, check_total_offset_condition() & Truth::unknown());
 
         return result;
+    };
+
+    auto check_in_range = [&](const MarkRange & range, BoolMask initial_mask = {})
+    {
+        return check_bounds_in_range(range, Truth::need(initial_mask)).mask();
     };
 
     bool key_condition_exact_range = !key_condition_useful || key_condition.matchesExactContinuousRange();
@@ -2724,47 +2719,15 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             .min_marks_for_seek = min_marks_for_seek,
         };
 
-        GenericExclusionSearchResult search_result;
-        std::list<KeyCondition> substituted_conditions;
+        /// The search reads whether a subrange can be `Always` only to collect exact ranges, so the check can stop earlier
+        /// without them.
+        const Truth need = Truth::need(Side{Side::Never, exact_ranges ? Side::Always : Side::Sometimes});
+        auto check = [&](const MarkRange & mark_range) { return check_bounds_in_range(mark_range, need).is_true; };
+
+        auto search_result = genericExclusionSearch(part_ranges, check, search_settings, /*collect_exact_ranges=*/ exact_ranges != nullptr);
 
         if (exact_ranges)
-        {
-            search_result = genericExclusionSearch(
-                part_ranges,
-                [&](const MarkRange & mark_range) { return check_in_range(mark_range, BoolMask()); },
-                search_settings,
-                /*collect_exact_ranges=*/ true);
-
             *exact_ranges = std::move(search_result.exact_ranges);
-        }
-        else
-        {
-            /// Without exact ranges only `can_be_true` matters, so the atoms that cannot be evaluated may be assumed true.
-            /// Then a range where no subrange can be excluded is certainly true, and the search does not split it.
-            if (checked_key_condition && checked_key_condition->hasUnknownAtoms())
-            {
-                auto substituted = checked_key_condition->createWithUnknownAtomsAssumedTrue();
-                checked_key_condition = &substituted_conditions.emplace_back(std::move(substituted));
-            }
-
-            if (checked_part_offset_condition && checked_part_offset_condition->hasUnknownAtoms())
-            {
-                auto substituted = checked_part_offset_condition->createWithUnknownAtomsAssumedTrue();
-                checked_part_offset_condition = &substituted_conditions.emplace_back(std::move(substituted));
-            }
-
-            if (checked_total_offset_condition && checked_total_offset_condition->hasUnknownAtoms())
-            {
-                auto substituted = checked_total_offset_condition->createWithUnknownAtomsAssumedTrue();
-                checked_total_offset_condition = &substituted_conditions.emplace_back(std::move(substituted));
-            }
-
-            search_result = genericExclusionSearch(
-                part_ranges,
-                [&](const MarkRange & mark_range) { return check_in_range(mark_range, BoolMask()); },
-                search_settings,
-                /*collect_exact_ranges=*/ false);
-        }
 
         res = std::move(search_result.ranges);
         res.search_algorithm = MarkRanges::SearchAlgorithm::GenericExclusionSearch;
@@ -2852,18 +2815,18 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     if (result_exact_range.begin < result_exact_range.end)
                     {
                         const size_t num_unevaluable_before = KeyCondition::getNumUnevaluableChainApplications();
-                        const bool exact_range_can_be_false
-                            = check_in_range(result_exact_range, BoolMask::consider_only_can_be_false).can_be_false;
+                        const Side exact_range_is_true = check_bounds_in_range(result_exact_range, Truth{}).is_true;
                         /// A monotonic function chain that could not be evaluated on the range answers "unknown":
                         /// an over-approximation that supports no exactness claim and contradicts none either.
                         const bool exact_range_unevaluable
                             = KeyCondition::getNumUnevaluableChainApplications() != num_unevaluable_before;
 
-                        if (exact_range_unevaluable)
+                        /// So does a check that no subrange can make certainly true. The check of a relaxed atom is one.
+                        if (exact_range_unevaluable || !exact_range_is_true.mayBeAlways())
                         {
                             /// Neither an exact range nor an inconsistency.
                         }
-                        else if (exact_range_can_be_false)
+                        else if (exact_range_is_true.level() != Side::Always)
                         {
                             /// key_condition.matchesExactContinuousRange returned true, but the
                             /// range doesn't seem to be continuous. Something's broken - most likely a
@@ -2892,19 +2855,14 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 #ifndef NDEBUG
                             if (used_key_prefix_loaded_in_memory && !boundary_pair_inexact)
                             {
-                                auto describe_condition = [](const KeyCondition & condition)
-                                {
-                                    return fmt::format("(relaxed: {}): {}", condition.isRelaxed(), condition.toString());
-                                };
-
                                 String conditions_description = fmt::format(
-                                    "key condition (useful: {}) {}", key_condition_useful, describe_condition(key_condition));
+                                    "key condition (useful: {}) {}", key_condition_useful, key_condition.toString());
                                 if (part_offset_condition_useful)
                                     conditions_description
-                                        += fmt::format("; part offset condition {}", describe_condition(*part_offset_condition));
+                                        += fmt::format("; part offset condition {}", part_offset_condition->toString());
                                 if (total_offset_condition_useful)
                                     conditions_description
-                                        += fmt::format("; total offset condition {}", describe_condition(*total_offset_condition));
+                                        += fmt::format("; total offset condition {}", total_offset_condition->toString());
 
                                 LOG_ERROR(
                                     log,
@@ -3088,7 +3046,7 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
 
             auto check_in_range = [&may_be_true_on_range](const MarkRange & mark_range)
             {
-                return BoolMask(may_be_true_on_range(mark_range.begin, mark_range.end, nullptr), true);
+                return Side::of(may_be_true_on_range(mark_range.begin, mark_range.end, nullptr), true, true);
             };
 
             auto search_result = genericExclusionSearch(ranges, check_in_range, search_settings, /*collect_exact_ranges=*/ false);
