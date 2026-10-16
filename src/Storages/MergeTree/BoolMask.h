@@ -78,6 +78,9 @@ struct BoolMaskBounds
 
     bool isComplete() const { return upper.isComplete() && lower.isComplete(); }
 
+    /// Whether each mask is certainly true or certainly false. Then every nonempty subrange has the same bounds.
+    bool isDecided() const { return upper.can_be_true != upper.can_be_false && lower.can_be_true != lower.can_be_false; }
+
     /// Bounds from two checks of the same condition on the same range, like checks on two indexes. The range is dropped if
     /// either check drops it, and it is exact if either check says it is. `none()` changes nothing.
     static BoolMaskBounds intersect(const BoolMaskBounds & left, const BoolMaskBounds & right)

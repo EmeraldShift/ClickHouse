@@ -1339,7 +1339,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
                 PartialDisjunctionResult partial_eval_results;
                 if (use_skip_indexes_for_disjunctions)
-                    partial_eval_results.resize(ranges.data_part->index_granularity->getMarksCountWithoutFinal() * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT, true);
+                    partial_eval_results.resize(ranges.data_part->index_granularity->getMarksCountWithoutFinal());
 
                 for (size_t idx = 0; idx < num_indexes; ++idx)
                 {
@@ -1381,13 +1381,13 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
                         const auto & condition
                             = index_and_condition.condition_template->generateForPart(ranges.data_part);
-                        std::vector<std::pair<size_t, bool>> atom_results;
+                        std::vector<std::pair<size_t, BoolMask>> atom_results;
                         KeyCondition::UpdatePartialDisjunctionResultFn record_atom_result;
                         if (use_skip_indexes_for_disjunctions)
-                            record_atom_result = [&](size_t position, bool atom_result, bool is_unknown)
+                            record_atom_result = [&](size_t position, BoolMask atom_mask, bool is_unknown)
                             {
                                 if (!is_unknown)
-                                    atom_results.emplace_back(position, atom_result);
+                                    atom_results.emplace_back(position, atom_mask);
                             };
                         if (condition->keepsEveryGranuleInHyperrectangle(sub_hyperrectangle, record_atom_result))
                         {
@@ -1398,10 +1398,9 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                                     key_condition_rpn_template->generateForPart(ranges.data_part).getRPN().size(),
                                     MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT);
                                 for (const auto & range : ranges.ranges)
-                                    for (size_t mark = range.begin; mark < range.end; ++mark)
-                                        for (const auto & [position, atom_result] : atom_results)
-                                            if (position < max_position)
-                                                partial_eval_results[(mark * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT) + position] = atom_result;
+                                    for (const auto & [position, atom_mask] : atom_results)
+                                        if (position < max_position)
+                                            partial_eval_results.update(range, position, atom_mask);
                             }
 
                             LOG_TRACE(
@@ -3022,12 +3021,12 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
     if (index_helper->isVectorSimilarityIndex())
         read_hints.vector_search_results.reset();
 
-    auto create_update_partial_disjunction_result_fn = [&](size_t range_begin) -> KeyCondition::UpdatePartialDisjunctionResultFn
+    auto create_update_partial_disjunction_result_fn = [&](MarkRange marks) -> KeyCondition::UpdatePartialDisjunctionResultFn
     {
         if (use_skip_indexes_for_disjunctions && key_condition_rpn_template)
         {
             const size_t max_position = std::min(key_condition_rpn_template->getRPN().size(), MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT);
-            return [range_begin, max_position, &partial_disjunction_result](size_t position, bool element_result, bool is_unknown)
+            return [marks, max_position, &partial_disjunction_result](size_t position, BoolMask element_mask, bool is_unknown)
             {
                 /// Index conditions may have extra condition-local RPN nodes after rewrites.
                 /// `mergePartialResultsForDisjunctions` reads only positions from
@@ -3035,16 +3034,15 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
                 if (is_unknown || position >= max_position)
                     return;
 
-                const auto bit_index = (range_begin * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT) + position;
-                if (bit_index >= partial_disjunction_result.size())
+                if (marks.end > partial_disjunction_result.numMarks())
                 {
                     throw Exception(
                         ErrorCodes::LOGICAL_ERROR,
-                        "Partial disjunction result bit index {} is out of range, bitset size: {}, mark: {}, position: {}",
-                        bit_index, partial_disjunction_result.size(), range_begin, position);
+                        "Partial disjunction result marks {} are out of range, number of marks: {}, position: {}",
+                        marks, partial_disjunction_result.numMarks(), position);
                 }
 
-                partial_disjunction_result[bit_index] = element_result;
+                partial_disjunction_result.update(marks, position, element_mask);
             };
         }
         return nullptr;
@@ -3075,7 +3073,7 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
             {
                 for (size_t mark = range.begin; mark < range.end; ++mark)
                 {
-                    if (may_be_true_on_range(mark, mark + 1, create_update_partial_disjunction_result_fn(mark)))
+                    if (may_be_true_on_range(mark, mark + 1, create_update_partial_disjunction_result_fn({mark, mark + 1})))
                     {
                         if (res.empty() || mark - res.back().end > min_marks_for_seek)
                             res.push_back(MarkRange(mark, mark + 1));
@@ -3254,15 +3252,14 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
                 }
                 else
                 {
-                    size_t range_begin = std::max(ranges[i].begin, index_mark * skip_index_granularity);
-                    bool may_be_true = condition->mayBeTrueOnGranule(granule, create_update_partial_disjunction_result_fn(range_begin));
-
-                    if (!may_be_true)
-                        continue;
-
                     MarkRange data_range(
                         std::max(ranges[i].begin, index_mark * skip_index_granularity),
                         std::min(ranges[i].end, (index_mark + 1) * skip_index_granularity));
+
+                    bool may_be_true = condition->mayBeTrueOnGranule(granule, create_update_partial_disjunction_result_fn(data_range));
+
+                    if (!may_be_true)
+                        continue;
 
                     if (res.empty() || data_range.begin - res.back().end > min_marks_for_seek)
                         res.push_back(data_range);
@@ -3423,7 +3420,7 @@ MarkRanges MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions(
 
     /// Evaluate the RPN over all the ranges.
     auto rpn = rpn_template_for_eval_result.getRPN();
-    std::vector<bool> rpn_stack;
+    std::vector<BoolMask> rpn_stack;
     for (auto range : ranges)
     {
         for (auto range_begin = range.begin; range_begin < range.end; range_begin++)
@@ -3434,37 +3431,35 @@ MarkRanges MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions(
             {
                 if (element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
                 {
-                    rpn_stack.emplace_back(partial_eval_results[(range_begin * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT) + position]);
+                    rpn_stack.emplace_back(partial_eval_results.get(range_begin, position));
                 }
                 else if (element.function == KeyCondition::RPNElement::FUNCTION_NOT)
                 {
-                    /// NOT x = 'acd' is always True with BloomFilter even if x = 'acd' was True.
-                    /// Hence rpn_stack.back() = !rpn_stack.back() will be wrong. We will
-                    /// push True by default for NOT. This could cause false positives for
-                    /// other skip indexes if NOT is used.
-                    rpn_stack.back() = true;
+                    /// A bloom filter cannot tell that `x = 'acd'` is certainly true, so it reports `can_be_false` for it, and
+                    /// `NOT x = 'acd'` can be true.
+                    rpn_stack.back() = !rpn_stack.back();
                 }
                 else if (element.function == KeyCondition::RPNElement::FUNCTION_OR)
                 {
                     auto arg1 = rpn_stack.back();
                     rpn_stack.pop_back();
                     auto arg2 = rpn_stack.back();
-                    rpn_stack.back() = arg1 || arg2;
+                    rpn_stack.back() = arg1 | arg2;
                 }
                 else if (element.function == KeyCondition::RPNElement::FUNCTION_AND)
                 {
                     auto arg1 = rpn_stack.back();
                     rpn_stack.pop_back();
                     auto arg2 = rpn_stack.back();
-                    rpn_stack.back() = arg1 && arg2;
+                    rpn_stack.back() = arg1 & arg2;
                 }
                 else if (element.function == KeyCondition::RPNElement::ALWAYS_TRUE)
                 {
-                    rpn_stack.emplace_back(true);
+                    rpn_stack.emplace_back(true, false);
                 }
                 else if (element.function == KeyCondition::RPNElement::ALWAYS_FALSE)
                 {
-                    rpn_stack.emplace_back(false);
+                    rpn_stack.emplace_back(false, true);
                 }
                 else
                     throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type {} in mergePartialResultsForDisjunctions(), RPN = {}", element.function, rpn_template_for_eval_result_string);
@@ -3475,7 +3470,7 @@ MarkRanges MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions(
             if (rpn_stack.size() != 1)
                 throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size {} in mergePartialResultsForDisjunctions(), RPN = {}", rpn_stack.size(), rpn_template_for_eval_result_string);
 
-            if (rpn_stack[0])
+            if (rpn_stack[0].can_be_true)
             {
                 if (res.empty() || range_begin - res.back().end > min_marks_for_seek)
                     res.push_back({range_begin, range_begin + 1});

@@ -251,12 +251,11 @@ bool MergeTreeIndexConditionMinMax::keepsEveryGranuleInHyperrectangle(
         return upper.can_be_true && !upper.can_be_false;
     }
 
-    /// `mayBeTrueOnGranule` gives each atom's upper bound `can_be_true` to `update_partial_disjunction_result_fn`. An upper
-    /// bound that is certainly true or certainly false on the hyperrectangle is the same on every granule inside it. If
-    /// every atom is like that, so is the condition.
+    /// `mayBeTrueOnGranule` gives each atom's `outer()` mask to `update_partial_disjunction_result_fn`. If the bounds of every
+    /// atom are decided on the hyperrectangle, every granule inside it has the same bounds for each atom and for the condition.
     const auto & rpn = condition.getRPN();
     bool atoms_decided = true;
-    std::vector<std::pair<size_t, bool>> atom_results;
+    std::vector<std::pair<size_t, BoolMask>> atom_results;
     const auto bounds = condition.checkBoundsInHyperrectangle(
         hyperrectangle, index_data_types, {}, {},
         [&](size_t rpn_index, BoolMaskBounds element_bounds)
@@ -266,17 +265,16 @@ bool MergeTreeIndexConditionMinMax::keepsEveryGranuleInHyperrectangle(
                 || element.function == KeyCondition::RPNElement::FUNCTION_NOT
                 || element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
                 return;
-            const auto upper = element_bounds.upper;
-            if (upper.can_be_true && upper.can_be_false)
-                atoms_decided = false;
+            if (element_bounds.isDecided())
+                atom_results.emplace_back(*element.position_in_filter_rpn, element_bounds.outer());
             else
-                atom_results.emplace_back(*element.position_in_filter_rpn, upper.can_be_true);
+                atoms_decided = false;
         });
     if (!atoms_decided || !bounds.upper.can_be_true)
         return false;
 
-    for (const auto & [position, result] : atom_results)
-        update_partial_disjunction_result_fn(position, result, /*is_unknown=*/false);
+    for (const auto & [position, mask] : atom_results)
+        update_partial_disjunction_result_fn(position, mask, /*is_unknown=*/false);
     return true;
 }
 

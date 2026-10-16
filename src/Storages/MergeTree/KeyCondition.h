@@ -127,11 +127,11 @@ public:
     /// on that range.
     ///
     /// Range pruning for mixed AND/OR predicates uses below callback to record each atom's
-    /// evaluation result got by applying corresponding skip index (true or false). This is
+    /// mask got by applying corresponding skip index. This is
     /// done in MergeTreeDataSelectExecutor::filterMarksUsingIndex(). Each *IndexCondition
     /// invokes this callback as it is evaluating the predicate. The final result for each
     /// granule is computed in MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions()
-    using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, bool result, bool is_unknown)>;
+    using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, BoolMask mask, bool is_unknown)>;
 
     /// Receives the bounds of an element of `getRPN()`, given by its index there.
     using ElementMaskFn = std::function<void (size_t rpn_index, BoolMaskBounds bounds)>;

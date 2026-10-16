@@ -7783,7 +7783,7 @@ BoolMaskBounds KeyCondition::checkBoundsInHyperrectangle(
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type in KeyCondition::RPNElement");
 
         if (update_partial_disjunction_result_fn && element.position_in_filter_rpn)
-            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().upper.can_be_true, (element.function == RPNElement::FUNCTION_UNKNOWN));
+            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().outer(), (element.function == RPNElement::FUNCTION_UNKNOWN));
         if (element_mask_fn && element.position_in_filter_rpn)
             element_mask_fn(&element - rpn.data(), rpn_stack.back());
     }
