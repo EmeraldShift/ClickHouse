@@ -1174,11 +1174,8 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
     /// Positions in the part-level minmax hyperrectangle of each skip index's columns, when all of them
     /// are covered by it; empty otherwise.
-    /// Left empty with `use_skip_indexes_for_disjunctions`. There a skipped index leaves its atoms at the default
-    /// `true` in `partial_eval_results`. One of them can be false on a granule even if the index condition is true
-    /// on the whole part, and under OR that false atom could have dropped the granule.
     std::vector<std::vector<size_t>> index_to_partition_minmax_positions(skip_indexes.useful_indices.size());
-    if (!use_skip_indexes_for_disjunctions && metadata_snapshot->hasPartitionKey() && !parts_with_ranges.empty())
+    if (metadata_snapshot->hasPartitionKey() && !parts_with_ranges.empty())
     {
         std::unordered_map<String, size_t> partition_minmax_col_pos;
         /// `PARTITION_KEY_ONLY` keeps positions aligned regardless of appended `_block_number` / `_block_offset`.
@@ -1384,8 +1381,29 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
                         const auto & condition
                             = index_and_condition.condition_template->generateForPart(ranges.data_part);
-                        if (condition->alwaysTrueOnHyperrectangle(sub_hyperrectangle))
+                        std::vector<std::pair<size_t, bool>> atom_results;
+                        KeyCondition::UpdatePartialDisjunctionResultFn record_atom_result;
+                        if (use_skip_indexes_for_disjunctions)
+                            record_atom_result = [&](size_t position, bool atom_result, bool is_unknown)
+                            {
+                                if (!is_unknown)
+                                    atom_results.emplace_back(position, atom_result);
+                            };
+                        if (condition->keepsEveryGranuleInHyperrectangle(sub_hyperrectangle, record_atom_result))
                         {
+                            if (!atom_results.empty())
+                            {
+                                /// Write the positions that `filterMarksUsingIndex` would write.
+                                const size_t max_position = std::min(
+                                    key_condition_rpn_template->generateForPart(ranges.data_part).getRPN().size(),
+                                    MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT);
+                                for (const auto & range : ranges.ranges)
+                                    for (size_t mark = range.begin; mark < range.end; ++mark)
+                                        for (const auto & [position, atom_result] : atom_results)
+                                            if (position < max_position)
+                                                partial_eval_results[(mark * MAX_BITS_FOR_PARTIAL_DISJUNCTION_RESULT) + position] = atom_result;
+                            }
+
                             LOG_TRACE(
                                 log,
                                 "Skipping granule-level evaluation of skip index {} on part {}: "

@@ -7355,7 +7355,8 @@ BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & hyperrectangle,
     const DataTypes & data_types,
     const ColumnIndexToBloomFilter & column_index_to_column_bf,
-    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn,
+    const ElementMaskFn & element_mask_fn) const
 {
     absl::InlinedVector<BoolMask, 16> rpn_stack;
 
@@ -7798,6 +7799,8 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
         if (update_partial_disjunction_result_fn && element.position_in_filter_rpn)
             update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().can_be_true, (element.function == RPNElement::FUNCTION_UNKNOWN));
+        if (element_mask_fn && element.position_in_filter_rpn)
+            element_mask_fn(&element - rpn.data(), rpn_stack.back());
     }
 
     if (rpn_stack.size() != 1)

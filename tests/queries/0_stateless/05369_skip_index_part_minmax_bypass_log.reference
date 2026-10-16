@@ -1,0 +1,20 @@
+c < 2000 AND v = 3, use_skip_indexes_for_disjunctions = 0: bypassed 1
+c < 2000 AND v = 3, use_skip_indexes_for_disjunctions = 1: bypassed 1
+143
+143
+NOT (c >= 2000 OR v = 3), use_skip_indexes_for_disjunctions = 0: bypassed 1
+NOT (c >= 2000 OR v = 3), use_skip_indexes_for_disjunctions = 1: bypassed 1
+857
+857
+NOT (c >= 500 OR v = 3), use_skip_indexes_for_disjunctions = 0: bypassed 0
+NOT (c >= 500 OR v = 3), use_skip_indexes_for_disjunctions = 1: bypassed 0
+429
+429
+(c < 2000 AND v = 3) OR c = 5000, use_skip_indexes_for_disjunctions = 0: bypassed 1
+(c < 2000 AND v = 3) OR c = 5000, use_skip_indexes_for_disjunctions = 1: bypassed 1
+143
+143
+(c < 2000 AND v = 3) OR c = 5, use_skip_indexes_for_disjunctions = 0: bypassed 1
+(c < 2000 AND v = 3) OR c = 5, use_skip_indexes_for_disjunctions = 1: bypassed 0
+144
+144

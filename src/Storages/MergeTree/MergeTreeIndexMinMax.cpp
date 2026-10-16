@@ -238,14 +238,46 @@ bool MergeTreeIndexConditionMinMax::mayBeTrueOnGranule(MergeTreeIndexGranulePtr 
     return condition.checkInHyperrectangle(granule.hyperrectangle, index_data_types, {}, update_partial_disjunction_result_fn).can_be_true;
 }
 
-bool MergeTreeIndexConditionMinMax::alwaysTrueOnHyperrectangle(const Hyperrectangle & hyperrectangle) const
+bool MergeTreeIndexConditionMinMax::keepsEveryGranuleInHyperrectangle(
+    const Hyperrectangle & hyperrectangle, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
     if (hyperrectangle.size() != index_data_types.size())
         return false;
-    /// `condition_with_unknown_atoms_true` has the same `can_be_true` as `condition` on every granule. If it is certainly
-    /// true on the hyperrectangle, it is certainly true on every granule inside it, so the index drops none of them.
-    const auto mask = condition_with_unknown_atoms_true->checkInHyperrectangle(hyperrectangle, index_data_types);
-    return mask.can_be_true && !mask.can_be_false;
+
+    if (!update_partial_disjunction_result_fn)
+    {
+        /// `condition_with_unknown_atoms_true` has the same `can_be_true` as `condition` on every granule. If it is certainly
+        /// true on the hyperrectangle, it is certainly true on every granule inside it, so the index drops none of them.
+        const auto mask = condition_with_unknown_atoms_true->checkInHyperrectangle(hyperrectangle, index_data_types);
+        return mask.can_be_true && !mask.can_be_false;
+    }
+
+    /// An atom that is certainly true or certainly false on the hyperrectangle has the same mask on every granule inside
+    /// it. If every atom of `condition` is like that, every element of `condition` has the same mask on those granules as
+    /// on the hyperrectangle.
+    const auto & rpn = condition.getRPN();
+    bool atoms_decided = true;
+    std::vector<std::pair<size_t, bool>> atom_results;
+    const auto mask = condition.checkInHyperrectangle(
+        hyperrectangle, index_data_types, {}, {},
+        [&](size_t rpn_index, BoolMask element_mask)
+        {
+            const auto & element = rpn[rpn_index];
+            if (element.function == KeyCondition::RPNElement::FUNCTION_AND || element.function == KeyCondition::RPNElement::FUNCTION_OR
+                || element.function == KeyCondition::RPNElement::FUNCTION_NOT
+                || element.function == KeyCondition::RPNElement::FUNCTION_UNKNOWN)
+                return;
+            if (element_mask.can_be_true && element_mask.can_be_false)
+                atoms_decided = false;
+            else
+                atom_results.emplace_back(*element.position_in_filter_rpn, element_mask.can_be_true);
+        });
+    if (!atoms_decided || !mask.can_be_true)
+        return false;
+
+    for (const auto & [position, result] : atom_results)
+        update_partial_disjunction_result_fn(position, result, /*is_unknown=*/false);
+    return true;
 }
 
 std::string MergeTreeIndexConditionMinMax::getDescription() const

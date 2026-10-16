@@ -62,7 +62,8 @@ public:
 
     bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
 
-    bool alwaysTrueOnHyperrectangle(const Hyperrectangle & hyperrectangle) const override;
+    bool keepsEveryGranuleInHyperrectangle(
+        const Hyperrectangle & hyperrectangle, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
 
     std::string getDescription() const override;
 

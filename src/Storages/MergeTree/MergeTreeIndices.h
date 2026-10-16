@@ -167,9 +167,12 @@ public:
     using UpdatePartialDisjunctionResultFn = KeyCondition::UpdatePartialDisjunctionResultFn;
     virtual bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const = 0;
 
-    /// Whether `mayBeTrueOnGranule` keeps every granule whose values lie in the hyperrectangle.
-    /// The axes are the index columns in declared order.
-    virtual bool alwaysTrueOnHyperrectangle(const Hyperrectangle & /*hyperrectangle*/) const
+    /// Whether `mayBeTrueOnGranule` keeps every granule whose values lie in the hyperrectangle, and gives
+    /// `update_partial_disjunction_result_fn` the same result for each atom on all of those granules. If so, this function
+    /// gives `update_partial_disjunction_result_fn` those results once. The axes are the index columns in declared order.
+    virtual bool keepsEveryGranuleInHyperrectangle(
+        const Hyperrectangle & /*hyperrectangle*/,
+        const UpdatePartialDisjunctionResultFn & /*update_partial_disjunction_result_fn*/) const
     {
         return false;
     }

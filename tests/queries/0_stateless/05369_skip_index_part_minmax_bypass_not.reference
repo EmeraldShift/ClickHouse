@@ -1,9 +1,0 @@
-c < 2000 AND v = 3: bypassed 1
-143
-143
-NOT (c >= 2000 OR v = 3): bypassed 1
-857
-857
-NOT (c >= 500 OR v = 3): bypassed 0
-429
-429

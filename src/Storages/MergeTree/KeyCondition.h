@@ -133,12 +133,17 @@ public:
     /// granule is computed in MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions()
     using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, bool result, bool is_unknown)>;
 
+    /// Receives the mask of an element of `getRPN()`, given by its index there.
+    using ElementMaskFn = std::function<void (size_t rpn_index, BoolMask mask)>;
+
     /// Whether the condition and its negation are feasible in the direct product of single column ranges specified by `hyperrectangle`.
+    /// `element_mask_fn` gets the mask of each element that `update_partial_disjunction_result_fn` gets a result for.
     BoolMask checkInHyperrectangle(
         const Hyperrectangle & hyperrectangle,
         const DataTypes & data_types,
         const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
-        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr,
+        const ElementMaskFn & element_mask_fn = nullptr) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
     /// `key_col_to_sparse_pos` maps key index to position in `sparse_hyperrectangle`, or -1 if not tracked.
