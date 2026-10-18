@@ -55,6 +55,7 @@ void registerTableFunctionJDBC(TableFunctionFactory & factory);
 
 void registerTableFunctionView(TableFunctionFactory & factory);
 void registerTableFunctionViewIfPermitted(TableFunctionFactory & factory);
+void registerTableFunctionDeltaQuery(TableFunctionFactory & factory);
 
 void registerTableFunctionObfuscate(TableFunctionFactory & factory);
 
