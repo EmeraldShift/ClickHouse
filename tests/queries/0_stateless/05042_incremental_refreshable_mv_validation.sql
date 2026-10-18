@@ -1,6 +1,6 @@
 -- Tags: atomic-database
 -- Validation of incremental refreshable materialized view definitions at CREATE and ALTER:
--- exactly one plain source table whose engine supports streaming, and no MODIFY QUERY.
+-- MergeTree source tables with block numbers, joined by inner joins, and no MODIFY QUERY.
 
 DROP TABLE IF EXISTS val_src;
 DROP TABLE IF EXISTS val_src_noblock;
@@ -9,6 +9,7 @@ DROP TABLE IF EXISTS val_dim;
 DROP TABLE IF EXISTS val_mem;
 DROP TABLE IF EXISTS val_tgt;
 DROP TABLE IF EXISTS val_mv;
+DROP TABLE IF EXISTS val_mv_join;
 
 CREATE TABLE val_src (k UInt64, v UInt64)
 ENGINE = MergeTree ORDER BY k
@@ -19,7 +20,7 @@ SETTINGS
     add_minmax_index_for_block_offset_column = 1,
     part_minmax_index_columns = 'with_block_number_offset';
 
-CREATE TABLE val_dim (k UInt64) ENGINE = MergeTree ORDER BY k;
+CREATE TABLE val_dim (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
 CREATE TABLE val_mem (k UInt64, v UInt64) ENGINE = Memory;
 CREATE TABLE val_tgt (k UInt64, v UInt64) ENGINE = MergeTree ORDER BY k;
 
@@ -30,31 +31,38 @@ CREATE MATERIALIZED VIEW val_mv
     AS SELECT k, v FROM val_src;
 SELECT 'valid_created', count() FROM system.tables WHERE database = currentDatabase() AND name = 'val_mv';
 
--- A JOIN is not a single source.
+-- An inner join of sources with block numbers is accepted.
 CREATE MATERIALIZED VIEW val_mv_join
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL
     TO val_tgt EMPTY
-    AS SELECT s.k, s.v FROM val_src s JOIN val_dim d ON s.k = d.k; -- { serverError BAD_ARGUMENTS }
+    AS SELECT s.k, s.v FROM val_src s JOIN val_dim d ON s.k = d.k;
+SELECT 'join_created', count() FROM system.tables WHERE database = currentDatabase() AND name = 'val_mv_join';
 
--- A subquery referencing another table is rejected: the cursor only advances on the top-level source.
+-- A LEFT JOIN is rejected: a new row of the right side would change rows the view already appended.
+CREATE MATERIALIZED VIEW val_mv_left_join
+    REFRESH EVERY 10 YEAR APPEND INCREMENTAL
+    TO val_tgt EMPTY
+    AS SELECT s.k, s.v FROM val_src s LEFT JOIN val_dim d ON s.k = d.k; -- { serverError NOT_IMPLEMENTED }
+
+-- A subquery is rejected: the cursor covers only the tables of the FROM clause.
 CREATE MATERIALIZED VIEW val_mv_subquery
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL
     TO val_tgt EMPTY
-    AS SELECT k, v FROM val_src WHERE k IN (SELECT k FROM val_dim); -- { serverError BAD_ARGUMENTS }
+    AS SELECT k, v FROM val_src WHERE k IN (SELECT k FROM val_dim); -- { serverError NOT_IMPLEMENTED }
 
 -- A subquery source (not a plain table) is rejected.
 CREATE MATERIALIZED VIEW val_mv_subquery_src
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL
     TO val_tgt EMPTY
-    AS SELECT k, v FROM (SELECT k, v FROM val_src); -- { serverError BAD_ARGUMENTS }
+    AS SELECT k, v FROM (SELECT k, v FROM val_src); -- { serverError NOT_IMPLEMENTED }
 
--- A non-streaming source engine (Memory) is rejected.
+-- A source engine other than MergeTree (Memory) is rejected.
 CREATE MATERIALIZED VIEW val_mv_mem
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL
     TO val_tgt EMPTY
     AS SELECT k, v FROM val_mem; -- { serverError NOT_IMPLEMENTED }
 
--- A source that does not persist _block_number/_block_offset is rejected: the cursor would drift across merges.
+-- A source that does not persist _block_number is rejected: the cursor would drift across merges.
 -- Set the settings explicitly to 0 so the test is deterministic under randomized MergeTree settings.
 CREATE TABLE val_src_noblock (k UInt64, v UInt64) ENGINE = MergeTree ORDER BY k
 SETTINGS enable_block_number_column = 0, enable_block_offset_column = 0;
@@ -81,6 +89,7 @@ CREATE OR REPLACE MATERIALIZED VIEW val_mv
     AS SELECT k, v FROM val_src; -- { serverError NOT_IMPLEMENTED }
 
 DROP TABLE val_mv;
+DROP TABLE val_mv_join;
 DROP TABLE val_tgt;
 DROP TABLE val_mem;
 DROP TABLE val_dim;

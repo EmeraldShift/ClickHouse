@@ -1,7 +1,7 @@
 -- Tags: atomic-database
 -- Incremental refreshable materialized view: each refresh appends only the rows committed to the source
--- since the previous refresh. `APPEND INCREMENTAL` makes the refresh inject
--- `STREAM BOUNDED UNORDERED CURSOR {...}` onto the single source and persist the advanced cursor.
+-- since the previous refresh. The refresh reads the source between the persisted cursor and the committed frontier, and
+-- persists the frontier.
 
 DROP TABLE IF EXISTS incr_src;
 DROP TABLE IF EXISTS incr_tgt;

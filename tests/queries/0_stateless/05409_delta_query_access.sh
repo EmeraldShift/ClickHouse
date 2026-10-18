@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Tags: atomic-database
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -16,7 +17,8 @@ $CLICKHOUSE_CLIENT -q "
     CREATE USER ${USER};"
 
 FRONTIER="SELECT * FROM deltaQueryFrontier((SELECT k FROM t))"
-DELTA="SELECT * FROM deltaQuery((SELECT k FROM t), map('${CLICKHOUSE_DATABASE}.t', map()), map('${CLICKHOUSE_DATABASE}.t', map('all', 1)))"
+T_UUID=$($CLICKHOUSE_CLIENT -q "SELECT uuid FROM system.tables WHERE database = currentDatabase() AND name = 't'")
+DELTA="SELECT * FROM deltaQuery((SELECT k FROM t), map(), map('${T_UUID}.all.block_number', 2))"
 denied() { grep -qF "necessary to have the grant SELECT ON ${CLICKHOUSE_DATABASE}.t" && echo "ACCESS_DENIED"; }
 
 echo "Without SELECT"
@@ -25,7 +27,7 @@ $CLICKHOUSE_CLIENT --user "${USER}" -q "$DELTA" 2>&1 | denied
 
 echo "With SELECT"
 $CLICKHOUSE_CLIENT -q "GRANT SELECT ON ${CLICKHOUSE_DATABASE}.t TO ${USER}"
-$CLICKHOUSE_CLIENT --user "${USER}" -q "$FRONTIER" | sed "s/${CLICKHOUSE_DATABASE}/db/"
+$CLICKHOUSE_CLIENT --user "${USER}" -q "$FRONTIER" | sed "s/${T_UUID}/uuid/"
 $CLICKHOUSE_CLIENT --user "${USER}" -q "$DELTA"
 
 $CLICKHOUSE_CLIENT -q "DROP USER ${USER}"

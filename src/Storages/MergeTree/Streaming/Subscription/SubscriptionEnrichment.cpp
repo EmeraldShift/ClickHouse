@@ -8,6 +8,30 @@ static bool partitionBelongsToSubscription(const String & partition_id, size_t s
     return std::hash<String>{}(partition_id) % subscriptions_count == subscription_index;
 }
 
+Int64 promoteBlockNumber(Int64 cursor, const std::vector<MergeTreePartInfo> & parts, const MergeTreeCursorPromoter & promoter)
+{
+    for (const auto & part : parts)
+    {
+        /// Already entirely consumed.
+        if (part.max_block <= cursor)
+            continue;
+
+        /// Intersects with the cursor or is contiguous to it — we can read through the part without crossing any gap.
+        if (part.min_block <= cursor + 1)
+        {
+            cursor = part.max_block;
+            continue;
+        }
+
+        /// A block is still in flight in the gap (being committed, or not yet fetched): stop, don't skip past it.
+        if (!promoter.canPromote(cursor, part.min_block))
+            break;
+
+        cursor = part.max_block;
+    }
+    return cursor;
+}
+
 bool enrichSubscription(
     MergeTreeBoundsSubscription & subscription,
     const LocalPartsByPartition & local_parts,
@@ -32,27 +56,7 @@ bool enrichSubscription(
         if (auto it = safe_block_numbers.find(partition_id); it != safe_block_numbers.end())
             starting_cursor = it->second;
 
-        Int64 cursor = starting_cursor;
-        for (const auto & part : parts)
-        {
-            /// Already entirely consumed.
-            if (part.max_block <= cursor)
-                continue;
-
-            /// Intersects with the cursor or is contiguous to it — we can read through the part without crossing any gap.
-            if (part.min_block <= cursor + 1)
-            {
-                cursor = part.max_block;
-                continue;
-            }
-
-            /// A block is still in flight in the gap (being committed, or not yet fetched): stop, don't skip past it.
-            if (!promoter.canPromote(cursor, part.min_block))
-                break;
-
-            cursor = part.max_block;
-        }
-
+        Int64 cursor = promoteBlockNumber(starting_cursor, parts, promoter);
         if (cursor > starting_cursor)
             promoted_partitions[partition_id] = cursor;
     }

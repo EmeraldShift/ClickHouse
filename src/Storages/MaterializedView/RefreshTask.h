@@ -118,7 +118,7 @@ public:
         /// the dependency's latest last_success_end_time, we should start a refresh.
         AllDependenciesInfo last_success_dependencies;
 
-        /// Per-partition cursor of the last successfully processed snapshot, for incremental refresh
+        /// `DeltaQuery` cursor of the last successfully processed snapshot, for incremental refresh
         /// (`REFRESH ... APPEND INCREMENTAL`). Null when the view is not incremental or nothing has been processed yet.
         CursorTreeNodePtr cursor;
 

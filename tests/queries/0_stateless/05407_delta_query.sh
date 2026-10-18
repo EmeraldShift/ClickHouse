@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+# Tags: atomic-database
 
 CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
 . "$CURDIR"/../shell_config.sh
 
-# Maintain two join queries with `deltaQuery` over five rounds of inserts, then compare the maintained results with
-# the queries evaluated from scratch.
+# Maintain two join queries with `deltaQuery`, and the first one with an incremental refreshable materialized view, over
+# five rounds of inserts. Then compare the maintained results with the queries evaluated from scratch.
 
 $CLICKHOUSE_CLIENT -q "
     CREATE TABLE orders (id UInt64, day Date, product String, qty Int64)
@@ -15,18 +16,21 @@ $CLICKHOUSE_CLIENT -q "
     CREATE TABLE products (product String, category String)
         ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1;
 
-    CREATE TABLE cursors (query UInt8, round UInt8, cursor Map(String, Map(String, UInt64))) ENGINE = MergeTree ORDER BY (query, round);
+    CREATE TABLE cursors (query UInt8, round UInt8, cursor Map(String, Int64)) ENGINE = MergeTree ORDER BY (query, round);
     CREATE TABLE revenue (category String, product String, revenue SimpleAggregateFunction(sum, Int64), n SimpleAggregateFunction(sum, UInt64),
         orders AggregateFunction(uniqExact, UInt64)) ENGINE = AggregatingMergeTree ORDER BY (category, product);
     CREATE TABLE revenue_deltas (round UInt8, category String, product String, revenue Int64, n UInt64, orders UInt64) ENGINE = MergeTree ORDER BY round;
     CREATE TABLE pairs (product String, pairs SimpleAggregateFunction(sum, UInt64), qq SimpleAggregateFunction(sum, Int64))
         ENGINE = AggregatingMergeTree ORDER BY product;
+    CREATE TABLE view_revenue AS revenue;
 "
 
 Q1="SELECT p.category AS category, o.product AS product, sum(o.qty * q.price) AS revenue, count() AS n, uniqExactState(o.id) AS orders
     FROM orders AS o INNER JOIN quotes AS q ON q.order_id = o.id INNER JOIN products AS p ON p.product = o.product
     WHERE q.version < 5 GROUP BY category, product"
 Q2="SELECT a.product AS product, count() AS pairs, sum(a.qty * b.qty) AS qq FROM orders AS a INNER JOIN orders AS b ON a.product = b.product GROUP BY product"
+
+$CLICKHOUSE_CLIENT -q "CREATE MATERIALIZED VIEW revenue_view REFRESH EVERY 10 YEAR APPEND INCREMENTAL TO view_revenue EMPTY AS $Q1"
 
 cursor() { echo "(SELECT cursor FROM cursors WHERE query = $1 AND round = $2)"; }
 
@@ -42,7 +46,9 @@ end_round()
         INSERT INTO revenue SELECT * FROM deltaQuery(($Q1), $(cursor 1 $((r - 1))), $(cursor 1 "$r"));
         INSERT INTO revenue_deltas SELECT $r, category, product, revenue, n, finalizeAggregation(orders)
             FROM deltaQuery(($Q1), $(cursor 1 $((r - 1))), $(cursor 1 "$r"));
-        INSERT INTO pairs SELECT * FROM deltaQuery(($Q2), $(cursor 2 $((r - 1))), $(cursor 2 "$r"));"
+        INSERT INTO pairs SELECT * FROM deltaQuery(($Q2), $(cursor 2 $((r - 1))), $(cursor 2 "$r"));
+        SYSTEM REFRESH VIEW revenue_view;
+        SYSTEM WAIT VIEW revenue_view;"
 }
 
 end_round 0
@@ -91,6 +97,15 @@ $CLICKHOUSE_CLIENT -q "
         maintained AS (SELECT category, product, sum(revenue), sum(n), uniqExactMerge(orders) FROM revenue GROUP BY category, product),
         recomputed AS (SELECT category, product, revenue, n, finalizeAggregation(orders) FROM ($Q1))
     SELECT 'maintained only', * FROM (SELECT * FROM maintained EXCEPT ALL SELECT * FROM recomputed)
+    UNION ALL
+    SELECT 'recomputed only', * FROM (SELECT * FROM recomputed EXCEPT ALL SELECT * FROM maintained)"
+
+echo "View and recomputed revenue differences"
+$CLICKHOUSE_CLIENT -q "
+    WITH
+        maintained AS (SELECT category, product, sum(revenue), sum(n), uniqExactMerge(orders) FROM view_revenue GROUP BY category, product),
+        recomputed AS (SELECT category, product, revenue, n, finalizeAggregation(orders) FROM ($Q1))
+    SELECT 'view only', * FROM (SELECT * FROM maintained EXCEPT ALL SELECT * FROM recomputed)
     UNION ALL
     SELECT 'recomputed only', * FROM (SELECT * FROM recomputed EXCEPT ALL SELECT * FROM maintained)"
 

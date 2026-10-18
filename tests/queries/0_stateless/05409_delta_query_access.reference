@@ -2,5 +2,5 @@ Without SELECT
 ACCESS_DENIED
 ACCESS_DENIED
 With SELECT
-{'db.t':{'all':1}}
+{'uuid.all.block_number':2}
 1
