@@ -6,7 +6,9 @@
 #include <Core/Settings.h>
 #include <Databases/DatabaseReplicated.h>
 #include <IO/Operators.h>
+#include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromFile.h>
 #include <Interpreters/Cache/QueryResultCache.h>
 #include <Interpreters/Context.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
@@ -31,6 +33,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/QueryScope.h>
 #include <Common/FailPoint.h>
+#include <Common/filesystemHelpers.h>
 #include <Common/Macros.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
@@ -280,6 +283,20 @@ RefreshTask::RefreshTask(
     {
         if (is_restore_from_backup)
             scheduling.stop_requested = true;
+
+        /// Coordinated views keep the cursor in Keeper. The others keep it in a local file named by the UUID of the view.
+        const auto view_id = view->getStorageID();
+        if (isIncremental() && view_id.hasUUID())
+        {
+            cursor_path = fs::path(context->getPath()) / "refresh_cursors" / (toString(view_id.uuid) + ".bin");
+            if (!attach)
+                fs::remove(cursor_path);
+            else if (fs::exists(cursor_path))
+            {
+                ReadBufferFromFile in(cursor_path);
+                coordination.root_znode.cursor = buildCursorTree(readFieldBinary(in).safeGet<Map>());
+            }
+        }
     }
 }
 
@@ -443,7 +460,11 @@ void RefreshTask::shutdown()
 void RefreshTask::drop(ContextPtr context, bool is_shared_db)
 {
     if (!coordination.coordinated)
+    {
+        if (!cursor_path.empty())
+            fs::remove(cursor_path);
         return;
+    }
 
     auto component_guard = Coordination::setCurrentComponent("RefreshTask::drop");
     auto zookeeper = context->getZooKeeper();
@@ -1655,6 +1676,27 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     if (!cursor_persisted_by_target)
         if (auto cursor = refresh_context->getStreamingCursor())
             out_cursor = cursor->tree;
+
+    /// A failure leaves the previous cursor in the file, so the first refresh after a restart repeats the rows since then.
+    if (!cursor_path.empty() && out_cursor)
+    {
+        try
+        {
+            fs::create_directories(fs::path(cursor_path).parent_path());
+            const String temp_path = cursor_path + ".tmp";
+            {
+                WriteBufferFromFile out(temp_path);
+                writeFieldBinary(Field(cursorTreeToMap(out_cursor)), out);
+                out.finalize();
+                out.sync();
+            }
+            fs::rename(temp_path, cursor_path);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger(), "Failed to persist the cursor of the refresh");
+        }
+    }
 
     return new_table_id.uuid;
 }

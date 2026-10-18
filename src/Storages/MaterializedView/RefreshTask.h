@@ -71,7 +71,8 @@ public:
     /// Information stored in zookeeper shared among replicas to make sure only one replica does a
     /// refresh for each timeslot.
     /// If coordination is disabled, we still do "coordination" the same way (as if there's only one
-    /// replica), but keep the CoordinationZnode in memory without writing to zookeeper.
+    /// replica), but keep the CoordinationZnode in memory without writing to zookeeper. The cursor of an incremental
+    /// view also goes to a local file, see `cursor_path`.
     struct CoordinationZnode
     {
         /// "Official" time of the latest successful refresh, i.e. time according to schedule rather than wall clock,
@@ -385,6 +386,8 @@ private:
     Coordination::WatchCallbackPtr watch_callback;
 
     CoordinationState coordination;
+    /// The file that keeps the cursor of an uncoordinated incremental view across DETACH and restarts, or empty.
+    String cursor_path;
     ExecutionState execution;
     SchedulingState scheduling;
 

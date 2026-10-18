@@ -41,6 +41,14 @@ SYSTEM REFRESH VIEW incr_mv;
 SYSTEM WAIT VIEW incr_mv;
 SELECT 'round3', count(), sum(k), sum(v) FROM incr_tgt;
 
+-- Round 4: the cursor survives DETACH and ATTACH, so the refresh after them appends only the 5 new rows.
+INSERT INTO incr_src SELECT number, number * 10 FROM numbers(10, 5);
+DETACH TABLE incr_mv;
+ATTACH TABLE incr_mv;
+SYSTEM REFRESH VIEW incr_mv;
+SYSTEM WAIT VIEW incr_mv;
+SELECT 'round4', count(), sum(k), sum(v) FROM incr_tgt;
+
 DROP TABLE incr_mv;
 DROP TABLE incr_tgt;
 DROP TABLE incr_src;

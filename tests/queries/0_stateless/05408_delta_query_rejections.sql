@@ -108,6 +108,9 @@ SELECT * FROM deltaQuery((SELECT k, count() FROM t GROUP BY k HAVING count() > 1
 SELECT * FROM deltaQuery((SELECT k, avg(v) FROM s GROUP BY k), map(), map()); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, sum(v) FROM t GROUP BY k WITH TOTALS)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, sum(v) AS s, s * 2 AS sign FROM t GROUP BY k HAVING s > 0)); -- { serverError BAD_ARGUMENTS }
+-- Names of the columns that the residual generates.
+SELECT * FROM deltaQueryFrontier((SELECT k AS __val_1, sum(v) + 1 AS __key_1 FROM t GROUP BY k)); -- { serverError BAD_ARGUMENTS }
+SELECT * FROM deltaQueryFrontier((SELECT k AS __count, sum(v) + 1 FROM t GROUP BY k)); -- { serverError BAD_ARGUMENTS }
 -- Accepted result columns over signed inputs, and over unsigned inputs with the setting.
 SELECT * FROM deltaQueryFrontier((SELECT k, count(), count(v), countIf(v > 0), sum(v), sumIf(v, v > 0), exponentialMovingAverageState(1)(v, k)
     FROM s GROUP BY k)) FORMAT Null;

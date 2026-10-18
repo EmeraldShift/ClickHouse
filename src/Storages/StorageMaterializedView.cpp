@@ -50,6 +50,7 @@
 #include <Common/typeid_cast.h>
 #include <Common/randomSeed.h>
 #include <Core/UUID.h>
+#include <Common/SipHash.h>
 
 #include <Backups/BackupEntriesCollector.h>
 
@@ -110,11 +111,16 @@ static void removeNonCommonColumns(const Block & src_header, Block & target_head
 namespace
 {
     /// The hidden tables of an incremental refreshable materialized view whose query has a residual: the integral of the
-    /// core of the query, and the delta of the core in the last refresh.
+    /// core of the query, and the delta of the core in the last refresh. The UUID of the integral follows from the UUID of
+    /// the view, so a rename can find the integral without the lock of the database.
     std::pair<StorageID, StorageID> getResidualTableIds(const StorageID & view_id)
     {
         const auto uuid = toString(view_id.uuid);
-        return {StorageID(view_id.database_name, ".inner_integral." + uuid), StorageID(view_id.database_name, ".inner_delta." + uuid)};
+        SipHash hash;
+        hash.update(view_id.uuid);
+        hash.update("integral");
+        return {StorageID(view_id.database_name, ".inner_integral." + uuid, UUID(hash.get128())),
+            StorageID(view_id.database_name, ".inner_delta." + uuid)};
     }
 
     /// Runs `query` as an internal query of the refresh.
@@ -712,6 +718,9 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
             /// the residual over the integral. A failure after the integral absorbs the delta and before the cursor persists
             /// makes the next refresh add the delta again.
             auto [integral_id, delta_id] = getResidualTableIds(getStorageID());
+            /// Like a refresh that replaces the target, the definer creates, drops, reads and writes the hidden tables.
+            refresh_context->checkAccess(AccessType::DROP_TABLE | AccessType::CREATE_TABLE | AccessType::SELECT | AccessType::INSERT,
+                integral_id.database_name);
             executeRefreshStep(delta_query.getIntegralCreateQuery(integral_id), refresh_context);
             executeRefreshStep(fmt::format("CREATE OR REPLACE TABLE {} ENGINE = Memory AS {}", delta_id.getFullTableName(),
                 select_query->formatWithSecretsOneLine()), refresh_context);
@@ -1005,6 +1014,17 @@ void StorageMaterializedView::mutate(const MutationCommands & commands, ContextP
 {
     checkStatementCanBeForwarded();
     getTargetTable()->mutate(commands, local_context);
+}
+
+void StorageMaterializedView::checkTableCanBeRenamed(const StorageID & new_name) const
+{
+    /// The hidden tables are in the database of the view.
+    const auto table_id = getStorageID();
+    if (new_name.database_name != table_id.database_name && table_id.hasUUID()
+        && DatabaseCatalog::instance().tryGetByUUID(getResidualTableIds(table_id).first.uuid).second)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Cannot move an incremental refreshable materialized view with HAVING, ORDER BY, LIMIT, DISTINCT, windows or "
+            "expressions over aggregates to another database");
 }
 
 void StorageMaterializedView::renameInMemory(const StorageID & new_table_id)

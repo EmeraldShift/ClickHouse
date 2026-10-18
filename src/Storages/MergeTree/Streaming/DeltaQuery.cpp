@@ -37,7 +37,6 @@
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
 #include <Storages/StorageProxy.h>
 
-#include <boost/algorithm/string/replace.hpp>
 #include <fmt/ranges.h>
 
 #include <deque>
@@ -100,8 +99,18 @@ struct DeltaQuery::Residual
     Strings simple_functions;
     /// The merge of each aggregate `__val_j` of the residual, which reads the aggregate columns of the integral.
     ASTs merges;
-    /// The residual as a select over the placeholder table `residual_input`.
-    String outer;
+    /// The merges of `sum` and `avg`, with the integral columns of their sum and of their count of non-NULL arguments. The
+    /// count is null for a `sum`, whose integral has no count unless its argument is Nullable.
+    struct SumMerge
+    {
+        size_t merge;
+        String sum_column;
+        String count_column;
+        ASTPtr count;
+    };
+    std::vector<SumMerge> sum_merges;
+    /// The residual as a select without FROM.
+    ASTPtr outer;
     Names outputs;
     /// The keys whose values bound the rows that a change of the integral can change, and the output columns that equal
     /// them. A refresh recomputes the rows of the touched values of these keys. Empty if it recomputes all rows.
@@ -712,10 +721,32 @@ bool needsResidual(const QueryNode & query, bool is_signed)
     return false;
 }
 
-/// The name of the table that stands for the merged rows of the integral in `Residual::outer`.
-constexpr std::string_view residual_input = "__residual_input";
-
 String makeKeyName(size_t key) { return fmt::format("__key_{}", key + 1); }
+
+/// Whether the core, the residual or the delta of the residual names its own columns `name`.
+bool isGeneratedName(std::string_view name)
+{
+    for (std::string_view prefix : {"__key_", "__val_", "__agg_"})
+        if (name.starts_with(prefix))
+            return true;
+    return name == "__count" || name == "__index" || name == "__weight";
+}
+
+/// A user name equal to a generated name would capture or shadow the generated column.
+void checkNoGeneratedNames(const IAST & ast)
+{
+    auto check = [](std::string_view name)
+    {
+        if (isGeneratedName(name))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Name {} is reserved in queries with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates", name);
+    };
+    check(ast.tryGetAlias());
+    if (const auto * identifier = ast.as<ASTIdentifier>())
+        check(identifier->shortName());
+    for (const auto & child : ast.children)
+        checkNoGeneratedNames(*child);
+}
 
 bool isAggregate(const IAST & ast)
 {
@@ -814,6 +845,7 @@ ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, boo
         residual.outputs.push_back(column.name);
     }
 
+    checkNoGeneratedNames(select);
     auto outer_ast = select.clone();
     auto & outer = outer_ast->as<ASTSelectQuery &>();
 
@@ -925,14 +957,22 @@ ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, boo
             auto column = add_core_aggregate(function.clone(), "");
             return make_aggregate(function.name.substr(0, function.name.size() - String("State").size()) + "MergeState", function, {column});
         }
-        if ((base == "sum" || base == "count") && is_sum)
+        const String suffix = suffixes.empty() ? "" : "If";
+        auto name_of = [](const ASTPtr & column) { return column->as<ASTIdentifier &>().name(); };
+        if (base == "count" && is_sum)
             return makeASTFunction("sum", add_core_aggregate(function.clone(), "sum"));
+        if (base == "sum" && is_sum)
+        {
+            auto sum = add_core_aggregate(function.clone(), "sum");
+            residual.sum_merges.push_back({residual.merges.size(), name_of(sum), "", makeASTFunction("count" + suffix, cloneAll(arguments))});
+            return makeASTFunction("sum", std::move(sum));
+        }
         if (base == "avg" && is_sum)
         {
             /// `avg(x)` is `sum(x) / count(x)`, which sums over rows.
-            const String suffix = suffixes.empty() ? "" : "If";
             auto sum = add_core_aggregate(makeASTFunction("sum" + suffix, cloneAll(arguments)), "sum");
             auto count = add_core_aggregate(makeASTFunction("count" + suffix, cloneAll(arguments)), "sum");
+            residual.sum_merges.push_back({residual.merges.size(), name_of(sum), name_of(count), nullptr});
             return makeASTFunction("divide", makeASTFunction("sum", std::move(sum)), makeASTFunction("sum", std::move(count)));
         }
         if (is_signed)
@@ -979,10 +1019,9 @@ ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, boo
             ASTSelectQuery::Expression::SETTINGS, ASTSelectQuery::Expression::TABLES})
         outer.setExpression(clause, nullptr);
     outer.group_by_all = false;
-    outer.replaceDatabaseAndTable(StorageID("", String(residual_input)));
     for (size_t i = 0; i < residual.outputs.size(); ++i)
         outer.select()->children[i]->setAlias(residual.outputs[i]);
-    residual.outer = outer_ast->formatWithSecretsOneLine();
+    residual.outer = std::move(outer_ast);
 
     auto core_ast = select.clone();
     auto & core = core_ast->as<ASTSelectQuery &>();
@@ -1058,9 +1097,34 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     if (!core)
         return;
     analyze(core, context, sign_column, nullptr);
+    auto core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
+
+    /// A sum of Nullable values is NULL over rows whose values are all NULL, but the merged sum of the rows and their
+    /// retractions is 0. So the merge returns NULL where the count of non-NULL values is 0.
+    bool added_counts = false;
+    for (auto & sum_merge : split.sum_merges)
+    {
+        if (!removeLowCardinality(core_columns.tryGetByName(sum_merge.sum_column)->type)->isNullable())
+            continue;
+        if (sum_merge.count)
+        {
+            sum_merge.count_column = fmt::format("__agg_{}", split.simple_functions.size());
+            sum_merge.count->setAlias(sum_merge.count_column);
+            core->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().select()->children.push_back(sum_merge.count);
+            split.simple_functions.push_back("sum");
+            added_counts = true;
+        }
+        auto & merge = split.merges.at(sum_merge.merge);
+        merge = makeASTFunction("if", makeASTFunction("equals", makeASTFunction("sum", make_intrusive<ASTIdentifier>(sum_merge.count_column)),
+            make_intrusive<ASTLiteral>(UInt64{0})), make_intrusive<ASTLiteral>(Field()), merge);
+    }
+    if (added_counts)
+    {
+        analyze(core, context, sign_column, nullptr);
+        core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
+    }
 
     /// The integral has the columns of the deltas of the core, and merges the aggregate columns.
-    const auto core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
     Strings structure;
     /// The merges of a `SimpleAggregateFunction` column would have its type, so they read the values of the column.
     std::map<String, String> simple_types;
@@ -1195,9 +1259,11 @@ String DeltaQuery::Residual::buildInput(const String & integral, const String & 
 
 String DeltaQuery::Residual::buildResidual(const String & integral, const String & where) const
 {
-    auto result = outer;
-    boost::replace_first(result, fmt::format("FROM {}", residual_input), fmt::format("FROM ({})", buildInput(integral, where)));
-    return result;
+    auto input = parseSelect(fmt::format("SELECT * FROM ({})", buildInput(integral, where)));
+    auto result = outer->clone();
+    result->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::TABLES,
+        input->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().tables()->clone());
+    return result->formatWithSecretsOneLine();
 }
 
 String DeltaQuery::Residual::buildPartitionFilter(const Names & columns, const String & delta) const
@@ -1236,8 +1302,8 @@ String DeltaQuery::getIntegralCreateQuery(const StorageID & integral) const
     for (size_t i = 0; i < residual->num_keys; ++i)
         if (std::ranges::find(residual->partition_keys, i) == residual->partition_keys.end())
             order.push_back(backQuote(makeKeyName(i)));
-    return fmt::format("CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} SETTINGS allow_nullable_key = 1",
-        integral.getFullTableName(), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} SETTINGS allow_nullable_key = 1",
+        integral.getFullTableName(), quoteString(toString(integral.uuid)), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
 }
 
 /// The residual over the touched keys counts each of its rows once, and the target counts each of its rows of those keys by
@@ -1260,13 +1326,15 @@ ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageI
         outputs.push_back(backQuote(output));
     const auto columns = joinNames(outputs);
     const auto sign = backQuote(residual->sign_column);
+    /// An empty delta leaves the residual unchanged, but a global aggregate has a row before its first delta.
+    const bool skip = delta_is_empty && !(residual->has_aggregates && residual->num_keys == 0);
     return parseSelect(fmt::format(
         "SELECT {0}, arrayJoin(arrayWithConstant(toUInt64(abs(`__count`)), toInt8(sign(`__count`)))) AS {1} "
         "FROM (SELECT {0}, sum(`__weight`) AS `__count` "
         "FROM (SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}) "
         "GROUP BY {0} HAVING `__count` != 0){5}",
         columns, sign, residual->buildResidual(integral.getFullTableName(), where), target.getFullTableName(), target_where,
-        delta_is_empty ? " WHERE 0" : ""));
+        skip ? " WHERE 0" : ""));
 }
 
 CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const

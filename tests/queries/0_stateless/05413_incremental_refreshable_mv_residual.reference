@@ -4,30 +4,48 @@ round 1	view 3	1
 round 1	view 4	1
 round 1	view 5	1
 round 1	view 6	1
+round 1	view 7	1
+round 1	view 8	1
 round 2	view 1	1
 round 2	view 2	1
 round 2	view 3	1
 round 2	view 4	1
 round 2	view 5	1
 round 2	view 6	1
+round 2	view 7	1
+round 2	view 8	1
 round 3	view 1	1
 round 3	view 2	1
 round 3	view 3	1
 round 3	view 4	1
 round 3	view 5	1
 round 3	view 6	1
+round 3	view 7	1
+round 3	view 8	1
 round 4	view 1	1
 round 4	view 2	1
 round 4	view 3	1
 round 4	view 4	1
 round 4	view 5	1
 round 4	view 6	1
+round 4	view 7	1
+round 4	view 8	1
 round 5	view 1	1
 round 5	view 2	1
 round 5	view 3	1
 round 5	view 4	1
 round 5	view 5	1
 round 5	view 6	1
+round 5	view 7	1
+round 5	view 8	1
+round 6	view 1	1
+round 6	view 2	1
+round 6	view 3	1
+round 6	view 4	1
+round 6	view 5	1
+round 6	view 6	1
+round 6	view 7	1
+round 6	view 8	1
 Net rows of the views
 1	toys	24	356.67	1
 2	1	1200	1
@@ -39,11 +57,15 @@ Net rows of the views
 5	C	1
 6	1	2	10	10	1
 6	2	2	5	2	1
+7	1	\N	\N	\N	1
+7	2	9	4	4	1
+8	1	\N	1
 Result types
 category	String
 qty	Int64
 avg_price	Float64
 sign	Int8
 Integrals
-6
+8
+NOT_IMPLEMENTED
 0
