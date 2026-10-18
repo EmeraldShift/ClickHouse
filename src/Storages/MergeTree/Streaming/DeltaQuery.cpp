@@ -3,13 +3,16 @@
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 #include <Analyzer/AggregationUtils.h>
+#include <Analyzer/ArrayJoinNode.h>
+#include <Analyzer/ColumnNode.h>
 #include <Analyzer/FunctionNode.h>
+#include <Analyzer/JoinNode.h>
 #include <Analyzer/QueryNode.h>
+#include <Analyzer/TableNode.h>
+#include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <Core/Joins.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/DatabaseCatalog.h>
-#include <Interpreters/IdentifierSemantic.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -18,7 +21,6 @@
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSubquery.h>
-#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
@@ -26,7 +28,7 @@
 
 #include <deque>
 #include <map>
-#include <unordered_set>
+#include <unordered_map>
 
 
 namespace DB
@@ -43,23 +45,37 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool enable_block_number_column;
 }
 
-/// One occurrence of a table in the FROM clause of the query.
+/// One table of the FROM clause of the query.
 struct DeltaQuery::Input
 {
-    /// The name that qualifies columns of this occurrence in the query: its alias, or the table name as written.
-    std::vector<String> qualifier;
+    /// The unique alias of the table in the query, which qualifies its columns.
+    String alias;
     /// The key of the table in cursors: its UUID.
     String key;
     std::shared_ptr<MergeTreeData> storage;
+};
+
+/// An equality `from.from_column = to.to_column` between join keys of two inputs. The semi-join reduction follows it from
+/// input `from` to input `to`.
+struct DeltaQuery::SemiJoinEdge
+{
+    size_t from;
+    String from_column;
+    size_t to;
+    String to_column;
 };
 
 namespace
 {
 
 using Input = DeltaQuery::Input;
+using SemiJoinEdge = DeltaQuery::SemiJoinEdge;
 
 /// Table UUID -> partition ID -> first excluded block number.
 using Cursor = std::map<String, std::map<String, Int64>>;
+
+/// The inputs by their nodes in the query tree.
+using InputIndexes = std::unordered_map<const IQueryTreeNode *, size_t>;
 
 [[noreturn]] void throwUnsupported(std::string_view construct)
 {
@@ -85,21 +101,124 @@ bool isMergeableAggregate(const String & name)
     return canonical == "sum" || canonical == "count";
 }
 
-/// Rejects subqueries, which could read tables that the cursors do not cover. A join query also rejects window functions,
-/// whose result over the union of the terms differs from the union of their results.
-void checkExpression(const IAST & ast, bool is_join)
+/// Appends the tables of the join tree in order, and the ON expressions of its joins. Throws unless the join tree joins
+/// tables by inner joins, whose delta is the UNION ALL of per-table terms.
+void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, QueryTreeNodes & join_conditions)
 {
-    if (ast.as<ASTSubquery>() || ast.as<ASTSelectWithUnionQuery>())
-        throwUnsupported("subqueries");
-    if (const auto * function = ast.as<ASTFunction>(); is_join && function && function->isWindowFunction())
-        throwUnsupported("window functions in joins");
-    for (const auto & child : ast.children)
-        checkExpression(*child, is_join);
+    switch (node->getNodeType())
+    {
+        case QueryTreeNodeType::TABLE:
+            tables.push_back(node);
+            return;
+        case QueryTreeNodeType::ARRAY_JOIN:
+            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables, join_conditions);
+            return;
+        case QueryTreeNodeType::CROSS_JOIN:
+        {
+            auto & join = node->as<CrossJoinNode &>();
+            if (std::ranges::any_of(join.getJoinTypes(), [](const auto & type) { return type.locality == JoinLocality::Global; }))
+                throwUnsupported("GLOBAL joins");
+            for (const auto & table : join.getTableExpressions())
+                collectJoinTree(table, tables, join_conditions);
+            return;
+        }
+        case QueryTreeNodeType::JOIN:
+        {
+            /// Resolution has replaced an unspecified strictness by `join_default_strictness`.
+            const auto & join = node->as<JoinNode &>();
+            if (join.getKind() != JoinKind::Inner || join.getStrictness() != JoinStrictness::All)
+                throwUnsupported("joins other than INNER ALL, CROSS and comma joins");
+            if (join.getLocality() == JoinLocality::Global)
+                throwUnsupported("GLOBAL joins");
+            collectJoinTree(join.getLeftTableExpressionNode(), tables, join_conditions);
+            collectJoinTree(join.getRightTableExpressionNode(), tables, join_conditions);
+            if (join.isOnJoinExpression())
+                join_conditions.push_back(join.getJoinExpression());
+            return;
+        }
+        default:
+            throwUnsupported("table functions or subqueries in FROM");
+    }
+}
+
+/// Throws unless the table has block numbers that order its rows by insert, and no merges or mutations rewrite its rows.
+Input makeInput(const TableNode & table)
+{
+    if (const auto & modifiers = table.getTableExpressionModifiers();
+        modifiers && (modifiers->hasSampleSizeRatio() || modifiers->hasStream()))
+        throwUnsupported("SAMPLE or STREAM");
+
+    auto storage = castStorage<MergeTreeData>(table.getStorage(), DeferredTable::Load);
+    if (!storage)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries read only MergeTree tables, but {} has engine {}",
+            table.getStorageID().getNameForLogs(), table.getStorage()->getName());
+    const auto table_id = storage->getStorageID();
+    if (storage->merging_params.mode != MergeTreeData::MergingParams::Ordinary)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, whose merges rewrite rows",
+            table_id.getNameForLogs());
+    if (!(*storage->getSettings())[MergeTreeSetting::enable_block_number_column])
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Delta queries require table {} to set enable_block_number_column = 1",
+            table_id.getNameForLogs());
+    if (!table_id.hasUUID())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries require table {} to have a UUID, as tables of Atomic databases do",
+            table_id.getNameForLogs());
+    /// The bounds read the virtual columns `_part` and `_partition_id`, which columns of the same names would shadow.
+    for (const auto * virtual_column : {"_part", "_partition_id"})
+        if (table.getStorageSnapshot()->metadata->getColumns().has(virtual_column))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, whose column {} shadows a virtual column",
+                table_id.getNameForLogs(), virtual_column);
+
+    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage)};
+}
+
+/// Rejects subqueries and tables outside FROM, which could read tables that the cursors do not cover. A join query also
+/// rejects window functions, whose result over the union of the terms differs from the union of their results.
+void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_indexes, bool is_join)
+{
+    for (const auto & child : node.getChildren())
+    {
+        if (!child)
+            continue;
+        switch (child->getNodeType())
+        {
+            case QueryTreeNodeType::QUERY:
+            case QueryTreeNodeType::UNION:
+                throwUnsupported("subqueries");
+            case QueryTreeNodeType::TABLE:
+            case QueryTreeNodeType::TABLE_FUNCTION:
+                if (!input_indexes.contains(child.get()))
+                    throwUnsupported("IN over tables");
+                break;
+            case QueryTreeNodeType::FUNCTION:
+                if (is_join && child->as<FunctionNode &>().isWindowFunction())
+                    throwUnsupported("window functions in joins");
+                break;
+            default:
+                break;
+        }
+        checkExpressions(*child, input_indexes, is_join);
+    }
+}
+
+/// Checks the clauses whose result over the union of the terms of a join query differs from the union of their results.
+void checkJoinClauses(const QueryNode & query)
+{
+    if (query.isDistinct())
+        throwUnsupported("DISTINCT in joins");
+    if (query.isGroupByWithTotals() || query.isGroupByWithRollup() || query.isGroupByWithCube() || query.isGroupByWithGroupingSets())
+        throwUnsupported("WITH TOTALS, ROLLUP, CUBE or GROUPING SETS in joins");
+    if (query.hasHaving())
+        throwUnsupported("HAVING in joins");
+    if (query.hasOrderBy() || query.hasLimit() || query.hasOffset() || query.hasLimitByLimit() || query.hasLimitAfter()
+        || query.hasLimitUntil())
+        throwUnsupported("ORDER BY, LIMIT or LIMIT BY in joins");
+    if (query.hasWindow() || query.hasQualify())
+        throwUnsupported("WINDOW or QUALIFY in joins");
 }
 
 /// Checks that each result column of a join query is either a mergeable aggregate or free of aggregates. Resolution inlines
-/// aliases, so `sum(v) AS s, s + 1` fails too. Optimizations are skipped because they move arithmetic out of aggregates,
-/// which would make `sum(v * 2)` fail.
+/// aliases, so `sum(v) AS s, s + 1` fails too. The query tree skips optimizations, which move arithmetic out of aggregates
+/// and would make `sum(v * 2)` fail.
 void checkResultColumns(const QueryNode & query)
 {
     for (const auto & column : query.getProjection().getNodes())
@@ -114,82 +233,50 @@ void checkResultColumns(const QueryNode & query)
     }
 }
 
-/// Checks the clauses whose result over the union of the terms of a join query differs from the union of their results.
-void checkJoinClauses(const ASTSelectQuery & select)
+void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
 {
-    if (select.distinct)
-        throwUnsupported("DISTINCT in joins");
-    if (select.group_by_with_totals || select.group_by_with_rollup || select.group_by_with_cube || select.group_by_with_grouping_sets)
-        throwUnsupported("WITH TOTALS, ROLLUP, CUBE or GROUPING SETS in joins");
-    if (select.having())
-        throwUnsupported("HAVING in joins");
-    if (select.orderBy() || select.limitLength() || select.limitBy() || select.limitOffset())
-        throwUnsupported("ORDER BY, LIMIT or LIMIT BY in joins");
-    if (select.window() || select.qualify())
-        throwUnsupported("WINDOW or QUALIFY in joins");
-}
-
-const ASTSelectQuery & getSingleSelect(const ASTSelectWithUnionQuery & query)
-{
-    if (query.list_of_selects->children.size() != 1)
-        throwUnsupported("UNION");
-    const auto * select = query.list_of_selects->children[0]->as<ASTSelectQuery>();
-    if (!select)
-        throwUnsupported("nested queries");
-    return *select;
-}
-
-/// The table occurrences of the FROM clause, in order. Throws unless each is a table with block numbers, and the joins
-/// between them are inner joins, whose delta is the UNION ALL of per-occurrence terms.
-std::vector<Input> collectInputs(const ASTSelectQuery & select, const ContextPtr & context)
-{
-    if (!select.tables())
-        throwUnsupported("queries without tables");
-
-    std::vector<Input> inputs;
-    for (const auto & child : select.tables()->children)
+    if (const auto * function = node->as<FunctionNode>(); function && function->getFunctionName() == "and")
     {
-        const auto & element = child->as<ASTTablesInSelectQueryElement &>();
-        if (element.array_join)
-            continue;
-
-        if (const auto * join = element.table_join ? element.table_join->as<ASTTableJoin>() : nullptr)
-        {
-            bool inner = join->kind == JoinKind::Inner || join->kind == JoinKind::Cross || join->kind == JoinKind::Comma;
-            bool all = join->strictness == JoinStrictness::Unspecified || join->strictness == JoinStrictness::All;
-            if (!inner || !all || join->locality == JoinLocality::Global)
-                throwUnsupported("joins other than INNER, CROSS and comma joins");
-        }
-
-        const auto & table_expression = element.table_expression->as<ASTTableExpression &>();
-        if (table_expression.final || table_expression.sample_size || table_expression.stream_settings)
-            throwUnsupported("FINAL, SAMPLE or STREAM");
-        const auto * identifier = table_expression.database_and_table_name ? table_expression.database_and_table_name->as<ASTTableIdentifier>() : nullptr;
-        if (!identifier)
-            throwUnsupported("table functions or subqueries in FROM");
-
-        auto table = DatabaseCatalog::instance().getTable(context->resolveStorageID(identifier->getTableId()), context);
-        auto storage = castStorage<MergeTreeData>(table, DeferredTable::Load);
-        if (!storage)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries read only MergeTree tables, but {} has engine {}",
-                table->getStorageID().getNameForLogs(), table->getName());
-        if (storage->merging_params.mode != MergeTreeData::MergingParams::Ordinary)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, whose merges rewrite rows",
-                storage->getStorageID().getNameForLogs());
-        if (!(*storage->getSettings())[MergeTreeSetting::enable_block_number_column])
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Delta queries require table {} to set enable_block_number_column = 1",
-                storage->getStorageID().getNameForLogs());
-        if (!storage->getStorageID().hasUUID())
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries require table {} to have a UUID, as tables of Atomic databases do",
-                storage->getStorageID().getNameForLogs());
-
-        String alias = identifier->tryGetAlias();
-        inputs.push_back({
-            .qualifier = alias.empty() ? identifier->name_parts : std::vector<String>{alias},
-            .key = toString(storage->getStorageID().uuid),
-            .storage = std::move(storage)});
+        for (const auto & argument : function->getArguments().getNodes())
+            splitConjuncts(argument, conjuncts);
     }
-    return inputs;
+    else
+        conjuncts.push_back(node);
+}
+
+/// The edges of the top-level conjuncts `a.x = b.y` of `conditions` that equate columns of two different inputs.
+///
+/// The semi-join reduction rewrites `a.x = b.y` into `b.y IN (SELECT x FROM a ...)`. `IN` casts `b.y` to the type of `x`
+/// and looks it up by its binary representation. That lookup can disagree with `=`. For example, `-0.0 = 0.0` is true and
+/// `-0.0 IN (SELECT 0.0)` is false. So only integer and string columns of one type count as join keys.
+std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions, const InputIndexes & input_indexes)
+{
+    QueryTreeNodes conjuncts;
+    for (const auto & condition : conditions)
+        splitConjuncts(condition, conjuncts);
+
+    std::vector<SemiJoinEdge> edges;
+    for (const auto & conjunct : conjuncts)
+    {
+        const auto * function = conjunct->as<FunctionNode>();
+        if (!function || function->getFunctionName() != "equals" || function->getArguments().getNodes().size() != 2)
+            continue;
+        const auto * a = function->getArguments().getNodes()[0]->as<ColumnNode>();
+        const auto * b = function->getArguments().getNodes()[1]->as<ColumnNode>();
+        if (!a || !b)
+            continue;
+        auto a_input = input_indexes.find(a->getColumnSourceOrNull().get());
+        auto b_input = input_indexes.find(b->getColumnSourceOrNull().get());
+        if (a_input == input_indexes.end() || b_input == input_indexes.end() || a_input->second == b_input->second)
+            continue;
+        auto type = removeLowCardinalityAndNullable(a->getColumnType());
+        if (!type->equals(*removeLowCardinalityAndNullable(b->getColumnType()))
+            || !(type->isValueRepresentedByInteger() || isStringOrFixedString(type)))
+            continue;
+        edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName()});
+        edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName()});
+    }
+    return edges;
 }
 
 /// The parts of one table on this server and the promoters that report the blocks in flight to it.
@@ -307,15 +394,16 @@ Int64 getBound(const std::map<String, Int64> & partitions, const String & partit
     return it == partitions.end() ? 0 : it->second;
 }
 
-ASTPtr makeColumn(const std::vector<String> & qualifier, const String & column)
+/// `qualifier.column`, or `column` for an empty qualifier.
+ASTPtr makeColumn(const String & qualifier, const String & column)
 {
-    auto parts = qualifier;
-    parts.push_back(column);
-    return make_intrusive<ASTIdentifier>(std::move(parts));
+    if (qualifier.empty())
+        return make_intrusive<ASTIdentifier>(column);
+    return make_intrusive<ASTIdentifier>(std::vector<String>{qualifier, column});
 }
 
 /// `transform(_partition_id, ids, bounds, 0)`, the bound of the partition of the row. A missing partition has bound 0.
-ASTPtr makeBound(const std::vector<String> & qualifier, const std::map<String, Int64> & partitions)
+ASTPtr makeBound(const String & qualifier, const std::map<String, Int64> & partitions)
 {
     Array ids;
     Array bounds;
@@ -334,7 +422,15 @@ ASTPtr makeBound(const std::vector<String> & qualifier, const std::map<String, I
 /// Conjuncts that keep the rows of an input with `lower` <= `_block_number` < `upper`, where a null `lower` keeps every row
 /// below `upper`. The conjuncts on `mergeTreePartInfo(_part)` depend only on the part, so they skip the parts outside the
 /// bounds before reading them.
-void addBounds(ASTs & conjuncts, const std::vector<String> & qualifier, const std::map<String, Int64> * lower,
+/// XCR review-bar: Preserve the original query's column-grant requirements when adding these bounds. A user with
+/// `SELECT(k, public)` on `t` can run `SELECT t.public FROM t JOIN u ON t.k = u.k`, but its `deltaQuery` fails with
+/// `ACCESS_DENIED` until granted `SELECT(_block_number, _partition_id, _part)` too. The single-table case fails as well.
+/// Don't require grants on implementation-only virtual columns that the user's query doesn't read.
+///
+/// aide on behalf of mjarrett: Declined. Skipping the check for these columns would need the planner to know which
+/// columns of a query the rewrite generated, and the delta runs as a plain query from the table function and from the
+/// refresh's INSERT. The docs of `deltaQuery` and of APPEND INCREMENTAL state the requirement, and 05409 tests it.
+void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
     const std::map<String, Int64> & upper)
 {
     auto part_block = [&](const String & field)
@@ -349,98 +445,6 @@ void addBounds(ASTs & conjuncts, const std::vector<String> & qualifier, const st
         conjuncts.push_back(makeASTFunction("greaterOrEquals", makeColumn(qualifier, "_block_number"), makeBound(qualifier, *lower)));
         conjuncts.push_back(makeASTFunction("greaterOrEquals", part_block("max_block"), makeBound(qualifier, *lower)));
     }
-}
-
-/// A column of one input, like `o.id`.
-struct InputColumn
-{
-    size_t input;
-    String column;
-};
-
-/// The aliases that expressions of Q define. Table aliases are not included.
-void collectExpressionAliases(const IAST & ast, std::unordered_set<String> & aliases)
-{
-    if (ast.as<ASTTableExpression>())
-        return;
-    if (auto alias = ast.tryGetAlias(); !alias.empty())
-        aliases.insert(alias);
-    for (const auto & child : ast.children)
-        collectExpressionAliases(*child, aliases);
-}
-
-/// The input column that an identifier like `o.id` in Q names. The analyzer binds `o.id` to an alias `o` or to a column
-/// `o` or `o.id` of any input before it binds `o` as a table qualifier. It also accepts the table name of an input that
-/// has an alias. So this returns nothing unless `o` is the qualifier of exactly one input and names no alias or column.
-std::optional<InputColumn> findInputColumn(
-    const IAST & ast, const std::vector<Input> & inputs, const std::unordered_set<String> & expression_aliases)
-{
-    const auto * identifier = ast.as<ASTIdentifier>();
-    if (!identifier || identifier->name_parts.size() < 2 || expression_aliases.contains(identifier->name_parts[0]))
-        return {};
-    std::vector<String> qualifier(identifier->name_parts.begin(), identifier->name_parts.end() - 1);
-    std::optional<InputColumn> result;
-    for (size_t k = 0; k < inputs.size(); ++k)
-    {
-        auto metadata = inputs[k].storage->getInMemoryMetadataPtr(nullptr, false);
-        if (metadata->getColumns().hasColumnOrNested(GetColumnsOptions::All, qualifier[0]))
-            return {};
-        auto table_id = inputs[k].storage->getStorageID();
-        bool matches = qualifier == inputs[k].qualifier || qualifier == std::vector<String>{table_id.table_name}
-            || qualifier == std::vector<String>{table_id.database_name, table_id.table_name};
-        if (matches && (result || qualifier != inputs[k].qualifier))
-            return {};
-        if (matches)
-            result = InputColumn{k, identifier->name_parts.back()};
-    }
-    return result;
-}
-
-/// The semi-join reduction rewrites `a.x = b.y` into `b.y IN (SELECT x FROM a ...)`. `IN` casts `b.y` to the type of
-/// `x` and looks it up by its binary representation. That lookup can disagree with `=`. For example, `-0.0 = 0.0` is true
-/// and `-0.0 IN (SELECT 0.0)` is false. So only integer and string columns of one type count as join keys.
-bool isSemiJoinKeyPair(const InputColumn & a, const InputColumn & b, const std::vector<Input> & inputs)
-{
-    auto get_type = [&](const InputColumn & column) -> DataTypePtr
-    {
-        auto metadata = inputs[column.input].storage->getInMemoryMetadataPtr(nullptr, false);
-        auto name_and_type = metadata->getColumns().tryGetColumn(GetColumnsOptions::AllPhysicalAndAliases, column.column);
-        return name_and_type ? removeLowCardinalityAndNullable(name_and_type->type) : nullptr;
-    };
-    auto a_type = get_type(a);
-    auto b_type = get_type(b);
-    return a_type && b_type && a_type->equals(*b_type) && (a_type->isValueRepresentedByInteger() || isStringOrFixedString(a_type));
-}
-
-/// The top-level conjuncts of ON and WHERE that equate join keys of two different inputs, like `q.order_id = o.id`.
-/// Queries with ARRAY JOIN have none, because ARRAY JOIN without an alias replaces a column by its elements.
-std::vector<std::array<InputColumn, 2>> collectJoinEqualities(const ASTSelectQuery & select, const std::vector<Input> & inputs)
-{
-    ASTs conjuncts;
-    splitConjunctionsAst(select.where(), conjuncts);
-    for (const auto & child : select.tables()->children)
-    {
-        const auto & element = child->as<ASTTablesInSelectQueryElement &>();
-        if (element.array_join)
-            return {};
-        if (const auto * join = element.table_join ? element.table_join->as<ASTTableJoin>() : nullptr)
-            splitConjunctionsAst(join->on_expression, conjuncts);
-    }
-    std::unordered_set<String> expression_aliases;
-    collectExpressionAliases(select, expression_aliases);
-
-    std::vector<std::array<InputColumn, 2>> equalities;
-    for (const auto & conjunct : conjuncts)
-    {
-        const auto * function = conjunct->as<ASTFunction>();
-        if (!function || function->name != "equals" || !function->arguments || function->arguments->children.size() != 2)
-            continue;
-        auto left = findInputColumn(*function->arguments->children[0], inputs, expression_aliases);
-        auto right = findInputColumn(*function->arguments->children[1], inputs, expression_aliases);
-        if (left && right && left->input != right->input && isSemiJoinKeyPair(*left, *right, inputs))
-            equalities.push_back({*left, *right});
-    }
-    return equalities;
 }
 
 /// `(SELECT column FROM input WHERE where)`
@@ -464,18 +468,43 @@ ASTPtr makeSemiJoinSubquery(const Input & input, const String & column, ASTPtr w
 }
 
 DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context)
-    : query(query_->clone())
 {
-    const auto & select = getSingleSelect(query->as<ASTSelectWithUnionQuery &>());
-    inputs = collectInputs(select, context);
-    const bool is_join = inputs.size() > 1;
-    checkExpression(select, is_join);
-    if (is_join)
-        checkJoinClauses(select);
+    InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
+    auto query_tree = interpreter.getQueryTree()->clone();
 
-    InterpreterSelectQueryAnalyzer interpreter(query, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
+    /// Aliases and columns of the query can shadow the names of its tables. So the bounds qualify the columns of each table
+    /// by its unique alias `__tableN`.
+    createUniqueAliasesIfNecessary(query_tree, context);
+    const auto * query_node = query_tree->as<QueryNode>();
+    if (!query_node)
+        throwUnsupported("UNION");
+
+    QueryTreeNodes tables;
+    QueryTreeNodes conditions;
+    collectJoinTree(query_node->getJoinTreeNode(), tables, conditions);
+    InputIndexes input_indexes;
+    for (const auto & table : tables)
+    {
+        input_indexes.emplace(table.get(), inputs.size());
+        inputs.push_back(makeInput(table->as<TableNode &>()));
+    }
+
+    const bool is_join = inputs.size() > 1;
+    checkExpressions(*query_tree, input_indexes, is_join);
     if (is_join)
-        checkResultColumns(interpreter.getQueryTree()->as<QueryNode &>());
+    {
+        checkJoinClauses(*query_node);
+        checkResultColumns(*query_node);
+    }
+
+    if (query_node->hasWhere())
+        conditions.push_back(query_node->getWhere());
+    semi_join_edges = collectSemiJoinEdges(conditions, input_indexes);
+    query = query_tree->toAST();
+
+    /// Resolution checks only that the user can see the tables. Building the plan checks the grants on the columns that
+    /// the query reads.
+    interpreter.getSampleBlock();
 }
 
 DeltaQuery::~DeltaQuery() = default;
@@ -534,12 +563,11 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         }
     }
 
-    const auto & select = getSingleSelect(query->as<ASTSelectWithUnionQuery &>());
-    const auto equalities = collectJoinEqualities(select, inputs);
+    const auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
     auto terms = make_intrusive<ASTExpressionList>();
     for (size_t i = 0; i < inputs.size(); ++i)
     {
-        auto add_bounds = [&](ASTs & conjuncts, size_t j, const std::vector<String> & qualifier)
+        auto add_bounds = [&](ASTs & conjuncts, size_t j, const String & qualifier)
         {
             const auto & key = inputs[j].key;
             if (j < i)
@@ -554,7 +582,7 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         if (auto where = select.where())
             conjuncts.push_back(where->clone());
         for (size_t j = 0; j < inputs.size(); ++j)
-            add_bounds(conjuncts, j, inputs[j].qualifier);
+            add_bounds(conjuncts, j, inputs[j].alias);
 
         /// Each subquery reads one table and defines no aliases, so its unqualified columns name columns of that table.
         /// `reductions[j]` is the reduction of input j with unqualified columns, for the subqueries of later hops.
@@ -566,24 +594,21 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         {
             size_t from = queue.front();
             queue.pop_front();
-            for (const auto & equality : equalities)
-                for (size_t side : {0, 1})
-                {
-                    const auto & [a, x] = equality[side];
-                    const auto & [b, y] = equality[1 - side];
-                    if (a != from || reached[b])
-                        continue;
-                    reached[b] = true;
-                    queue.push_back(b);
+            for (const auto & [a, x, b, y] : semi_join_edges)
+            {
+                if (a != from || reached[b])
+                    continue;
+                reached[b] = true;
+                queue.push_back(b);
 
-                    ASTs where;
-                    add_bounds(where, a, {});
-                    if (reductions[a])
-                        where.push_back(reductions[a]->clone());
-                    auto subquery = makeSemiJoinSubquery(inputs[a], x, makeASTFunction("and", std::move(where)));
-                    reductions[b] = makeASTFunction("in", make_intrusive<ASTIdentifier>(y), subquery->clone());
-                    conjuncts.push_back(makeASTFunction("in", makeColumn(inputs[b].qualifier, y), std::move(subquery)));
-                }
+                ASTs where;
+                add_bounds(where, a, "");
+                if (reductions[a])
+                    where.push_back(reductions[a]->clone());
+                auto subquery = makeSemiJoinSubquery(inputs[a], x, makeASTFunction("and", std::move(where)));
+                reductions[b] = makeASTFunction("in", make_intrusive<ASTIdentifier>(y), subquery->clone());
+                conjuncts.push_back(makeASTFunction("in", makeColumn(inputs[b].alias, y), std::move(subquery)));
+            }
         }
 
         auto term = select.clone();

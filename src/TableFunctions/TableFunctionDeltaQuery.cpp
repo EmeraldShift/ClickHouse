@@ -144,6 +144,9 @@ of the partition that the cursor excludes. An empty map is the cursor before any
 The tables must be `MergeTree` or `ReplicatedMergeTree` tables of Atomic databases with `enable_block_number_column = 1`, without mutations
 or lightweight updates. A query that joins tables may use filters, `INNER` and `CROSS` joins, and `GROUP BY`. Each of its result columns is
 either free of aggregates or one call of `sum`, `count`, their `-If` forms, or any `-State` aggregate.
+
+Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
+the tables of `query`.
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction}, SecretArgumentsSpec{}, {.allow_readonly = true});
 
     factory.registerFunction<TableFunctionDeltaQueryFrontier>({.description = R"DOCS_MD(

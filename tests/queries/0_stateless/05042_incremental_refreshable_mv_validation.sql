@@ -44,6 +44,12 @@ CREATE MATERIALIZED VIEW val_mv_left_join
     TO val_tgt EMPTY
     AS SELECT s.k, s.v FROM val_src s LEFT JOIN val_dim d ON s.k = d.k; -- { serverError NOT_IMPLEMENTED }
 
+-- An unspecified strictness that `join_default_strictness` makes ANY is rejected too.
+CREATE MATERIALIZED VIEW val_mv_any_join
+    REFRESH EVERY 10 YEAR APPEND INCREMENTAL
+    TO val_tgt EMPTY
+    AS SELECT s.k, s.v FROM val_src s JOIN val_dim d ON s.k = d.k SETTINGS join_default_strictness = 'ANY'; -- { serverError NOT_IMPLEMENTED }
+
 -- A subquery is rejected: the cursor covers only the tables of the FROM clause.
 CREATE MATERIALIZED VIEW val_mv_subquery
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL

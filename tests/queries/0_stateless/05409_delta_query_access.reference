@@ -1,6 +1,13 @@
-Without SELECT
+Without grants
 ACCESS_DENIED
 ACCESS_DENIED
+With SHOW COLUMNS
+ACCESS_DENIED
+With SELECT(k)
+{'uuid.all.block_number':2}
+ACCESS_DENIED
+ACCESS_DENIED
+With SELECT(k) and the virtual columns
+1
 With SELECT
 {'uuid.all.block_number':2}
-1

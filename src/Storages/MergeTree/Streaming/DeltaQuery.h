@@ -23,7 +23,7 @@ namespace DB
 class DeltaQuery
 {
 public:
-    /// Throws unless `query` is supported. Resolving `query` also checks the grants of `context` on its tables.
+    /// Throws unless `query` is supported and the grants of `context` allow running it.
     DeltaQuery(const ASTPtr & query, const ContextPtr & context);
     ~DeltaQuery();
 
@@ -35,10 +35,13 @@ public:
     ASTPtr buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
 
     struct Input;
+    struct SemiJoinEdge;
 
 private:
+    /// The resolved query, whose tables have unique aliases.
     ASTPtr query;
     std::vector<Input> inputs;
+    std::vector<SemiJoinEdge> semi_join_edges;
 };
 
 }

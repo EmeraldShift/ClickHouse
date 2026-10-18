@@ -8,6 +8,8 @@ CREATE TABLE no_block_number (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS e
 CREATE TABLE replacing (k UInt64) ENGINE = ReplacingMergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
 CREATE TABLE mutated (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
 CREATE TABLE memory (k UInt64) ENGINE = Memory;
+CREATE TABLE sampled (k UInt64) ENGINE = MergeTree ORDER BY k SAMPLE BY k SETTINGS enable_block_number_column = 1;
+CREATE TABLE shadowing (k UInt64, _part String) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
 INSERT INTO mutated VALUES (1), (2);
 ALTER TABLE mutated DELETE WHERE k = 1 SETTINGS mutations_sync = 2;
 
@@ -30,11 +32,14 @@ SELECT * FROM deltaQueryFrontier((SELECT k FROM (SELECT k FROM t))); -- { server
 SELECT * FROM deltaQueryFrontier((SELECT number FROM numbers(1))); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT t.k FROM t LEFT JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT t.k FROM t ANY INNER JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT k FROM t FINAL)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT t.k FROM t INNER JOIN u ON t.k = u.k SETTINGS join_default_strictness = 'ANY')); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM t WHERE (k, v) IN u)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM sampled SAMPLE 1 / 2)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM memory)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM replacing)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM no_block_number)); -- { serverError BAD_ARGUMENTS }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM mutated)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM shadowing)); -- { serverError NOT_IMPLEMENTED }
 
 -- Accepted result columns of joins.
 SELECT * FROM deltaQueryFrontier((SELECT sum(v), count(), sumIf(v, v > 0), countIf(v > 0), avgState(v), uniqState(t.k) FROM t JOIN u ON t.k = u.k)) FORMAT Null;
