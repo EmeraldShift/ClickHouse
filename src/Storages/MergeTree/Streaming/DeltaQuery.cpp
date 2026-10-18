@@ -86,9 +86,9 @@ struct DeltaQuery::Input
     /// The columns of the table in the equalities of the ON clause, if the table is the right side of a LEFT, SEMI, ANTI or
     /// ASOF join. Such a join isn't linear in the table. A new row of the table changes the result for every left row of
     /// its join keys, see `buildDelta`.
-    Names join_keys;
+    Names join_keys = {};
     /// The columns of such a table that the query reads.
-    Names columns;
+    Names columns = {};
 };
 
 /// An equality `from.from_column = to.to_column` between join keys of two inputs. The semi-join reduction follows it from
@@ -1023,14 +1023,6 @@ bool dropsRowsForGood(ASTSelectQuery & select, bool with_fill)
         || ((comparison->name == "greaterOrEquals" || comparison->name == "greater") && is_rank(arguments[1]) && arguments[0]->as<ASTLiteral>());
 }
 
-ASTs cloneAll(const ASTs & asts)
-{
-    ASTs result;
-    for (const auto & ast : asts)
-        result.push_back(ast->clone());
-    return result;
-}
-
 /// Splits the resolved `select` of `query` into its core, which it returns, and the residual, which it fills in.
 ///
 /// The keys of the core are the GROUP BY keys, or else the columns that the residual reads. The core selects the keys as
@@ -1326,14 +1318,14 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     /// The query can set `delta_query_sign_column` in its SETTINGS, as the query of a view does.
     auto context = Context::createCopy(context_);
     InterpreterSetQuery::applySettingsFromQuery(query_, context);
-    const String sign_column = context->getSettingsRef()[Setting::delta_query_sign_column];
+    const String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
 
     Residual split;
-    split.sign_column = sign_column;
-    auto core = analyze(query_, context, sign_column, sign_column.empty() ? nullptr : &split);
+    split.sign_column = sign_column_setting;
+    auto core = analyze(query_, context, sign_column_setting, sign_column_setting.empty() ? nullptr : &split);
     if (!core)
         return;
-    analyze(core, context, sign_column, nullptr);
+    analyze(core, context, sign_column_setting, nullptr);
     auto core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
 
     /// A sum of Nullable values is NULL over rows whose values are all NULL, but the merged sum of the rows and their
@@ -1357,7 +1349,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     }
     if (added_counts)
     {
-        analyze(core, context, sign_column, nullptr);
+        analyze(core, context, sign_column_setting, nullptr);
         core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
     }
 
@@ -1388,7 +1380,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     }
 
     /// The residual over an empty integral has the types of the rows that the residual deltas insert.
-    split.output_query = parseSelect(fmt::format("SELECT *, toInt8(1) AS {} FROM ({})", backQuote(sign_column),
+    split.output_query = parseSelect(fmt::format("SELECT *, toInt8(1) AS {} FROM ({})", backQuote(sign_column_setting),
         split.buildResidual(split.buildInput(fmt::format("null({})", quoteString(joinNames(structure))), ""))));
     for (const auto & column : *InterpreterSelectQueryAnalyzer::getSampleBlock(split.output_query, context))
         if (WhichDataType(column.type).isAggregateFunction())
@@ -1414,7 +1406,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
             throwUnsupported("now() outside WHERE");
     }
     /// Resolution folds now() into a constant, and its source expression keeps the call.
-    IQueryTreeNode::ConvertToASTOptions ast_options;
+    ConvertToASTOptions ast_options;
     ast_options.use_source_expression_for_constants = has_clock;
     InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     auto query_tree = interpreter.getQueryTree()->clone();
@@ -1572,7 +1564,10 @@ DeltaQuery::~DeltaQuery() = default;
 
 ASTPtr DeltaQuery::getQuery() const
 {
-    return residual ? residual->output_query : query;
+    /// The weights of the query read `__term_sign`, which each term of a delta binds. The query itself is one term of sign 1.
+    auto result = (residual ? residual->output_query : query)->clone();
+    bindTerm(*result, 1, {});
+    return result;
 }
 
 String DeltaQuery::Residual::buildInput(const String & integral, const String & where) const
@@ -1667,10 +1662,8 @@ String DeltaQuery::getIntegralCreateQuery(const StorageID & integral) const
     for (size_t i = 0; i < residual->num_keys; ++i)
         if (std::ranges::find(residual->partition_keys, i) == residual->partition_keys.end())
             order.push_back(backQuote(makeKeyName(i)));
-    /// A group whose rows are all retracted has count 0, and merges delete it.
-    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {}{} SETTINGS allow_nullable_key = 1",
-        integral.getFullTableName(), quoteString(toString(integral.uuid)), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")",
-        residual->num_keys ? " TTL toDateTime(0) DELETE WHERE `__agg_0` = 0" : "");
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} SETTINGS allow_nullable_key = 1",
+        integral.getFullTableName(), quoteString(toString(integral.uuid)), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
 }
 
 /// The residual over the touched keys counts each of its rows once, and the target counts each of its rows of those keys by

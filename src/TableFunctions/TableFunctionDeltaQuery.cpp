@@ -55,12 +55,7 @@ protected:
         const IAST * query = num_arguments ? function.arguments->children[0].get() : nullptr;
         if (const auto * subquery = query ? query->as<ASTSubquery>() : nullptr)
             query = subquery->children.at(0).get();
-        const auto * union_query = query ? query->as<ASTSelectWithUnionQuery>() : nullptr;
-        if (!union_query || !std::ranges::all_of(union_query->list_of_selects->children, [](const auto & select)
-            {
-                const auto * select_query = select->template as<ASTSelectQuery>();
-                return select_query && select_query->select();
-            }))
+        if (!query || !query->as<ASTSelectWithUnionQuery>())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table function '{}' requires a query as its first argument", getName());
         if (num_arguments != 1 + numCursorArguments())
             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Table function '{}' takes a query and {} cursors",

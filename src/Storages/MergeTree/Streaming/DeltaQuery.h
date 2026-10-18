@@ -1,5 +1,6 @@
 #pragma once
 
+#include <Core/Names.h>
 #include <Core/Streaming/CursorTree.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>

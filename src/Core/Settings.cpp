@@ -10790,7 +10790,7 @@ A query with this setting can also have `LEFT`, `SEMI`, `ANTI` and `ASOF` joins 
 The empty string, the default, makes no input signed.
 )", EXPERIMENTAL, \
         {"26.11", "", "", "New setting for delta queries over inputs whose rows have signs."}) \
-    DECLARE(Float, delta_query_residual_full_recompute_ratio, 0.2, R"(
+    DECLARE(Float, delta_query_residual_full_recompute_ratio, 0.25, R"(
 In an incremental refreshable materialized view whose residual compares rows only within the values of some keys, like `HAVING`, `LIMIT BY` or a window with `PARTITION BY`, a refresh recomputes the residual for all keys instead of only the touched keys when the rows of the delta exceed this fraction of the rows of the hidden table that holds the `GROUP BY` keys and the merged aggregates. Both give the same result. A value of 1 or more always recomputes only the touched keys.
 )", EXPERIMENTAL, \
         {"26.11", 0.2, 0.2, "New setting for incremental refreshable materialized views."}) \
