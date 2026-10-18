@@ -113,6 +113,9 @@ struct RangesInDataPart
     size_t part_starting_offset_in_query;
     MarkRanges ranges;
     MarkRanges exact_ranges;
+    /// For each conjunct of `ReadFromMergeTree::AnalysisResult::conjuncts`, the ranges where the conjunct is true on every
+    /// row. Index analysis fills them.
+    std::vector<MarkRanges> exact_ranges_by_conjunct;
     /// For each condition of `MergeTreeSelectProcessor::getPrewhereConditions`, the ranges where the condition is true on
     /// every row.
     std::vector<MarkRanges> exact_ranges_by_condition;

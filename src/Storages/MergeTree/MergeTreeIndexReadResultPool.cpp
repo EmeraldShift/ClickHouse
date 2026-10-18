@@ -185,6 +185,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
                     /*part_offset_condition=*/nullptr,
                     /*total_offset_condition=*/nullptr,
                     /*exact_ranges=*/nullptr,
+                    /*conjunct_exact_ranges=*/nullptr,
                     /*pk_to_minmax_slot=*/nullptr,
                     context->getSettingsRef(),
                     log);

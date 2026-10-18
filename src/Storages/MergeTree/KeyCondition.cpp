@@ -1646,6 +1646,10 @@ KeyCondition::KeyCondition(
     for (size_t i = 0; i < rpn.size(); ++i)
         rpn[i].position_in_filter_rpn = i;
 
+    for (const auto & [start, end] : topLevelConjunction())
+        conjunct_positions.push_back(end - 1);
+    std::ranges::sort(conjunct_positions);
+
     findHyperrectanglesForArgumentsOfSpaceFillingCurves();
 }
 
@@ -6871,7 +6875,8 @@ Truth KeyCondition::checkBoundsInRange(
     const FieldRef * right_keys,
     const DataTypes & data_types,
     const Truth & need,
-    const Hyperrectangle * key_bounds) const
+    const Hyperrectangle * key_bounds,
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
     chassert(key_order.compareTuples(left_keys, right_keys, used_key_size) <= 0);
 
@@ -6883,7 +6888,7 @@ Truth KeyCondition::checkBoundsInRange(
     return forAnyHyperrectangle(used_key_size, left_keys, right_keys, true, true, key_ranges, data_types, key_order, 0, need, key_bounds,
         [&] (const Hyperrectangle & key_ranges_hyperrectangle)
     {
-        return checkBoundsInHyperrectangle(key_ranges_hyperrectangle, data_types);
+        return checkBoundsInHyperrectangle(key_ranges_hyperrectangle, data_types, {}, update_partial_disjunction_result_fn);
     });
 }
 
@@ -6909,7 +6914,8 @@ Truth KeyCondition::checkBoundsInRange(
     const DataTypes & sparse_data_types,
     const std::vector<UInt8> & equal_boundaries_mask,
     const Truth & need,
-    const Hyperrectangle * key_bounds) const
+    const Hyperrectangle * key_bounds,
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
     const size_t sparse_keys_size = sparse_key_indices.size();
 
@@ -6971,7 +6977,7 @@ Truth KeyCondition::checkBoundsInRange(
         {
             return checkBoundsInHyperrectangle(
                 key_col_to_sparse_pos, key_ranges_hyperrectangle, sparse_data_types,
-                /*num_refinable_key_columns=*/ enumerated_key_prefix_size);
+                /*num_refinable_key_columns=*/ enumerated_key_prefix_size, update_partial_disjunction_result_fn);
         });
 }
 
@@ -8214,7 +8220,8 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
     const std::vector<int> & key_col_to_sparse_pos,
     const Hyperrectangle & sparse_hyperrectangle,
     const DataTypes & sparse_data_types,
-    size_t num_refinable_key_columns) const
+    size_t num_refinable_key_columns,
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
     /// The other key columns have the same range on every range the caller checks. A key column that the part doesn't load
     /// in memory is one. Only the partition minmax index bounds it, for the whole part.
@@ -8678,12 +8685,19 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
             rpn_stack.back() = rpn_stack.back().fixed();
     };
 
+    /// An element is reported as unknown if every value can be on the range.
     for (const auto & element : rpn)
     {
         if (element.function == RPNElement::FUNCTION_ATOM_GROUP)
             pushAtomGroupTruth(element, apply_atom, rpn_stack);
         else
             apply_atom(element);
+
+        if (update_partial_disjunction_result_fn && element.position_in_filter_rpn)
+        {
+            const BoolMask mask = rpn_stack.back().mask();
+            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, mask, mask.can_be_true && mask.can_be_false);
+        }
     }
 
     if (rpn_stack.size() != 1)

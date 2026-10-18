@@ -54,6 +54,47 @@ public:
         boost::dynamic_bitset<> bits;
     };
 
+    /// Finds the ranges where conjuncts of the filter are true on every row from the masks that a condition reports, see
+    /// `KeyCondition::UpdatePartialDisjunctionResultFn`. A condition rewrites each conjunct into one or more leaves of its
+    /// top-level `AND`. A conjunct is true on every row of a checked range if each of its leaves is reported true on every
+    /// row in every report of the check.
+    class ConjunctExactRanges
+    {
+    public:
+        /// `leaf_positions` are the `KeyCondition::getConjunctPositions` of the checked condition, and `conjunct_of_leaf` gives
+        /// the conjunct of each leaf, see `ReadFromMergeTree::Indexes`. The ranges of conjunct `i` are added to
+        /// `exact_ranges_by_conjunct[i]`. Constant folding for a part can replace several leaves with one constant. If the
+        /// condition has a different number of leaves, `report` is empty and no ranges are added.
+        ConjunctExactRanges(
+            const std::vector<size_t> & leaf_positions,
+            const std::vector<size_t> & conjunct_of_leaf_,
+            std::vector<MarkRanges> & exact_ranges_by_conjunct_);
+
+        ConjunctExactRanges(const ConjunctExactRanges &) = delete;
+        ConjunctExactRanges & operator=(const ConjunctExactRanges &) = delete;
+
+        /// The function to pass to a check.
+        const KeyCondition::UpdatePartialDisjunctionResultFn & report() const { return report_fn; }
+
+        /// Ends the check of `range`. A check of a range of keys may stop before it reports every hyperrectangle if its
+        /// truth covers its `need` (see `Truth::covers`). Then `complete` is false, and no ranges are added.
+        void endCheck(const MarkRange & range, bool complete);
+
+        /// Sorts the ranges of each conjunct and merges the ranges that intersect or touch.
+        static void normalize(std::vector<MarkRanges> & exact_ranges_by_conjunct);
+
+    private:
+        static constexpr size_t no_leaf = std::numeric_limits<size_t>::max();
+
+        const std::vector<size_t> & conjunct_of_leaf;
+        std::vector<MarkRanges> & exact_ranges_by_conjunct;
+        std::vector<size_t> leaf_of_position;
+        /// Whether each leaf was reported, and whether it was reported true on every row in every report of the check.
+        std::vector<UInt8> reported;
+        std::vector<UInt8> always_true;
+        KeyCondition::UpdatePartialDisjunctionResultFn report_fn;
+    };
+
     explicit MergeTreeDataSelectExecutor(const MergeTreeData & data_, ProjectionDescriptionRawPtr projection_ = nullptr);
 
     /** When reading, selects a set of parts that covers the desired range of the index.
@@ -113,6 +154,8 @@ public:
         /// every other caller runs before `tryOptimizeTopK` and keeps the conservative default.
         bool allow_top_k_prewhere_query_condition_cache = false) const;
 
+    /// If `exact_ranges` is not null, fill it with the ranges where the filter is true on every row. If
+    /// `conjunct_exact_ranges` is not null, the checks of `key_condition` report to it.
     static MarkRanges markRangesFromPKRange(
         const MergeTreeData::DataPartPtr & part,
         const MarkRanges & part_ranges,
@@ -122,6 +165,7 @@ public:
         const KeyCondition * part_offset_condition,
         const KeyCondition * total_offset_condition,
         MarkRanges * exact_ranges,
+        ConjunctExactRanges * conjunct_exact_ranges,
         const std::vector<std::optional<size_t>> * pk_to_minmax_slot,
         const Settings & settings,
         LoggerPtr log);
@@ -133,9 +177,13 @@ public:
         const KeyCondition * part_offset_condition,
         const KeyCondition * total_offset_condition,
         MarkRanges * exact_ranges,
+        ConjunctExactRanges * conjunct_exact_ranges,
         const std::vector<std::optional<size_t>> * pk_to_minmax_slot,
         const Settings & settings,
         LoggerPtr log);
+
+    /// The marks in both sorted lists of disjoint ranges.
+    static MarkRanges intersectRanges(const MarkRanges & left, const MarkRanges & right);
 
     /// If `exact_ranges` is not null, fill it with the ranges of the granules where the condition is true on every row.
     static std::pair<MarkRanges, RangesInDataPartReadHints> filterMarksUsingIndex(
@@ -204,6 +252,7 @@ private:
         const ConditionTemplate<KeyCondition>::Ptr & minmax_idx_condition,
         const DataTypes & minmax_columns_types,
         const std::optional<PartitionPruner> & partition_pruner,
+        const std::vector<size_t> & conjunct_of_leaf,
         const PartitionIdToMaxBlock * max_block_numbers_to_read,
         PartFilterCounters & counters,
         QueryStatusPtr query_status);
@@ -264,6 +313,7 @@ public:
         const std::optional<PartitionPruner> & partition_pruner,
         const ConditionTemplate<KeyCondition>::Ptr & minmax_idx_condition,
         const std::optional<std::unordered_set<String>> & part_values,
+        const std::vector<size_t> & conjunct_of_leaf,
         const StorageMetadataPtr & metadata_snapshot,
         const MergeTreeData & data,
         const ContextPtr & context,

@@ -31,8 +31,11 @@ public:
     bool canPartitionBePruned(const IMergeTreeDataPart & part) const;
 
     /// The truth of the predicate on the rows of the part's partition. The part is pruned if `is_true` is `Never`, and the
-    /// predicate accepts every row of the part if `is_true` is `Always`.
-    Truth checkPartition(const IMergeTreeDataPart & part) const;
+    /// predicate accepts every row of the part if `is_true` is `Always`. The check reports the elements to
+    /// `update_partial_disjunction_result_fn` if it is set.
+    Truth checkPartition(
+        const IMergeTreeDataPart & part,
+        const KeyCondition::UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
 
     bool isUseless() const { return useless; }
 

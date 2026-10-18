@@ -123,23 +123,6 @@ void fillRequiredColumns(
         node_info.may_throw = true;
 }
 
-/// Appends the conditions combined with AND into `atoms`, descending into nested AND nodes.
-/// The order of the original conditions is preserved: `and(A, and(B, C))` yields `A, B, C`.
-/// ActionsDAG::extractConjunctionAtoms is not reused here because it walks with a stack and thus
-/// reverses sibling order, while the step boundaries below and the evaluation order promised for a
-/// user written PREWHERE both depend on the original order.
-void flattenConjunction(const ActionsDAG::Node * node, ActionsDAG::NodeRawConstPtrs & atoms)
-{
-    if (node->type == ActionsDAG::ActionType::FUNCTION && node->function_base && node->function_base->getName() == "and")
-    {
-        for (const auto * child : node->children)
-            flattenConjunction(child, atoms);
-        return;
-    }
-
-    atoms.push_back(node);
-}
-
 /// Appends the INPUT nodes of the sub-DAG rooted at `node` to `inputs`, each at most once.
 void collectInputNodes(
     const ActionsDAG::Node * node,
@@ -257,6 +240,18 @@ const ActionsDAG::Node & addFunction(
     return new_node;
 }
 
+}
+
+void flattenConjunction(const ActionsDAG::Node * node, ActionsDAG::NodeRawConstPtrs & atoms)
+{
+    if (node->type == ActionsDAG::ActionType::FUNCTION && node->function_base && node->function_base->getName() == "and")
+    {
+        for (const auto * child : node->children)
+            flattenConjunction(child, atoms);
+        return;
+    }
+
+    atoms.push_back(node);
 }
 
 std::optional<ActionsDAG::NodeRawConstPtrs> getSplitPrewhereConditions(const PrewhereInfo & prewhere_info)

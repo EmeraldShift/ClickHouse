@@ -36,10 +36,11 @@ bool PartitionPruner::canPartitionBePruned(const IMergeTreeDataPart & part) cons
     return checkPartition(part).is_true.level() == Side::Never;
 }
 
-Truth PartitionPruner::checkPartition(const IMergeTreeDataPart & part) const
+Truth PartitionPruner::checkPartition(
+    const IMergeTreeDataPart & part, const KeyCondition::UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
     const auto & partition_id = part.info.getPartitionId();
-    if (auto it = partition_truth_map.find(partition_id); it != partition_truth_map.end())
+    if (auto it = partition_truth_map.find(partition_id); it != partition_truth_map.end() && !update_partial_disjunction_result_fn)
         return it->second;
 
     const auto & partition_value = part.partition.value;
@@ -52,7 +53,8 @@ Truth PartitionPruner::checkPartition(const IMergeTreeDataPart & part) const
     }
 
     const auto truth = partition_condition.checkBoundsInRange(
-        partition_value.size(), index_value.data(), index_value.data(), partition_key.data_types);
+        partition_value.size(), index_value.data(), index_value.data(), partition_key.data_types, /*need=*/ {},
+        /*key_bounds=*/ nullptr, update_partial_disjunction_result_fn);
     partition_truth_map.emplace(partition_id, truth);
 
     if (truth.is_true.level() == Side::Never)

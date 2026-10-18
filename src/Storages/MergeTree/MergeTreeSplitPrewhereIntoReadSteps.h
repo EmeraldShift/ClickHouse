@@ -17,6 +17,13 @@ class ColumnsDescription;
 struct IndexReadTask;
 using IndexReadTasks = std::map<String, IndexReadTask>;
 
+/// Appends the conditions combined with AND into `atoms`, descending into nested AND nodes.
+/// The order of the original conditions is preserved: `and(A, and(B, C))` yields `A, B, C`.
+/// ActionsDAG::extractConjunctionAtoms is not reused here because it walks with a stack and thus
+/// reverses sibling order, while the step boundaries of `tryBuildPrewhereSteps` and the evaluation order promised for a
+/// user written PREWHERE both depend on the original order.
+void flattenConjunction(const ActionsDAG::Node * node, ActionsDAG::NodeRawConstPtrs & atoms);
+
 /// The conditions combined with AND into the PREWHERE, evaluated in steps by `tryBuildPrewhereSteps`. Unset if the
 /// PREWHERE is not split into steps.
 std::optional<ActionsDAG::NodeRawConstPtrs> getSplitPrewhereConditions(const PrewhereInfo & prewhere_info);

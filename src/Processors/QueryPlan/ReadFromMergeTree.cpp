@@ -71,6 +71,7 @@
 #include <Storages/MergeTree/MergeTreeReadPoolProjectionIndex.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/MergeTreeSource.h>
+#include <Storages/MergeTree/MergeTreeSplitPrewhereIntoReadSteps.h>
 #include <Storages/MergeTree/RuntimeFilterReadRangesRefiner.h>
 #include <Storages/MergeTree/SealGatedReadTransform.h>
 #include <Processors/Transforms/CopyTransform.h>
@@ -3053,70 +3054,52 @@ RangesInDataParts ReadFromMergeTree::filterPartsForStatistics(
     /// Execution checks forced index usage after it builds subquery sets.
     return MergeTreeDataSelectExecutor::filterPartsByPartition(
         parts, partition_indexes.partition_pruner, partition_indexes.minmax_idx_condition,
-        std::nullopt, metadata_snapshot, data, query_context, nullptr, getLogger("ReadFromMergeTree"), unused_stats,
+        std::nullopt, /*conjunct_of_leaf=*/ {}, metadata_snapshot, data, query_context, nullptr, getLogger("ReadFromMergeTree"), unused_stats,
         /* check_index_usage */ false);
 }
 
-ConditionTemplate<KeyCondition>::Ptr ReadFromMergeTree::buildPrimaryKeyCondition(
-    const std::shared_ptr<ActionsDAGWithInversionPushDown> & filter_dag_ptr,
-    const ContextPtr & query_context,
-    const StorageMetadataPtr & metadata_snapshot,
-    bool skip_constant_folding)
-{
-    auto key_condition_factory = [query_context, metadata_snapshot](const ActionsDAG *, const ActionsDAG::Node * predicate)
-    {
-        ActionsDAGWithInversionPushDown wrapped(predicate, query_context, /* boolean_context */ false);
-        return KeyCondition{wrapped, query_context, metadata_snapshot->getPrimaryKey(), /* single_point_ = */ false, !query_context->getSettingsRef()[Setting::use_primary_key]};
-    };
-    return std::make_shared<ConditionTemplate<KeyCondition>>(filter_dag_ptr, std::move(key_condition_factory), metadata_snapshot, query_context, skip_constant_folding);
-}
-
-void ReadFromMergeTree::findExactRangesByCondition(RangesInDataParts & parts_with_ranges) const
+void ReadFromMergeTree::findExactRangesByCondition(RangesInDataParts & parts_with_ranges, const Names & conjuncts) const
 {
     const auto conditions = MergeTreeSelectProcessor::getPrewhereConditions(
         query_info.row_level_filter, query_info.prewhere_info, reader_settings.enable_multiple_prewhere_read_steps);
-    if (conditions.empty() || parts_with_ranges.empty() || parts_with_ranges.front().data_part->isProjectionPart())
+    if (conditions.empty() || conjuncts.empty())
         return;
 
-    const auto & settings = context->getSettingsRef();
-    const auto & metadata_snapshot = storage_snapshot->metadata;
-    const bool skip_constant_folding = skip_partition_pruning || !settings[Setting::use_constant_folding_in_index_analysis];
-
-    std::vector<Indexes> indexes_by_condition;
+    /// A condition is true on every row where each of its conjuncts is. A condition with a conjunct that index analysis
+    /// didn't see has no ranges.
+    std::vector<std::vector<size_t>> conjuncts_of_condition;
     for (const auto * condition : conditions)
     {
-        auto filter_dag = std::make_shared<ActionsDAGWithInversionPushDown>(condition, context, /* boolean_context */ true);
-        auto & condition_indexes = indexes_by_condition.emplace_back(buildPrimaryKeyCondition(filter_dag, context, metadata_snapshot, skip_constant_folding));
-        buildPartitionPruningIndexes(condition_indexes, filter_dag, data, context, metadata_snapshot, skip_partition_pruning);
+        ActionsDAG::NodeRawConstPtrs condition_conjuncts;
+        flattenConjunction(condition, condition_conjuncts);
+        auto & indices = conjuncts_of_condition.emplace_back();
+        for (const auto * conjunct : condition_conjuncts)
+        {
+            const auto it = std::ranges::find(conjuncts, conjunct->result_name);
+            if (it == conjuncts.end())
+            {
+                indices.clear();
+                break;
+            }
+            indices.push_back(it - conjuncts.begin());
+        }
     }
 
-    const auto minmax_columns_types = MergeTreeData::getMinMaxColumns(metadata_snapshot->getPartitionKey(), data.getSettings()).getTypes();
     for (auto & part : parts_with_ranges)
     {
+        if (part.exact_ranges_by_conjunct.empty())
+            continue;
+
         part.exact_ranges_by_condition.resize(conditions.size());
         for (size_t i = 0; i < conditions.size(); ++i)
         {
-            const auto & condition_indexes = indexes_by_condition[i];
-            Truth part_truth;
-            if (condition_indexes.minmax_idx_condition)
-                part_truth = condition_indexes.minmax_idx_condition->generateForPart(part.data_part).checkBoundsInHyperrectangle(
-                    part.data_part->getMinMaxIndex()->hyperrectangle, minmax_columns_types);
-            if (condition_indexes.partition_pruner)
-                part_truth = Truth::meet(part_truth, condition_indexes.partition_pruner->checkPartition(*part.data_part));
-
-            if (part_truth.is_true.level() == Side::Always)
-                part.exact_ranges_by_condition[i] = part.ranges;
-            else if (metadata_snapshot->hasPrimaryKey())
-                MergeTreeDataSelectExecutor::markRangesFromPKRange(
-                    part,
-                    metadata_snapshot,
-                    condition_indexes.key_condition->generateForPart(part.data_part),
-                    /*part_offset_condition=*/ nullptr,
-                    /*total_offset_condition=*/ nullptr,
-                    &part.exact_ranges_by_condition[i],
-                    /*pk_to_minmax_slot=*/ nullptr,
-                    settings,
-                    log);
+            const auto & indices = conjuncts_of_condition[i];
+            if (indices.empty())
+                continue;
+            part.exact_ranges_by_condition[i] = part.exact_ranges_by_conjunct[indices.front()];
+            for (size_t index : indices | std::views::drop(1))
+                part.exact_ranges_by_condition[i] = MergeTreeDataSelectExecutor::intersectRanges(
+                    part.exact_ranges_by_condition[i], part.exact_ranges_by_conjunct[index]);
         }
     }
 }
@@ -3145,7 +3128,42 @@ void ReadFromMergeTree::buildIndexes(
     auto filter_dag_ptr = std::make_shared<ActionsDAGWithInversionPushDown>(filter_actions_dag_ ? filter_actions_dag_->getOutputs().front() : nullptr, query_context, /* boolean_context */ true);
     const auto & filter_dag = *filter_dag_ptr;
 
-    indexes.emplace(buildPrimaryKeyCondition(filter_dag_ptr, query_context, metadata_snapshot, skip_constant_folding));
+    {
+        auto key_condition_factory = [query_context, metadata_snapshot](const ActionsDAG *, const ActionsDAG::Node * predicate)
+        {
+            ActionsDAGWithInversionPushDown wrapped(predicate, query_context, /* boolean_context */ false);
+            return KeyCondition{wrapped, query_context, metadata_snapshot->getPrimaryKey(), /* single_point_ = */ false, !query_context->getSettingsRef()[Setting::use_primary_key]};
+        };
+        auto key_condition_template = std::make_shared<ConditionTemplate<KeyCondition>>(filter_dag_ptr, std::move(key_condition_factory), metadata_snapshot, query_context, skip_constant_folding);
+        indexes.emplace(std::move(key_condition_template));
+    }
+
+    /// The index conditions rewrite the filter. The rewrite of an `AND` is the `AND` of the rewrites of its arguments, and the
+    /// rewrite of a conjunct can be an `AND` of several leaves. `RPNBuilder` reads the arguments of an `indexHint` from the
+    /// hint and not from its rewrite. A filter with an `indexHint` leaf gets no conjuncts.
+    if (filter_actions_dag_)
+    {
+        ActionsDAG::NodeRawConstPtrs conjuncts;
+        flattenConjunction(filter_actions_dag_->getOutputs().front(), conjuncts);
+        for (size_t i = 0; conjuncts.size() > 1 && i < conjuncts.size(); ++i)
+        {
+            const ActionsDAGWithInversionPushDown rewrite(conjuncts[i], query_context, /* boolean_context */ true);
+            ActionsDAG::NodeRawConstPtrs leaves;
+            flattenConjunction(rewrite.predicate, leaves);
+            const auto is_index_hint = [](const ActionsDAG::Node * leaf)
+            {
+                return leaf->type == ActionsDAG::ActionType::FUNCTION && leaf->function_base->getName() == "indexHint";
+            };
+            if (std::ranges::any_of(leaves, is_index_hint))
+            {
+                indexes->conjuncts.clear();
+                indexes->conjunct_of_leaf.clear();
+                break;
+            }
+            indexes->conjuncts.push_back(conjuncts[i]->result_name);
+            indexes->conjunct_of_leaf.insert(indexes->conjunct_of_leaf.end(), leaves.size(), i);
+        }
+    }
 
     {
         auto key_condition_factory = [query_context](const ActionsDAG *, const ActionsDAG::Node * predicate)
@@ -3705,6 +3723,7 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         max_block_numbers_to_read.get(),
         log,
         result.index_stats);
+    result.conjuncts = indexes->conjuncts;
 
     result.sampling = MergeTreeDataSelectExecutor::getSampling(
         query_info_,
@@ -5355,7 +5374,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
     }
 
     /// The PREWHERE steps are final here. Index analysis may run before `optimizePrewhere` moves conditions to PREWHERE.
-    findExactRangesByCondition(result.parts_with_ranges);
+    findExactRangesByCondition(result.parts_with_ranges, result.conjuncts);
 
     shared_virtual_fields.emplace("_sample_factor", result.sampling.used_sample_factor);
     shared_virtual_fields.emplace("_table", data.getStorageID().getTableName());
@@ -6704,7 +6723,7 @@ ConditionSelectivityEstimatorPtr ReadFromMergeTree::getConditionSelectivityEstim
         IndexStats unused_stats;
         auto pruned_parts = MergeTreeDataSelectExecutor::filterPartsByPartition(
             parts, indexes->partition_pruner, indexes->minmax_idx_condition,
-            indexes->part_values, getStorageMetadata(), data, getContext(),
+            indexes->part_values, /*conjunct_of_leaf=*/ {}, getStorageMetadata(), data, getContext(),
             max_block_numbers_to_read.get(), getLogger("ReadFromMergeTree"), unused_stats);
         return data.getConditionSelectivityEstimator(pruned_parts, required_columns, getContext());
     }

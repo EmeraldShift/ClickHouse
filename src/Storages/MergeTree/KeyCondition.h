@@ -133,6 +133,9 @@ public:
     /// done in MergeTreeDataSelectExecutor::filterMarksUsingIndex(). Each *IndexCondition
     /// invokes this callback as it is evaluating the predicate. The final result for each
     /// granule is computed in MergeTreeDataSelectExecutor::mergePartialResultsForDisjunctions()
+    ///
+    /// Index analysis also reads the masks of the conjuncts (see `getConjunctPositions`) to find the ranges where a
+    /// conjunct is true on every row. A check of a range of keys reports each element once per hyperrectangle.
     using UpdatePartialDisjunctionResultFn = std::function<void (size_t position, BoolMask mask, bool is_unknown)>;
 
     /// Whether the condition and its negation are feasible in the direct product of single column ranges specified by `hyperrectangle`.
@@ -165,7 +168,8 @@ public:
         const std::vector<int> & key_col_to_sparse_pos,
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types,
-        size_t num_refinable_key_columns) const;
+        size_t num_refinable_key_columns,
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
 
     /// Whether the condition and its negation are (independently) feasible in the key range.
     /// left_key and right_key must contain all fields in the sort_descr in the appropriate order.
@@ -189,7 +193,8 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types,
         const Truth & need = {},
-        const Hyperrectangle * key_bounds = nullptr) const;
+        const Hyperrectangle * key_bounds = nullptr,
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
     /// However, `equal_boundaries_mask` must have the information about all/prefix keys. `equal_boundaries_mask` specifies whether ith key's
@@ -225,7 +230,8 @@ public:
         const DataTypes & sparse_data_types,
         const std::vector<UInt8> & equal_boundaries_mask,
         const Truth & need = {},
-        const Hyperrectangle * key_bounds = nullptr) const;
+        const Hyperrectangle * key_bounds = nullptr,
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
 
     const KeyOrder & getKeyOrder() const { return key_order; }
 
@@ -469,6 +475,10 @@ public:
     static const AtomMap atom_map;
 
     const RPN & getRPN() const { return rpn; }
+
+    /// The position (see `UpdatePartialDisjunctionResultFn`) of the last element of each conjunct of the filter, in order.
+    /// Empty if the condition skips analysis.
+    const std::vector<size_t> & getConjunctPositions() const { return conjunct_positions; }
     const ColumnIndices & getKeyColumns() const { return key_columns; }
 
     /// Whether a value of this type can be a NaN that an aggregated `getExtremes` bound does not show, and
@@ -903,6 +913,7 @@ private:
     std::vector<std::pair</*start*/ size_t, /*end*/ size_t>> topLevelConjunction() const;
 
     RPN rpn;
+    std::vector<size_t> conjunct_positions;
 
     /// If query has no filter, rpn will has one element with unknown function.
     /// This flag identify whether there are filters.

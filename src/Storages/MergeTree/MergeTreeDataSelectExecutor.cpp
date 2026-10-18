@@ -207,6 +207,68 @@ static MarkRanges unionOfRanges(const MarkRanges & left, const MarkRanges & righ
     return res;
 }
 
+MarkRanges MergeTreeDataSelectExecutor::intersectRanges(const MarkRanges & left, const MarkRanges & right)
+{
+    return splitByCoveredRanges(left, right).first;
+}
+
+MergeTreeDataSelectExecutor::ConjunctExactRanges::ConjunctExactRanges(
+    const std::vector<size_t> & leaf_positions,
+    const std::vector<size_t> & conjunct_of_leaf_,
+    std::vector<MarkRanges> & exact_ranges_by_conjunct_)
+    : conjunct_of_leaf(conjunct_of_leaf_)
+    , exact_ranges_by_conjunct(exact_ranges_by_conjunct_)
+{
+    if (conjunct_of_leaf.empty() || leaf_positions.size() != conjunct_of_leaf.size())
+        return;
+
+    leaf_of_position.resize(leaf_positions.back() + 1, no_leaf);
+    for (size_t leaf = 0; leaf < leaf_positions.size(); ++leaf)
+        leaf_of_position[leaf_positions[leaf]] = leaf;
+    reported.resize(conjunct_of_leaf.size());
+    always_true.resize(conjunct_of_leaf.size(), true);
+    exact_ranges_by_conjunct.resize(conjunct_of_leaf.back() + 1);
+
+    report_fn = [this](size_t position, BoolMask mask, bool)
+    {
+        if (position >= leaf_of_position.size() || leaf_of_position[position] == no_leaf)
+            return;
+        const size_t leaf = leaf_of_position[position];
+        reported[leaf] = true;
+        always_true[leaf] &= !mask.can_be_false;
+    };
+}
+
+void MergeTreeDataSelectExecutor::ConjunctExactRanges::endCheck(const MarkRange & range, bool complete)
+{
+    if (!report_fn)
+        return;
+
+    /// The leaves of a conjunct are adjacent.
+    for (size_t leaf = 0; complete && leaf < conjunct_of_leaf.size();)
+    {
+        const size_t conjunct = conjunct_of_leaf[leaf];
+        bool conjunct_always_true = true;
+        for (; leaf < conjunct_of_leaf.size() && conjunct_of_leaf[leaf] == conjunct; ++leaf)
+            conjunct_always_true &= reported[leaf] && always_true[leaf];
+
+        if (conjunct_always_true)
+            exact_ranges_by_conjunct[conjunct].push_back(range);
+    }
+
+    std::ranges::fill(reported, false);
+    std::ranges::fill(always_true, true);
+}
+
+void MergeTreeDataSelectExecutor::ConjunctExactRanges::normalize(std::vector<MarkRanges> & exact_ranges_by_conjunct)
+{
+    for (auto & ranges : exact_ranges_by_conjunct)
+    {
+        std::ranges::sort(ranges, {}, &MarkRange::begin);
+        ranges = unionOfRanges(ranges, {});
+    }
+}
+
 /// Maps each primary-key column position to the slot of the matching column in a part's partition
 /// minmax index (nullopt when the primary-key column is not a partition-minmax column).
 static std::vector<std::optional<size_t>> buildPrimaryKeyToMinMaxSlotMapping(
@@ -252,7 +314,8 @@ size_t MergeTreeDataSelectExecutor::getApproximateTotalRowsToRead(
     for (const auto & part : parts)
     {
         MarkRanges part_ranges = markRangesFromPKRange(
-            part, metadata_snapshot, key_condition, nullptr, nullptr, /*exact_ranges=*/nullptr, pk_to_minmax_slot_ptr, settings, log);
+            part, metadata_snapshot, key_condition, nullptr, nullptr, /*exact_ranges=*/nullptr, /*conjunct_exact_ranges=*/nullptr,
+            pk_to_minmax_slot_ptr, settings, log);
         for (const auto & range : part_ranges)
             rows_count += part.data_part->index_granularity->getRowsCountInRange(range);
     }
@@ -745,7 +808,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterParts(
     ReadFromMergeTree::IndexStats & index_stats)
 {
     auto res = filterPartsByPartition(
-        parts, indexes.partition_pruner, indexes.minmax_idx_condition, indexes.part_values,
+        parts, indexes.partition_pruner, indexes.minmax_idx_condition, indexes.part_values, indexes.conjunct_of_leaf,
         metadata_snapshot, data, context, max_block_numbers_to_read, log, index_stats);
     return filterPartsByStatistics(res, metadata_snapshot, query_info, mutations_snapshot, context, log, index_stats);
 }
@@ -755,6 +818,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPartition(
     const std::optional<PartitionPruner> & partition_pruner,
     const ConditionTemplate<KeyCondition>::Ptr & minmax_idx_condition,
     const std::optional<std::unordered_set<String>> & part_values,
+    const std::vector<size_t> & conjunct_of_leaf,
     const StorageMetadataPtr & metadata_snapshot,
     const MergeTreeData & data,
     const ContextPtr & context,
@@ -790,6 +854,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPartition(
         minmax_idx_condition,
         minmax_columns_types,
         partition_pruner,
+        conjunct_of_leaf,
         max_block_numbers_to_read,
         part_filter_counters,
         query_status);
@@ -1007,6 +1072,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
     const auto & part_offset_condition = filter_context.indexes.part_offset_condition;
     const auto & total_offset_condition = filter_context.indexes.total_offset_condition;
     const auto & key_condition_rpn_template = filter_context.indexes.key_condition_rpn_template;
+    const auto & conjunct_of_leaf = filter_context.indexes.conjunct_of_leaf;
     const auto & skip_indexes = filter_context.indexes.skip_indexes;
     const auto & top_k_filter_info = filter_context.top_k_filter_info;
     const auto & reader_settings = filter_context.reader_settings;
@@ -1264,13 +1330,17 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                 pk_stat.total_parts.fetch_add(1, std::memory_order_relaxed);
                 pk_stat.total_granules.fetch_add(total_marks_count, std::memory_order_relaxed);
 
+                const auto & part_key_condition = key_condition->generateForPart(ranges.data_part);
+                ConjunctExactRanges conjunct_exact_ranges(
+                    part_key_condition.getConjunctPositions(), conjunct_of_leaf, ranges.exact_ranges_by_conjunct);
                 ranges.ranges = markRangesFromPKRange(
                     ranges,
                     metadata_snapshot,
-                    key_condition->generateForPart(ranges.data_part),
+                    part_key_condition,
                     part_offset_condition ? &part_offset_condition->generateForPart(ranges.data_part) : nullptr,
                     total_offset_condition ? &total_offset_condition->generateForPart(ranges.data_part) : nullptr,
                     &exact_ranges,
+                    &conjunct_exact_ranges,
                     pk_to_minmax_slot_ptr,
                     settings,
                     log);
@@ -1432,6 +1502,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
             }
 
             ranges.exact_ranges = std::move(exact_ranges);
+            ConjunctExactRanges::normalize(ranges.exact_ranges_by_conjunct);
 
             /// Optimize ORDER BY <col> LIMIT n - if <col> is scalar numeric / date / datetime and has a minmax index
             if (perform_top_k_optimization
@@ -2305,6 +2376,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     const KeyCondition * part_offset_condition,
     const KeyCondition * total_offset_condition,
     MarkRanges * exact_ranges,
+    ConjunctExactRanges * conjunct_exact_ranges,
     const std::vector<std::optional<size_t>> * pk_to_minmax_slot,
     const Settings & settings,
     LoggerPtr log)
@@ -2318,6 +2390,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         part_offset_condition,
         total_offset_condition,
         exact_ranges,
+        conjunct_exact_ranges,
         pk_to_minmax_slot,
         settings,
         log);
@@ -2332,6 +2405,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     const KeyCondition * part_offset_condition,
     const KeyCondition * total_offset_condition,
     MarkRanges * exact_ranges,
+    ConjunctExactRanges * conjunct_exact_ranges,
     const std::vector<std::optional<size_t>> * pk_to_minmax_slot,
     const Settings & settings,
     LoggerPtr log)
@@ -2614,6 +2688,9 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     std::vector<FieldRef> part_offset_left(2);
     std::vector<FieldRef> part_offset_right(2);
 
+    const KeyCondition::UpdatePartialDisjunctionResultFn no_report;
+    const auto & report_conjuncts = conjunct_exact_ranges ? conjunct_exact_ranges->report() : no_report;
+
     auto check_bounds_in_range = [&](const MarkRange & range, Truth need)
     {
         auto check_key_condition = [&]() -> Truth
@@ -2683,7 +2760,8 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     sparse_key_types,
                     equal_boundaries_mask,
                     need,
-                    &index_bounds);
+                    &index_bounds,
+                    report_conjuncts);
             }
 
             if (range.end == marks_count)
@@ -2725,7 +2803,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                 }
             }
             return key_condition.checkBoundsInRange(
-                used_key_size, index_left.data(), index_right.data(), key_types, need, &index_bounds);
+                used_key_size, index_left.data(), index_right.data(), key_types, need, &index_bounds, report_conjuncts);
         };
 
         auto check_part_offset_condition = [&]() -> Truth
@@ -2771,6 +2849,8 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             need = {};
 
         Truth result = key_condition_useful ? check_key_condition() : Truth::unknown();
+        if (conjunct_exact_ranges)
+            conjunct_exact_ranges->endCheck(range, /*complete=*/ key_condition_useful && !result.covers(need));
 
         if (part_offset_condition_useful)
             result = Truth::meet(result, check_part_offset_condition() & Truth::unknown());
@@ -3333,6 +3413,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
     const ConditionTemplate<KeyCondition>::Ptr & minmax_idx_condition,
     const DataTypes & minmax_columns_types,
     const std::optional<PartitionPruner> & partition_pruner,
+    const std::vector<size_t> & conjunct_of_leaf,
     const PartitionIdToMaxBlock * max_block_numbers_to_read,
     PartFilterCounters & counters,
     QueryStatusPtr query_status)
@@ -3364,14 +3445,21 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         counters.num_initial_selected_parts += 1;
         counters.num_initial_selected_granules += num_granules;
 
+        /// The conjuncts that are true on every row of the partition are true on every row of the part.
+        const MarkRange part_range(0, part_or_projection->index_granularity->getMarksCount());
+        std::vector<MarkRanges> exact_ranges_by_conjunct;
+
         /// hyperrectangle must come from the part whose metadata built the condition.
         Truth part_truth;
         if (minmax_idx_condition)
         {
-            part_truth = minmax_idx_condition->generateForPart(part_or_projection).checkBoundsInHyperrectangle(
-                part_or_projection->getMinMaxIndex()->hyperrectangle, minmax_columns_types);
+            const auto & condition = minmax_idx_condition->generateForPart(part_or_projection);
+            ConjunctExactRanges conjunct_exact_ranges(condition.getConjunctPositions(), conjunct_of_leaf, exact_ranges_by_conjunct);
+            part_truth = condition.checkBoundsInHyperrectangle(
+                part_or_projection->getMinMaxIndex()->hyperrectangle, minmax_columns_types, {}, conjunct_exact_ranges.report());
             if (part_truth.is_true.level() == Side::Never)
                 continue;
+            conjunct_exact_ranges.endCheck(part_range, /*complete=*/ true);
         }
 
         counters.num_parts_after_minmax += 1;
@@ -3381,13 +3469,18 @@ RangesInDataParts MergeTreeDataSelectExecutor::selectPartsToRead(
         {
             if (partition_pruner->canBePruned(*part))
                 continue;
-            part_truth = Truth::meet(part_truth, partition_pruner->checkPartition(*part));
+            ConjunctExactRanges conjunct_exact_ranges(
+                partition_pruner->getKeyCondition().getConjunctPositions(), conjunct_of_leaf, exact_ranges_by_conjunct);
+            const Truth partition_truth = partition_pruner->checkPartition(*part, conjunct_exact_ranges.report());
+            conjunct_exact_ranges.endCheck(part_range, /*complete=*/ !partition_truth.covers(Truth{}));
+            part_truth = Truth::meet(part_truth, partition_truth);
         }
 
         counters.num_parts_after_partition_pruner += 1;
         counters.num_granules_after_partition_pruner += num_granules;
 
         res_parts.push_back(prev_part);
+        res_parts.back().exact_ranges_by_conjunct = std::move(exact_ranges_by_conjunct);
 
         /// The filter is true on every row of the part.
         if (part_truth.is_true.level() == Side::Always)

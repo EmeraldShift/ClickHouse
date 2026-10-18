@@ -25,6 +25,10 @@ SELECT sum(k) FROM t_prewhere_true_conditions WHERE k >= 50050 AND v % 10 = 3;
 SELECT count(), sum(v) FROM t_prewhere_true_conditions
 PREWHERE k >= 20050 AND k < 79950 AND v % 10 = 3 SETTINGS max_bytes_to_read = 700000;
 
+-- Index analysis rewrites `NOT (k < 20050 OR k >= 79950)` into `k >= 20050 AND k < 79950`. The condition is true where both are.
+SELECT count(), sum(v) FROM t_prewhere_true_conditions
+PREWHERE NOT (k < 20050 OR k >= 79950) AND v % 10 = 3 SETTINGS max_bytes_to_read = 700000;
+
 -- The query condition cache records the granules without matching rows for the whole PREWHERE.
 SELECT count() FROM t_prewhere_true_conditions WHERE k >= 50050 AND v % 1000 = 3 SETTINGS use_query_condition_cache = 1;
 SELECT count() FROM t_prewhere_true_conditions WHERE k >= 50050 AND v % 1000 = 3 SETTINGS use_query_condition_cache = 1;

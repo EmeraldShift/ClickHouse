@@ -198,6 +198,8 @@ public:
     struct AnalysisResult
     {
         RangesInDataParts parts_with_ranges;
+        /// The conjuncts of `RangesInDataPart::exact_ranges_by_conjunct`, see `Indexes::conjuncts`.
+        Names conjuncts;
         SplitPartsByRanges split_parts;
         MergeTreeDataSelectSamplingData sampling;
         IndexStats index_stats;
@@ -221,6 +223,7 @@ public:
 
         AnalysisResult(const AnalysisResult & other)
             : parts_with_ranges(other.parts_with_ranges)
+            , conjuncts(other.conjuncts)
             , split_parts(other.split_parts)
             , sampling(other.sampling)
             , index_stats(other.index_stats)
@@ -242,6 +245,7 @@ public:
 
         AnalysisResult(AnalysisResult && other) noexcept
             : parts_with_ranges(std::move(other.parts_with_ranges))
+            , conjuncts(std::move(other.conjuncts))
             , split_parts(std::move(other.split_parts))
             , sampling(std::move(other.sampling))
             , index_stats(std::move(other.index_stats))
@@ -357,6 +361,10 @@ public:
         bool use_skip_indexes_if_final_exact_mode;
         bool use_skip_indexes_on_data_read;
         std::optional<std::unordered_set<String>> part_values;
+        /// The names of the conjuncts of the filter, if it has more than one, and the conjunct of each leaf of the top-level
+        /// `AND` that the index conditions rewrite the filter into (see `KeyCondition::getConjunctPositions`).
+        Names conjuncts;
+        std::vector<size_t> conjunct_of_leaf;
     };
 
     void addJoinRuntimeFilterIndexAnalysisOnDataRead(const String & filter_id, const String & column_name, const DataTypePtr & column_type);
@@ -699,14 +707,9 @@ private:
         bool skip_partition_pruning_,
         bool require_ready_sets = false);
 
-    static ConditionTemplate<KeyCondition>::Ptr buildPrimaryKeyCondition(
-        const std::shared_ptr<ActionsDAGWithInversionPushDown> & filter_dag_ptr,
-        const ContextPtr & query_context,
-        const StorageMetadataPtr & metadata_snapshot,
-        bool skip_constant_folding);
-
-    /// Fills `exact_ranges_by_condition` of the parts for the conditions of the PREWHERE steps.
-    void findExactRangesByCondition(RangesInDataParts & parts_with_ranges) const;
+    /// Fills `exact_ranges_by_condition` of the parts for the conditions of the PREWHERE steps from
+    /// `exact_ranges_by_conjunct`.
+    void findExactRangesByCondition(RangesInDataParts & parts_with_ranges, const Names & conjuncts) const;
 
     MergeTreeSettingsPtr data_settings;
     MergeTreeReaderSettings reader_settings;
