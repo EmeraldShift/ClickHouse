@@ -204,7 +204,7 @@ INSERT INTO t_minmax_nan_array VALUES (4, [100.]), (5, [150.]), (6, [200.]);
 
 SELECT count() FROM t_minmax_nan_array WHERE NOT (a <= [3.]);
 SELECT count() FROM t_minmax_nan_array WHERE NOT (a <= [3.]) SETTINGS use_skip_indexes = 0;
-SELECT countIf(explain LIKE '%Granules: 1/2%') FROM (EXPLAIN indexes = 1 SELECT count() FROM t_minmax_nan_array WHERE NOT (a <= [3.]));
+SELECT countIf(explain LIKE '%Granules: 1/2%') FROM (EXPLAIN indexes = 1 SELECT count() FROM t_minmax_nan_array WHERE NOT (a <= [3.]) SETTINGS optimize_use_implicit_projections = 0);
 
 DROP TABLE t_minmax_nan_array;
 

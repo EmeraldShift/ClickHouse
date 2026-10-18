@@ -137,12 +137,14 @@ public:
         const Settings & settings,
         LoggerPtr log);
 
+    /// If `exact_ranges` is not null, fill it with the ranges of the granules where the condition is true on every row.
     static std::pair<MarkRanges, RangesInDataPartReadHints> filterMarksUsingIndex(
         MergeTreeIndexPtr index_helper,
         MergeTreeIndexConditionPtr condition,
         const std::optional<KeyCondition> & key_condition_rpn_template,
         const MergeTreeDataPartInfoForReaderPtr & part_info,
         const MarkRanges & ranges,
+        MarkRanges * exact_ranges,
         const RangesInDataPartReadHints & in_read_hints,
         const MergeTreeReaderSettings & reader_settings,
         MarkCache * mark_cache,

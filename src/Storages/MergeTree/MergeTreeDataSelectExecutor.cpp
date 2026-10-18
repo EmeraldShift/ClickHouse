@@ -1251,16 +1251,12 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
             /// The filter is true on every row of these ranges, so every skip index keeps them, and they are not read.
             /// `selectPartsToRead` sets `exact_ranges` to the whole part if the filter is true on every row of its partition.
-            MarkRanges pk_exact_ranges = std::move(ranges.exact_ranges);
+            /// The primary key and the skip indexes add more.
+            MarkRanges exact_ranges = std::move(ranges.exact_ranges);
             ranges.exact_ranges.clear();
             const bool find_pk_exact_ranges = find_exact_ranges || !skip_indexes.useful_indices.empty();
 
-            if (!pk_exact_ranges.empty())
-            {
-                if (find_exact_ranges)
-                    ranges.exact_ranges = pk_exact_ranges;
-            }
-            else if (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition)
+            if (exact_ranges.empty() && (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition))
             {
                 CurrentMetrics::Increment metric(CurrentMetrics::FilteringMarksWithPrimaryKey);
                 ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::FilteringMarksWithPrimaryKeyMicroseconds);
@@ -1276,13 +1272,10 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                     key_condition->generateForPart(ranges.data_part),
                     part_offset_condition ? &part_offset_condition->generateForPart(ranges.data_part) : nullptr,
                     total_offset_condition ? &total_offset_condition->generateForPart(ranges.data_part) : nullptr,
-                    find_pk_exact_ranges ? &pk_exact_ranges : nullptr,
+                    find_pk_exact_ranges ? &exact_ranges : nullptr,
                     pk_to_minmax_slot_ptr,
                     settings,
                     log);
-
-                if (find_exact_ranges)
-                    ranges.exact_ranges = pk_exact_ranges;
 
                 pk_stat.search_algorithm.store(ranges.ranges.search_algorithm, std::memory_order_relaxed);
                 pk_stat.granules_dropped.fetch_add(total_marks_count - ranges.getMarksCount(), std::memory_order_relaxed);
@@ -1376,11 +1369,11 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                     }
 
                     const auto & condition = index_and_condition.condition_template->generateForPart(ranges.data_part);
-                    if (!use_skip_indexes_for_disjunctions && condition->keepsEveryGranule())
+                    if (!use_skip_indexes_for_disjunctions && condition->keepsEveryGranule() && !condition->mayFindExactGranules())
                     {
                         LOG_TRACE(
                             log,
-                            "Skipping skip index {} on part {}: it cannot drop granules without other indexes",
+                            "Skipping skip index {} on part {}: it can neither drop granules nor find exact granules without other indexes",
                             backQuote(index_and_condition.index->index.name),
                             ranges.data_part->name);
                         continue;
@@ -1390,11 +1383,12 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                     {
                         /// A vector similarity index keeps only the nearest rows, and a text index can give the values of
                         /// the filter for reading, so both are read on the exact ranges too.
-                        const bool keep_exact_ranges = !pk_exact_ranges.empty()
-                            && !index_and_condition.index->isVectorSimilarityIndex() && !index_and_condition.index->isTextIndex();
-                        auto [exact_ranges, ranges_to_filter] = keep_exact_ranges
-                            ? splitByCoveredRanges(ranges.ranges, pk_exact_ranges)
+                        const bool keep_exact_ranges
+                            = !index_and_condition.index->isVectorSimilarityIndex() && !index_and_condition.index->isTextIndex();
+                        auto [kept_ranges, ranges_to_filter] = keep_exact_ranges
+                            ? splitByCoveredRanges(ranges.ranges, exact_ranges)
                             : std::pair{MarkRanges{}, ranges.ranges};
+                        MarkRanges new_exact_ranges;
 
                         std::tie(ranges.ranges, ranges.read_hints) = filterMarksUsingIndex(
                             index_and_condition.index,
@@ -1402,6 +1396,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                             key_condition_rpn_template->generateForPart(ranges.data_part),
                             part_info_for_reader,
                             ranges_to_filter,
+                            keep_exact_ranges ? &new_exact_ranges : nullptr,
                             ranges.read_hints,
                             reader_settings,
                             mark_cache.get(),
@@ -1412,9 +1407,12 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                             log);
 
                         if (keep_exact_ranges)
+                        {
                             /// `filterMarksUsingIndex` merges ranges across a gap of up to `min_marks_for_seek` marks, so its
                             /// ranges may intersect the exact ranges.
-                            ranges.ranges = unionOfRanges(ranges.ranges, exact_ranges);
+                            ranges.ranges = unionOfRanges(ranges.ranges, kept_ranges);
+                            exact_ranges = unionOfRanges(exact_ranges, new_exact_ranges);
+                        }
                     }
 
                     stat.granules_dropped.fetch_add(total_granules - ranges.getMarksCount(), std::memory_order_relaxed);
@@ -1434,6 +1432,9 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                 }
 
             }
+
+            if (find_exact_ranges)
+                ranges.exact_ranges = std::move(exact_ranges);
 
             /// Optimize ORDER BY <col> LIMIT n - if <col> is scalar numeric / date / datetime and has a minmax index
             if (perform_top_k_optimization
@@ -2999,6 +3000,7 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
     const std::optional<KeyCondition> & key_condition_rpn_template,
     const MergeTreeDataPartInfoForReaderPtr & part_info,
     const MarkRanges & ranges,
+    MarkRanges * exact_ranges,
     const RangesInDataPartReadHints & in_read_hints,
     const MergeTreeReaderSettings & reader_settings,
     MarkCache * mark_cache,
@@ -3301,10 +3303,18 @@ std::pair<MarkRanges, RangesInDataPartReadHints> MergeTreeDataSelectExecutor::fi
                         std::max(ranges[i].begin, index_mark * skip_index_granularity),
                         std::min(ranges[i].end, (index_mark + 1) * skip_index_granularity));
 
-                    bool may_be_true = condition->mayBeTrueOnGranule(granule, create_update_partial_disjunction_result_fn(data_range));
+                    const Side is_true = condition->checkBoundsOnGranule(granule, create_update_partial_disjunction_result_fn(data_range)).is_true;
 
-                    if (!may_be_true)
+                    if (is_true.level() == Side::Never)
                         continue;
+
+                    if (exact_ranges && is_true.level() == Side::Always)
+                    {
+                        if (!exact_ranges->empty() && exact_ranges->back().end == data_range.begin)
+                            exact_ranges->back().end = data_range.end;
+                        else
+                            exact_ranges->push_back(data_range);
+                    }
 
                     if (res.empty() || data_range.begin - res.back().end > min_marks_for_seek)
                         res.push_back(data_range);

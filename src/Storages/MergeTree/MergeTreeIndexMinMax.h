@@ -29,6 +29,8 @@ struct MergeTreeIndexGranuleMinMax final : public IMergeTreeIndexGranule
     const Block & index_sample_block;
 
     Ranges hyperrectangle;
+    /// The version of the format that `deserializeBinary` read.
+    MergeTreeIndexVersion format_version = 0;
     Serializations serializations;
     DataTypes datatypes;
     FormatSettings format_settings;
@@ -60,15 +62,24 @@ public:
 
     bool alwaysUnknownOrTrue() const override;
     bool keepsEveryGranule() const override;
+    bool mayFindExactGranules() const override;
 
     bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
+    Truth checkBoundsOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const override;
 
     std::string getDescription() const override;
 
     ~MergeTreeIndexConditionMinMax() override = default;
 private:
+    /// The atoms that the bounds of a granule check.
+    static const std::unordered_set<KeyCondition::RPNElement::Function> & matchingFunctions();
+
     DataTypes index_data_types;
     KeyCondition condition;
+
+    /// Whether a row may hold a NULL or a NaN that the bounds of its granule leave out, see `checkBoundsOnGranule`.
+    bool bounds_may_hide_null_or_nan = false;
+    bool has_nullable_column = false;
 };
 
 

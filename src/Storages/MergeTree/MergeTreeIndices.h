@@ -113,9 +113,20 @@ public:
     using UpdatePartialDisjunctionResultFn = KeyCondition::UpdatePartialDisjunctionResultFn;
     virtual bool mayBeTrueOnGranule(MergeTreeIndexGranulePtr granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const = 0;
 
+    /// The truth of the condition on the rows of the granule. A granule where `is_true` is `Always` is an exact range. By
+    /// default, `is_true` is `Never` where `mayBeTrueOnGranule` returns false, and every value can be on the other granules.
+    virtual Truth checkBoundsOnGranule(MergeTreeIndexGranulePtr granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
+    {
+        return Truth::check(mayBeTrueOnGranule(granule, update_partial_disjunction_result_fn), true, true);
+    }
+
     /// Whether `mayBeTrueOnGranule` keeps every granule. `alwaysUnknownOrTrue` is false for some conditions that drop granules
     /// only together with other indexes with `use_skip_indexes_for_disjunctions`. An index on `a` for `a = 1 OR b = 1` is one.
     virtual bool keepsEveryGranule() const { return alwaysUnknownOrTrue(); }
+
+    /// Whether `checkBoundsOnGranule` can find a granule where the filter is true on every row. An index on `a` for
+    /// `a = 1 OR b = 1` keeps every granule. It still finds the granules where `a = 1` is true on every row.
+    virtual bool mayFindExactGranules() const { return false; }
 
     using FilteredGranules = std::vector<size_t>;
     virtual FilteredGranules getPossibleGranules(const MergeTreeIndexBulkGranulesPtr &) const

@@ -1,4 +1,5 @@
 #include <Storages/MergeTree/MergeTreeIndexMinMax.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/TypeTree.h>
 
 #include <Interpreters/ExpressionAnalyzer.h>
@@ -75,9 +76,11 @@ void MergeTreeIndexGranuleMinMax::deserializeBinary(ReadBuffer & istr, MergeTree
 
     Field min_val;
     Field max_val;
+    format_version = version;
 
     for (size_t i = 0; i < num_columns; ++i)
     {
+
         /// When updating in place, deserialize directly into the Range's fields.
         Field & min_ref = update_in_place ? static_cast<Field &>(hyperrectangle[i].left) : min_val;
         Field & max_ref = update_in_place ? static_cast<Field &>(hyperrectangle[i].right) : max_val;
@@ -214,12 +217,21 @@ MergeTreeIndexConditionMinMax::MergeTreeIndexConditionMinMax(
 {
     /// The granule bound comes from `getExtremes`, which skips NaN.
     condition.relaxAtomsOverNaNHidingColumns(index_data_types);
+
+    for (const auto & type : index_data_types)
+    {
+        bounds_may_hide_null_or_nan |= anyInTypeTree(*removeNullable(type), [](const IDataType & subtype) { return subtype.isNullable(); })
+            || anyInTypeTree(*type, [](const IDataType & subtype)
+        {
+            return (isArray(subtype) || isMap(subtype)) && anyInTypeTree(subtype, [](const IDataType & element) { return isFloat(element); });
+        });
+        has_nullable_column |= type->isNullable();
+    }
 }
 
-bool MergeTreeIndexConditionMinMax::alwaysUnknownOrTrue() const
+const std::unordered_set<KeyCondition::RPNElement::Function> & MergeTreeIndexConditionMinMax::matchingFunctions()
 {
-    return rpnEvaluatesAlwaysUnknownOrTrue(
-        condition.getRPN(),
+    static const std::unordered_set<KeyCondition::RPNElement::Function> functions(
         {KeyCondition::RPNElement::FUNCTION_NOT_IN_RANGE,
          KeyCondition::RPNElement::FUNCTION_IN_RANGE,
          KeyCondition::RPNElement::FUNCTION_IN_SET,
@@ -230,6 +242,12 @@ bool MergeTreeIndexConditionMinMax::alwaysUnknownOrTrue() const
          KeyCondition::RPNElement::FUNCTION_IS_NULL,
          KeyCondition::RPNElement::FUNCTION_IS_NOT_NULL,
          KeyCondition::RPNElement::ALWAYS_FALSE});
+    return functions;
+}
+
+bool MergeTreeIndexConditionMinMax::alwaysUnknownOrTrue() const
+{
+    return rpnEvaluatesAlwaysUnknownOrTrue(condition.getRPN(), matchingFunctions());
 }
 
 bool MergeTreeIndexConditionMinMax::keepsEveryGranule() const
@@ -237,10 +255,29 @@ bool MergeTreeIndexConditionMinMax::keepsEveryGranule() const
     return condition.alwaysUnknownOrTrue();
 }
 
+bool MergeTreeIndexConditionMinMax::mayFindExactGranules() const
+{
+    return rpnCheckedTruth(condition.getRPN(), matchingFunctions()).truth.is_true.mayBeAlways();
+}
+
 bool MergeTreeIndexConditionMinMax::mayBeTrueOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
+    return checkBoundsOnGranule(idx_granule, update_partial_disjunction_result_fn).mask().can_be_true;
+}
+
+Truth MergeTreeIndexConditionMinMax::checkBoundsOnGranule(MergeTreeIndexGranulePtr idx_granule, const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
+{
     const MergeTreeIndexGranuleMinMax & granule = typeid_cast<const MergeTreeIndexGranuleMinMax &>(*idx_granule);
-    return condition.checkInHyperrectangle(granule.hyperrectangle, index_data_types, {}, update_partial_disjunction_result_fn).can_be_true;
+    const Truth truth = condition.checkBoundsInHyperrectangle(granule.hyperrectangle, index_data_types, {}, update_partial_disjunction_result_fn);
+
+    /// `checkBoundsInHyperrectangle` reads a NULL in a `Nullable` column from the `+inf` bound. The relaxed atoms cover a
+    /// NaN in a float or a `Tuple` column. The bounds leave out a NULL inside a `Tuple`, `Array`, or `Map` value, and a
+    /// NaN inside an `Array` or a `Map` value. Older parts leave out a NULL in a `LowCardinality(Nullable)` column, and
+    /// the format doesn't record which parts those are. The first version of the format leaves out a NULL in a
+    /// `Nullable` column.
+    if (bounds_may_hide_null_or_nan || (granule.format_version == 1 && has_nullable_column))
+        return truth.withHiddenNull();
+    return truth;
 }
 
 std::string MergeTreeIndexConditionMinMax::getDescription() const

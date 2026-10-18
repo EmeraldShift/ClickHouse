@@ -46,7 +46,7 @@ ENGINE = MergeTree PARTITION BY intDiv(k, 1000) ORDER BY k SETTINGS index_granul
 INSERT INTO t_keep_sub_dst SELECT 1000 + number, tuple(9) FROM numbers(4);
 SYSTEM STOP MERGES t_keep_sub_dst;
 ALTER TABLE t_keep_sub_dst ATTACH PARTITION 0 FROM t_keep_sub_src SETTINGS alter_sync = 2;
-SELECT count() > 0 FROM (EXPLAIN indexes = 1 SELECT count() FROM t_keep_sub_dst WHERE p.x = 0) WHERE explain ILIKE '%Granules: 4/17%';
+SELECT count() > 0 FROM (EXPLAIN indexes = 1 SELECT count() FROM t_keep_sub_dst WHERE p.x = 0 SETTINGS optimize_use_implicit_projections = 0) WHERE explain ILIKE '%Granules: 4/17%';
 SELECT count() FROM t_keep_sub_dst WHERE p.x = 0;
 DROP TABLE IF EXISTS t_keep_subexpr_src;
 CREATE TABLE t_keep_subexpr_src (k UInt64, p Tuple(x UInt8), INDEX idx toString(p.x) TYPE set(100) GRANULARITY 1)
