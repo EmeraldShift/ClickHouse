@@ -60,6 +60,7 @@ namespace Setting
 {
     extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsUInt64 log_queries_cut_to_length;
+    extern const SettingsFloat delta_query_residual_full_recompute_ratio;
 }
 
 namespace ServerSetting
@@ -737,8 +738,17 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
             if (!append_only)
                 executeRefreshStep(fmt::format("INSERT INTO {} SELECT * FROM {}", integral_id.getFullTableName(),
                     delta_id.getFullTableName()), refresh_context);
-            auto delta_rows = DatabaseCatalog::instance().getTable(delta_id, refresh_context)->totalRows(refresh_context);
-            select_query = delta_query.buildResidualDelta(integral_id, delta_id, delta_rows == 0, inner_table_id);
+            auto delta_rows = DatabaseCatalog::instance().getTable(delta_id, refresh_context)->totalRows(refresh_context).value_or(0);
+            /// Recomputing many touched keys costs more than recomputing all keys, because the filters by the touched keys read
+            /// most granules anyway and add a set lookup per row. The integral counts rows of parts that haven't merged yet.
+            bool all_keys = false;
+            if (!append_only && delta_rows > 0 && delta_query.hasPartitionedResidual())
+            {
+                const auto ratio = static_cast<double>(refresh_context->getSettingsRef()[Setting::delta_query_residual_full_recompute_ratio]);
+                auto integral_rows = DatabaseCatalog::instance().getTable(integral_id, refresh_context)->totalRows(refresh_context).value_or(0);
+                all_keys = ratio < 1 && static_cast<double>(delta_rows) > ratio * static_cast<double>(integral_rows);
+            }
+            select_query = delta_query.buildResidualDelta(integral_id, delta_id, delta_rows == 0, inner_table_id, all_keys);
             /// `RefreshTask` drops the delta after the refresh, which frees its memory.
             out_temp_table_id = delta_id;
         }

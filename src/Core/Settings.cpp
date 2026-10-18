@@ -10785,9 +10785,19 @@ A query without aggregates returns the weight of each row in a column of this na
 
 In an incremental refreshable materialized view, a query with this setting can also have `HAVING`, `ORDER BY` with `LIMIT`, `LIMIT BY`, `DISTINCT`, window functions, `QUALIFY`, expressions over aggregates and `avg`. Over unsigned inputs it can also have any aggregate function. These clauses run over a hidden table that holds the `GROUP BY` keys and the merged aggregates of the query. A query without aggregates keeps the columns that these clauses read as keys. Each refresh recomputes the result for the keys that the new rows touch, or for all keys if a `LIMIT` or a window ranges over all of them. It inserts each changed row with sign 1 or -1, for a `CollapsingMergeTree` target whose sorting key identifies its rows. The results of aggregates can have other types than in the query, and float results can change in their last digits between refreshes. The definer of the view needs `CREATE TABLE`, `DROP TABLE`, `SELECT` and `INSERT` on the database of the view for the hidden tables, and the view can't move to another database after its first refresh. Names that start with `__key_`, `__val_` or `__agg_`, and the names `__count`, `__index` and `__weight`, are reserved in these queries. `deltaQuery` doesn't support these clauses.
 
+A query with this setting can also have `LEFT`, `SEMI`, `ANTI` and `ASOF` joins of a table by `ON` with an equality of columns, and filters by `now()` in `WHERE` over the columns of one table. The result of such a join changes for every left row of the join keys of a new right row, and the result of such a filter changes as time passes. So their deltas retract rows, and the target must be a `CollapsingMergeTree` or a `SummingMergeTree`.
+
 The empty string, the default, makes no input signed.
 )", EXPERIMENTAL, \
         {"26.11", "", "", "New setting for delta queries over inputs whose rows have signs."}) \
+    DECLARE(Float, delta_query_residual_full_recompute_ratio, 0.2, R"(
+In an incremental refreshable materialized view whose residual compares rows only within the values of some keys, like `HAVING`, `LIMIT BY` or a window with `PARTITION BY`, a refresh recomputes the residual for all keys instead of only the touched keys when the rows of the delta exceed this fraction of the rows of the hidden table that holds the `GROUP BY` keys and the merged aggregates. Both give the same result. A value of 1 or more always recomputes only the touched keys.
+)", EXPERIMENTAL, \
+        {"26.11", 0.2, 0.2, "New setting for incremental refreshable materialized views."}) \
+    DECLARE(String, delta_query_lookup_tables, "", R"(
+A comma-separated list of input tables of `deltaQuery` and of incremental refreshable materialized views whose new rows don't change earlier results. Each name is a table name or `database.table`. A delta joins the new rows of the other inputs with the latest rows of a lookup table, and the new rows of a lookup table join with nothing. So each result row stays as it was when its other rows arrived, like a lookup join, and the delta skips the term of the lookup table, which is usually its most expensive one. A query needs an input that isn't a lookup table.
+)", EXPERIMENTAL, \
+        {"26.11", "", "", "New setting for delta queries whose inputs include lookup tables."}) \
     DECLARE(Bool, allow_experimental_database_materialized_postgresql, false, R"(
 Allow to create database with Engine=MaterializedPostgreSQL(...).
 )", EXPERIMENTAL) \

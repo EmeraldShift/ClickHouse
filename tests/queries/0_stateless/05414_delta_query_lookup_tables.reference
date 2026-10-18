@@ -1,0 +1,15 @@
+round 1	joined	a	10
+round 1	joined	b	5
+round 1	looked_up	a	10
+round 1	looked_up	b	5
+round 2	joined	a	11
+round 2	joined	b	5
+round 2	joined	c	7
+round 2	looked_up	a	11
+round 2	looked_up	b	5
+round 3	joined	a	11
+round 3	joined	b	5
+round 3	joined	c	107
+round 3	looked_up	a	11
+round 3	looked_up	b	5
+round 3	looked_up	c	100

@@ -29,6 +29,7 @@
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTWindowDefinition.h>
 #include <Parsers/ParserSelectWithUnionQuery.h>
 #include <Parsers/parseQuery.h>
@@ -37,6 +38,9 @@
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
 #include <Storages/StorageProxy.h>
 
+#include <base/find_symbols.h>
+#include <boost/algorithm/string/trim.hpp>
+#include <chrono>
 #include <fmt/ranges.h>
 
 #include <deque>
@@ -58,6 +62,7 @@ namespace ErrorCodes
 
 namespace Setting
 {
+    extern const SettingsString delta_query_lookup_tables;
     extern const SettingsString delta_query_sign_column;
 }
 
@@ -74,6 +79,16 @@ struct DeltaQuery::Input
     /// The key of the table in cursors: its UUID.
     String key;
     std::shared_ptr<MergeTreeData> storage;
+    /// Whether `delta_query_lookup_tables` names the table. Its new rows then have no term, and the other terms read its
+    /// rows below the new cursor.
+    bool lookup = false;
+    bool is_signed = false;
+    /// The columns of the table in the equalities of the ON clause, if the table is the right side of a LEFT, SEMI, ANTI or
+    /// ASOF join. Such a join isn't linear in the table. A new row of the table changes the result for every left row of
+    /// its join keys, see `buildDelta`.
+    Names join_keys;
+    /// The columns of such a table that the query reads.
+    Names columns;
 };
 
 /// An equality `from.from_column = to.to_column` between join keys of two inputs. The semi-join reduction follows it from
@@ -259,9 +274,11 @@ bool isMergeableAggregate(const String & name)
     return suffixes.empty() && without_if.contains(base);
 }
 
-/// Appends the tables of the join tree in order, and the ON expressions of its joins. Throws unless the join tree joins
-/// tables by inner joins, whose delta is the UNION ALL of per-table terms.
-void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, QueryTreeNodes & join_conditions)
+/// Appends the tables of the join tree in order, the ON expressions of its joins, and its joins that are linear only in
+/// their left side. Throws unless each join is an inner join, which is linear in both sides, or a LEFT, SEMI, ANTI or ASOF
+/// join of a table by ON.
+void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, QueryTreeNodes & join_conditions,
+    QueryTreeNodes & keyed_joins)
 {
     switch (node->getNodeType())
     {
@@ -269,7 +286,7 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
             tables.push_back(node);
             return;
         case QueryTreeNodeType::ARRAY_JOIN:
-            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables, join_conditions);
+            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables, join_conditions, keyed_joins);
             return;
         case QueryTreeNodeType::CROSS_JOIN:
         {
@@ -277,21 +294,31 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
             if (std::ranges::any_of(join.getJoinTypes(), [](const auto & type) { return type.locality == JoinLocality::Global; }))
                 throwUnsupported("GLOBAL joins");
             for (const auto & table : join.getTableExpressions())
-                collectJoinTree(table, tables, join_conditions);
+                collectJoinTree(table, tables, join_conditions, keyed_joins);
             return;
         }
         case QueryTreeNodeType::JOIN:
         {
             /// Resolution has replaced an unspecified strictness by `join_default_strictness`.
             const auto & join = node->as<JoinNode &>();
-            if (join.getKind() != JoinKind::Inner || join.getStrictness() != JoinStrictness::All)
-                throwUnsupported("joins other than INNER ALL, CROSS and comma joins");
+            const auto kind = join.getKind();
+            const auto strictness = join.getStrictness();
+            const bool is_keyed = (kind == JoinKind::Left
+                    && (strictness == JoinStrictness::All || strictness == JoinStrictness::Semi || strictness == JoinStrictness::Anti
+                        || strictness == JoinStrictness::Asof))
+                || (kind == JoinKind::Inner && strictness == JoinStrictness::Asof);
+            if (!is_keyed && (kind != JoinKind::Inner || strictness != JoinStrictness::All))
+                throwUnsupported("joins other than INNER ALL, LEFT ALL, LEFT SEMI, LEFT ANTI, ASOF, CROSS and comma joins");
             if (join.getLocality() == JoinLocality::Global)
                 throwUnsupported("GLOBAL joins");
-            collectJoinTree(join.getLeftTableExpressionNode(), tables, join_conditions);
-            collectJoinTree(join.getRightTableExpressionNode(), tables, join_conditions);
+            if (is_keyed && (join.getRightTableExpressionNode()->getNodeType() != QueryTreeNodeType::TABLE || !join.isOnJoinExpression()))
+                throwUnsupported("LEFT, SEMI, ANTI or ASOF joins whose right side isn't a table joined by ON");
+            collectJoinTree(join.getLeftTableExpressionNode(), tables, join_conditions, keyed_joins);
+            collectJoinTree(join.getRightTableExpressionNode(), tables, join_conditions, keyed_joins);
             if (join.isOnJoinExpression())
                 join_conditions.push_back(join.getJoinExpression());
+            if (is_keyed)
+                keyed_joins.push_back(node);
             return;
         }
         default:
@@ -521,6 +548,16 @@ std::map<String, TableBlocks> snapshotTables(const std::vector<Input> & inputs)
     return tables;
 }
 
+/// The key of the time of the snapshot in the cursors of queries that call now(). Its value is in seconds.
+constexpr auto time_key = "now";
+
+std::optional<Int64> getTime(const CursorTreeNodePtr & tree)
+{
+    if (!tree || !tree->hasValue(time_key))
+        return {};
+    return tree->getValue(time_key);
+}
+
 /// Incremental refreshable materialized views over one table used to store the `STREAM` cursor of the table, which has
 /// the partitions at the top.
 bool isStreamCursor(const CursorTreeNode & tree)
@@ -565,6 +602,8 @@ Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & in
     }
     for (const auto & [key, value] : *tree)
     {
+        if (key == time_key && std::holds_alternative<Int64>(value))
+            continue;
         const auto * partitions = std::get_if<CursorTreeNodePtr>(&value);
         if (!partitions || !cursor.contains(key))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The {} has key {}, which is not the UUID of a table of the query", name, key);
@@ -633,6 +672,59 @@ void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String
     }
 }
 
+/// `c_1 AND ...`, or `1` without conjuncts.
+ASTPtr makeConjunction(ASTs conjuncts)
+{
+    if (conjuncts.empty())
+        return make_intrusive<ASTLiteral>(Field(UInt8{1}));
+    if (conjuncts.size() == 1)
+        return std::move(conjuncts[0]);
+    return makeASTFunction("and", std::move(conjuncts));
+}
+
+ASTs cloneAll(const ASTs & asts)
+{
+    ASTs result;
+    for (const auto & ast : asts)
+        result.push_back(ast->clone());
+    return result;
+}
+
+/// The factor of the weights of queries whose deltas have terms that retract rows, see `DeltaQuery::buildDelta`.
+constexpr auto term_sign_name = "__term_sign";
+
+/// Replaces the identifier `__term_sign` by `sign` and the calls of now() by `time`.
+void bindTerm(IAST & ast, std::optional<Int64> sign, std::optional<Int64> time)
+{
+    for (auto & child : ast.children)
+    {
+        const auto * identifier = child->as<ASTIdentifier>();
+        const auto * function = child->as<ASTFunction>();
+        if (sign && identifier && identifier->name() == term_sign_name)
+            child = make_intrusive<ASTLiteral>(Field(*sign));
+        else if (time && function && function->name == "now")
+            child = makeASTFunction("toDateTime", make_intrusive<ASTLiteral>(Field(static_cast<UInt64>(*time))));
+        else
+            bindTerm(*child, sign, time);
+    }
+}
+
+bool callsNow(const IAST & ast)
+{
+    if (const auto * function = ast.as<ASTFunction>(); function && function->name == "now")
+        return true;
+    return std::ranges::any_of(ast.children, [](const auto & child) { return callsNow(*child); });
+}
+
+/// The columns that `ast` reads by qualified identifiers, by qualifier.
+void collectColumns(const IAST & ast, std::map<String, std::set<String>> & columns)
+{
+    if (const auto * identifier = ast.as<ASTIdentifier>(); identifier && identifier->compound())
+        columns[identifier->name_parts[0]].insert(identifier->name_parts[1]);
+    for (const auto & child : ast.children)
+        collectColumns(*child, columns);
+}
+
 /// Adds `SETTINGS name = value` to `select`, keeping its other settings.
 void setSetting(ASTSelectQuery & select, std::string_view name, const Field & value)
 {
@@ -695,16 +787,79 @@ ASTPtr makeSelectWithUnion(ASTPtr select)
     return query;
 }
 
-/// `(SELECT column FROM input WHERE where)`
-ASTPtr makeSemiJoinSubquery(const Input & input, const String & column, ASTPtr where)
+ASTPtr parseSelect(const String & sql);
+
+/// `(SELECT columns FROM input AS alias WHERE where)`. The alias of the input lets `where` qualify its columns like the
+/// conjuncts of the query.
+ASTPtr makeSemiJoinSubquery(const Input & input, const Names & columns, ASTPtr where)
 {
-    auto select = make_intrusive<ASTSelectQuery>();
-    auto columns = make_intrusive<ASTExpressionList>();
-    columns->children.push_back(make_intrusive<ASTIdentifier>(column));
-    select->setExpression(ASTSelectQuery::Expression::SELECT, std::move(columns));
-    select->replaceDatabaseAndTable(input.storage->getStorageID());
-    select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(where));
-    return make_intrusive<ASTSubquery>(makeSelectWithUnion(std::move(select)));
+    Strings names;
+    for (const auto & column : columns)
+        names.push_back(backQuote(column));
+    auto query = parseSelect(fmt::format("SELECT {} FROM {} AS {}", fmt::join(names, ", "),
+        input.storage->getStorageID().getFullTableName(), backQuote(input.alias)));
+    query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().setExpression(
+        ASTSelectQuery::Expression::WHERE, std::move(where));
+    return make_intrusive<ASTSubquery>(std::move(query));
+}
+
+/// `(k_1, ...) IN subquery` over the join keys of `input`.
+ASTPtr makeJoinKeysIn(const Input & input, ASTPtr subquery)
+{
+    ASTs keys;
+    for (const auto & key : input.join_keys)
+        keys.push_back(makeColumn(input.alias, key));
+    auto left = keys.size() == 1 ? std::move(keys[0]) : makeASTFunction("tuple", std::move(keys));
+    return makeASTFunction("in", std::move(left), std::move(subquery));
+}
+
+/// Replaces the table of `input` in `select` by the subquery of its rows that pass `conjuncts`. The right side of a LEFT,
+/// SEMI, ANTI or ASOF join needs its bounds before the join. In WHERE they would filter the joined rows, and a left row
+/// whose matches are all out of bounds would get no row instead of a row without a match. Over a signed table the subquery
+/// sums the signs of equal rows, because the join must see which rows remain, not each insert and retraction.
+void replaceTable(ASTSelectQuery & select, const Input & input, ASTs conjuncts, const String & sign_column)
+{
+    Strings columns;
+    Strings group_by;
+    for (const auto & column : input.columns)
+    {
+        columns.push_back(fmt::format("{}.{} AS {}", backQuote(input.alias), backQuote(column), backQuote(column)));
+        group_by.push_back(fmt::format("{}.{}", backQuote(input.alias), backQuote(column)));
+    }
+    const auto table = input.storage->getStorageID().getFullTableName();
+    auto query = parseSelect(input.is_signed
+        ? fmt::format("SELECT {0}, sum({1}.{2}) AS {2} FROM {3} AS {1} GROUP BY {4} HAVING {2} != 0",
+            fmt::join(columns, ", "), backQuote(input.alias), backQuote(sign_column), table, fmt::join(group_by, ", "))
+        : fmt::format("SELECT {} FROM {} AS {}", fmt::join(columns, ", "), table, backQuote(input.alias)));
+    query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().setExpression(
+        ASTSelectQuery::Expression::WHERE, makeConjunction(std::move(conjuncts)));
+    auto subquery = make_intrusive<ASTSubquery>(std::move(query));
+    subquery->setAlias(input.alias);
+
+    for (const auto & element : select.tables()->children)
+    {
+        const auto & table_expression = element->as<ASTTablesInSelectQueryElement &>().table_expression;
+        if (!table_expression)
+            continue;
+        auto & expression = table_expression->as<ASTTableExpression &>();
+        if (!expression.database_and_table_name || expression.database_and_table_name->tryGetAlias() != input.alias)
+            continue;
+        std::ranges::replace(expression.children, expression.database_and_table_name, ASTPtr(subquery));
+        expression.database_and_table_name = nullptr;
+        expression.subquery = subquery;
+        return;
+    }
+    chassert(false);
+}
+
+/// The rows of `weighted`, which has `columns` and the weight `__weight` of each row, as rows of sign 1 or -1 in column
+/// `sign`. Equal rows sum their weights first, so rows of opposite weights cancel.
+String consolidate(const String & columns, const String & sign, const String & weighted)
+{
+    return fmt::format(
+        "SELECT {0}, arrayJoin(arrayWithConstant(toUInt64(abs(`__count`)), toInt8(sign(`__count`)))) AS {1} "
+        "FROM (SELECT {0}, sum(`__weight`) AS `__count` FROM ({2}) GROUP BY {0} HAVING `__count` != 0)",
+        columns, sign, weighted);
 }
 
 /// Whether the clauses of a query with `delta_query_sign_column` need the integral of the core. The core is the rest of the
@@ -1241,9 +1396,26 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     residual = std::make_shared<const Residual>(std::move(split));
 }
 
-ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split)
+ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_, Residual * split)
 {
     inputs.clear();
+    clock_input.reset();
+    clock_conjuncts.clear();
+    consolidated_columns.clear();
+    sign_column = sign_column_;
+
+    /// A filter by now() changes its result as time passes, see `buildDelta`. Elsewhere now() would change rows that no
+    /// delta reads again.
+    const bool has_clock = callsNow(*query_);
+    if (const auto & selects = query_->as<ASTSelectWithUnionQuery &>().list_of_selects->children; has_clock && selects.size() == 1)
+    {
+        const auto & original = selects[0]->as<ASTSelectQuery &>();
+        if (std::ranges::any_of(original.children, [&](const auto & child) { return child != original.where() && callsNow(*child); }))
+            throwUnsupported("now() outside WHERE");
+    }
+    /// Resolution folds now() into a constant, and its source expression keeps the call.
+    IQueryTreeNode::ConvertToASTOptions ast_options;
+    ast_options.use_source_expression_for_constants = has_clock;
     InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     auto query_tree = interpreter.getQueryTree()->clone();
 
@@ -1256,13 +1428,56 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
 
     QueryTreeNodes tables;
     QueryTreeNodes conditions;
-    collectJoinTree(query_node->getJoinTreeNode(), tables, conditions);
+    QueryTreeNodes keyed_joins;
+    collectJoinTree(query_node->getJoinTreeNode(), tables, conditions, keyed_joins);
     InputIndexes input_indexes;
+    std::set<String> lookup_tables;
+    std::vector<std::string> names;
+    splitInto<','>(names, context->getSettingsRef()[Setting::delta_query_lookup_tables].value);
+    for (auto & name : names)
+    {
+        boost::trim(name);
+        if (!name.empty())
+            lookup_tables.insert(name);
+    }
+    std::set<String> found_lookup_tables;
     for (const auto & table : tables)
     {
         input_indexes.emplace(table.get(), inputs.size());
         inputs.push_back(makeInput(table->as<TableNode &>()));
+        const auto table_id = inputs.back().storage->getStorageID();
+        for (const auto & name : {table_id.table_name, table_id.getFullNameNotQuoted()})
+            if (lookup_tables.contains(name))
+            {
+                inputs.back().lookup = true;
+                found_lookup_tables.insert(name);
+            }
     }
+    for (const auto & name : lookup_tables)
+        if (!found_lookup_tables.contains(name))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "delta_query_lookup_tables names {}, which the delta query doesn't read", name);
+    if (std::ranges::all_of(inputs, [](const auto & input) { return input.lookup; }))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "delta_query_lookup_tables names every input of the delta query");
+
+    /// A SEMI or ANTI join returns each left row at most once, whatever the signs of its matches.
+    std::unordered_set<size_t> existence_joins;
+    for (const auto & node : keyed_joins)
+    {
+        const auto & join = node->as<JoinNode &>();
+        const size_t right = input_indexes.at(join.getRightTableExpressionNode().get());
+        for (const auto & edge : collectSemiJoinEdges({join.getJoinExpression()}, input_indexes))
+            if (edge.from == right && std::ranges::find(inputs[right].join_keys, edge.from_column) == inputs[right].join_keys.end())
+                inputs[right].join_keys.push_back(edge.from_column);
+        if (inputs[right].join_keys.empty())
+            throwUnsupported("LEFT, SEMI, ANTI or ASOF joins without an equality of join keys of both sides in ON");
+        if (join.getStrictness() == JoinStrictness::Semi || join.getStrictness() == JoinStrictness::Anti)
+            existence_joins.insert(right);
+    }
+    /// The delta of a join that isn't linear in a table, or of a filter by now(), retracts rows of the result.
+    const bool retracts = has_clock
+        || std::ranges::any_of(inputs, [](const auto & input) { return !input.join_keys.empty() && !input.lookup; });
+    if (retracts && sign_column.empty())
+        throwUnsupported("LEFT, SEMI, ANTI or ASOF joins of tables that aren't lookup tables, or now(), without delta_query_sign_column");
 
     /// The deltas of a join or of a query with signed inputs must merge into the query over the union of the inputs. The
     /// delta of any other query is the query over the new rows of its table.
@@ -1274,15 +1489,25 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     {
         if (!hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
             continue;
-        signs.push_back(makeColumn(inputs[i].alias, sign_column));
+        inputs[i].is_signed = true;
         signed_tables.insert(tables[i].get());
+        auto sign = makeColumn(inputs[i].alias, sign_column);
+        if (existence_joins.contains(i))
+            continue;
+        /// A left row without a match gets sign 0 from the right side.
+        if (!inputs[i].join_keys.empty())
+            sign = makeASTFunction("if", makeASTFunction("equals", sign->clone(), make_intrusive<ASTLiteral>(Field(Int64{0}))),
+                make_intrusive<ASTLiteral>(Field(Int64{1})), sign);
+        signs.push_back(std::move(sign));
     }
+    if (retracts)
+        signs.push_back(make_intrusive<ASTIdentifier>(term_sign_name));
     checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
     const bool has_residual = split && needsResidual(*query_node, !signs.empty());
     checkExpressions(*query_tree, input_indexes, is_linear && !has_residual);
     if (has_residual)
     {
-        auto resolved = query_tree->toAST();
+        auto resolved = query_tree->toAST(ast_options);
         return splitResidual(*query_node, resolved->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>(),
             !signs.empty(), *split);
     }
@@ -1295,7 +1520,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     if (query_node->hasWhere())
         conditions.push_back(query_node->getWhere());
     semi_join_edges = collectSemiJoinEdges(conditions, input_indexes);
-    query = query_tree->toAST();
+    query = query_tree->toAST(ast_options);
 
     auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
     /// Without GROUP BY, a delta that reads no rows still returns one row by default, with 0 for `min` and `max`.
@@ -1303,6 +1528,39 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
         setSetting(select, "empty_result_for_aggregation_by_empty_set", true);
     if (!sign_column.empty())
         addWeights(select, *query_node, signs, sign_column);
+
+    std::map<String, std::set<String>> columns;
+    collectColumns(select, columns);
+    for (auto & input : inputs)
+        if (!input.join_keys.empty())
+            for (const auto & column : columns[input.alias])
+                if (column != sign_column)
+                    input.columns.push_back(column);
+
+    /// The pairs of terms of a query without aggregates return most rows twice with opposite signs.
+    if (retracts && select.select()->children.back()->tryGetAlias() == sign_column)
+        for (const auto & column : query_node->getProjectionColumns())
+            consolidated_columns.push_back(column.name);
+
+    if (has_clock)
+    {
+        ASTs conjuncts{select.where()};
+        if (const auto * function = select.where()->as<ASTFunction>(); function && function->name == "and")
+            conjuncts = function->arguments->children;
+        std::map<String, std::set<String>> clocked;
+        for (const auto & conjunct : conjuncts)
+            if (callsNow(*conjunct))
+            {
+                clock_conjuncts.push_back(conjunct->clone());
+                collectColumns(*conjunct, clocked);
+            }
+        auto it = clocked.size() == 1
+            ? std::ranges::find_if(inputs, [&](const auto & input) { return input.alias == clocked.begin()->first; })
+            : inputs.end();
+        if (it == inputs.end() || !it->join_keys.empty())
+            throwUnsupported("filters by now() unless they read one table, which isn't the right side of a LEFT, SEMI, ANTI or ASOF join");
+        clock_input = it - inputs.begin();
+    }
 
     /// Resolution checks only that the user can see the tables. Building the plan checks the grants on the columns that
     /// the query reads.
@@ -1409,18 +1667,21 @@ String DeltaQuery::getIntegralCreateQuery(const StorageID & integral) const
     for (size_t i = 0; i < residual->num_keys; ++i)
         if (std::ranges::find(residual->partition_keys, i) == residual->partition_keys.end())
             order.push_back(backQuote(makeKeyName(i)));
-    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} SETTINGS allow_nullable_key = 1",
-        integral.getFullTableName(), quoteString(toString(integral.uuid)), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
+    /// A group whose rows are all retracted has count 0, and merges delete it.
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {}{} SETTINGS allow_nullable_key = 1",
+        integral.getFullTableName(), quoteString(toString(integral.uuid)), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")",
+        residual->num_keys ? " TTL toDateTime(0) DELETE WHERE `__agg_0` = 0" : "");
 }
 
 /// The residual over the touched keys counts each of its rows once, and the target counts each of its rows of those keys by
 /// the sum of their signs. The difference of the counts per row is the delta, which becomes that many rows of sign 1 or -1.
-ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target) const
+ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target,
+    bool all_keys) const
 {
     chassert(residual);
     String where;
     String target_where;
-    if (!residual->partition_keys.empty())
+    if (!all_keys && !residual->partition_keys.empty())
     {
         Names keys;
         for (auto key : residual->partition_keys)
@@ -1438,13 +1699,14 @@ ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageI
     const auto input = residual->append_only
         ? residual->buildAppendOnlyInput(target.getFullTableName(), target_where, delta.getFullTableName())
         : residual->buildInput(integral.getFullTableName(), where);
-    return parseSelect(fmt::format(
-        "SELECT {0}, arrayJoin(arrayWithConstant(toUInt64(abs(`__count`)), toInt8(sign(`__count`)))) AS {1} "
-        "FROM (SELECT {0}, sum(`__weight`) AS `__count` "
-        "FROM (SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}) "
-        "GROUP BY {0} HAVING `__count` != 0){5}",
-        columns, sign, residual->buildResidual(input), target.getFullTableName(), target_where,
-        skip ? " WHERE 0" : ""));
+    return parseSelect(consolidate(columns, sign, fmt::format(
+        "SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}",
+        columns, sign, residual->buildResidual(input), target.getFullTableName(), target_where)) + (skip ? " WHERE 0" : ""));
+}
+
+bool DeltaQuery::hasPartitionedResidual() const
+{
+    return residual && !residual->partition_keys.empty();
 }
 
 CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
@@ -1460,7 +1722,10 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
             bound = blocks.getCommittedEnd(partition_id, bound);
         std::erase_if(partitions, [](const auto & partition) { return partition.second <= 0; });
     }
-    return makeCursorTree(frontier);
+    auto tree = makeCursorTree(frontier);
+    if (clock_input)
+        tree->setValue(time_key, std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    return tree;
 }
 
 /// The UNION ALL over i of Q, where input i reads rows in [old, new), inputs before it read rows below old, and inputs after
@@ -1472,6 +1737,13 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
 /// reduction of a in term i. Every row of the term satisfies that conjunct, because its row of a satisfies the same bounds
 /// and reduction and has `x = b.y`. So the conjunct removes only rows that the join removes. The conjunct only filters rows
 /// of b and never changes how many times a row appears, so it stays correct for inputs whose rows carry negative weights.
+///
+/// A LEFT, SEMI, ANTI or ASOF join is linear in its left side only. A new row of its right input i changes the result for
+/// every left row of its join keys. So term i is the difference of two terms that read the rows of input i below the new
+/// and below the old cursor, of the join keys of the new rows of input i. The reduction starts from those new rows.
+///
+/// A filter by now() is a join with the time, which is one more input after the others. Its term reads every input below
+/// the old cursor, and it is the difference of the query at the new and at the old time over the rows whose filter changed.
 ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const
 {
     const auto tables = snapshotTables(inputs);
@@ -1501,56 +1773,145 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         }
     }
 
+    const auto old_time = getTime(old_cursor);
+    const auto new_time = getTime(new_cursor);
+    const bool from_empty = std::ranges::all_of(inputs, [&](const auto & input) { return old_bounds.at(input.key).empty(); });
+    if (clock_input && (!new_time || (!from_empty && !old_time)))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "The cursors of a delta query that calls now() need the time of their snapshot, which deltaQueryFrontier adds");
+
     const auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
     auto terms = make_intrusive<ASTExpressionList>();
-    for (size_t i = 0; i < inputs.size(); ++i)
+    bool has_pairs = false;
+
+    /// The rows of an input that a term reads.
+    enum class Rows : uint8_t { Old, New, Delta };
+    auto add_rows = [&](ASTs & conjuncts, size_t j, Rows rows)
     {
-        auto add_bounds = [&](ASTs & conjuncts, size_t j, const String & qualifier)
+        const auto & key = inputs[j].key;
+        addBounds(conjuncts, inputs[j].alias, rows == Rows::Delta ? &old_bounds.at(key) : nullptr,
+            rows == Rows::Old ? old_bounds.at(key) : new_bounds.at(key));
+    };
+    auto has_new_rows = [&](size_t i)
+    {
+        const auto & key = inputs[i].key;
+        return std::ranges::any_of(new_bounds.at(key), [&](const auto & partition)
         {
-            const auto & key = inputs[j].key;
-            if (j < i)
-                addBounds(conjuncts, qualifier, nullptr, old_bounds.at(key));
-            else if (j == i)
-                addBounds(conjuncts, qualifier, &old_bounds.at(key), new_bounds.at(key));
-            else
-                addBounds(conjuncts, qualifier, nullptr, new_bounds.at(key));
-        };
+            return partition.second > getBound(old_bounds.at(key), partition.first);
+        });
+    };
 
-        ASTs conjuncts;
-        if (auto where = select.where())
-            conjuncts.push_back(where->clone());
+    /// Adds the term that reads rows `rows[j]` of each input j, and of input `from` only those that also pass `own`. The
+    /// reduction starts from the rows of `from` that pass `change`. The rows of the term have weight `sign` times their
+    /// weight in the query, and now() is `time`.
+    auto add_term = [&](const std::vector<Rows> & rows, std::optional<size_t> from, ASTs own, const ASTs & change, Int64 sign,
+        std::optional<Int64> time)
+    {
+        std::vector<ASTs> conjuncts(inputs.size());
         for (size_t j = 0; j < inputs.size(); ++j)
-            add_bounds(conjuncts, j, inputs[j].alias);
+            add_rows(conjuncts[j], j, rows[j]);
+        if (from)
+            std::ranges::move(own, std::back_inserter(conjuncts[*from]));
 
-        /// Each subquery reads one table and defines no aliases, so its unqualified columns name columns of that table.
-        /// `reductions[j]` is the reduction of input j with unqualified columns, for the subqueries of later hops.
-        std::vector<ASTPtr> reductions(inputs.size());
         std::vector<bool> reached(inputs.size());
-        reached[i] = true;
-        std::deque<size_t> queue{i};
+        std::deque<size_t> queue;
+        if (from)
+        {
+            reached[*from] = true;
+            queue.push_back(*from);
+        }
         while (!queue.empty())
         {
-            size_t from = queue.front();
+            size_t a = queue.front();
             queue.pop_front();
-            for (const auto & [a, x, b, y] : semi_join_edges)
+            for (const auto & [edge_from, x, b, y] : semi_join_edges)
             {
-                if (a != from || reached[b])
+                if (edge_from != a || reached[b])
                     continue;
                 reached[b] = true;
                 queue.push_back(b);
-
-                ASTs where;
-                add_bounds(where, a, "");
-                if (reductions[a])
-                    where.push_back(reductions[a]->clone());
-                auto subquery = makeSemiJoinSubquery(inputs[a], x, makeASTFunction("and", std::move(where)));
-                reductions[b] = makeASTFunction("in", make_intrusive<ASTIdentifier>(y), subquery->clone());
-                conjuncts.push_back(makeASTFunction("in", makeColumn(inputs[b].alias, y), std::move(subquery)));
+                auto subquery = makeSemiJoinSubquery(inputs[a], {x}, makeConjunction(cloneAll(a == *from ? change : conjuncts[a])));
+                conjuncts[b].push_back(makeASTFunction("in", makeColumn(inputs[b].alias, y), std::move(subquery)));
             }
         }
 
         auto term = select.clone();
-        term->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::WHERE, makeASTFunction("and", std::move(conjuncts)));
+        auto & term_select = term->as<ASTSelectQuery &>();
+        ASTs where;
+        if (select.where())
+            where.push_back(select.where()->clone());
+        for (size_t j = 0; j < inputs.size(); ++j)
+        {
+            if (inputs[j].join_keys.empty())
+                std::ranges::move(conjuncts[j], std::back_inserter(where));
+            else
+                replaceTable(term_select, inputs[j], std::move(conjuncts[j]), sign_column);
+        }
+        term_select.setExpression(ASTSelectQuery::Expression::WHERE, makeConjunction(std::move(where)));
+        bindTerm(*term, sign, time);
+        terms->children.push_back(std::move(term));
+    };
+
+    /// From the empty cursor, the delta is the query over the rows below the new cursor. One term reads them, instead of one
+    /// term per input that each read all the other inputs.
+    if (from_empty)
+        add_term(std::vector<Rows>(inputs.size(), Rows::New), {}, {}, {}, 1, new_time);
+
+    for (size_t i = 0; i < inputs.size() && !from_empty; ++i)
+    {
+        /// The new rows of a lookup table join with nothing, and the other terms read all its rows below the new cursor.
+        if (inputs[i].lookup || !has_new_rows(i))
+            continue;
+        std::vector<Rows> rows(inputs.size());
+        for (size_t j = 0; j < inputs.size(); ++j)
+            rows[j] = j < i && !inputs[j].lookup ? Rows::Old : Rows::New;
+        ASTs change;
+        add_rows(change, i, Rows::Delta);
+        if (inputs[i].join_keys.empty())
+        {
+            rows[i] = Rows::Delta;
+            add_term(rows, i, {}, change, 1, new_time);
+            continue;
+        }
+        auto keys = makeJoinKeysIn(inputs[i], makeSemiJoinSubquery(inputs[i], inputs[i].join_keys, makeConjunction(cloneAll(change))));
+        for (auto [own_rows, sign] : {std::pair{Rows::New, Int64{1}}, std::pair{Rows::Old, Int64{-1}}})
+        {
+            rows[i] = own_rows;
+            add_term(rows, i, {keys->clone()}, change, sign, new_time);
+        }
+        has_pairs = true;
+    }
+
+    if (clock_input && !from_empty && *old_time != *new_time)
+    {
+        std::vector<Rows> rows(inputs.size());
+        for (size_t j = 0; j < inputs.size(); ++j)
+            rows[j] = inputs[j].lookup ? Rows::New : Rows::Old;
+        auto filter_at = [&](Int64 time)
+        {
+            /// A conjunct with now() is a function of it, so `bindTerm` reaches every call.
+            auto filter = makeConjunction(cloneAll(clock_conjuncts));
+            bindTerm(*filter, {}, time);
+            return filter;
+        };
+        auto old_filter = filter_at(*old_time);
+        auto new_filter = filter_at(*new_time);
+        auto changed = makeASTFunction("and", makeASTFunction("or", old_filter->clone(), new_filter->clone()),
+            makeASTFunction("not", makeASTFunction("and", old_filter, new_filter)));
+        ASTs change;
+        add_rows(change, *clock_input, rows[*clock_input]);
+        change.push_back(changed->clone());
+        for (auto [time, sign] : {std::pair{*new_time, Int64{1}}, std::pair{*old_time, Int64{-1}}})
+            add_term(rows, clock_input, {changed->clone()}, change, sign, time);
+        has_pairs = true;
+    }
+
+    /// No input has new rows.
+    if (terms->children.empty())
+    {
+        auto term = select.clone();
+        term->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::WHERE, make_intrusive<ASTLiteral>(Field(UInt8{0})));
+        bindTerm(*term, 1, new_time);
         terms->children.push_back(std::move(term));
     }
 
@@ -1559,7 +1920,13 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
     result->is_normalized = true;
     result->list_of_selects = terms;
     result->children.push_back(terms);
-    return result;
+    if (!has_pairs || consolidated_columns.empty())
+        return result;
+    Strings columns;
+    for (const auto & column : consolidated_columns)
+        columns.push_back(backQuote(column));
+    return parseSelect(consolidate(joinNames(columns), backQuote(sign_column), fmt::format("SELECT {}, toInt64({}) AS `__weight` FROM ({})",
+        joinNames(columns), backQuote(sign_column), result->formatWithSecretsOneLine())));
 }
 
 }

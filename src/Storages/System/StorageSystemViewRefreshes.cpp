@@ -5,6 +5,8 @@
 #include <Access/ContextAccess.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeDateTime.h>
+#include <DataTypes/DataTypeFactory.h>
+#include <Core/Streaming/CursorTree.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeUUID.h>
@@ -45,6 +47,7 @@ ColumnsDescription StorageSystemViewRefreshes::getColumnsDescription()
         {"total_rows", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Estimated total number of rows that need to be read by the current running or most recently completed refresh at the given replica. NULL if status is `RunningOnAnotherReplica`"},
         {"written_rows", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Number of rows written by the current running or most recently completed refresh at the given replica. NULL if status is `RunningOnAnotherReplica`"},
         {"written_bytes", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Number of bytes written by the current running or most recently completed refresh at the given replica. NULL if status is `RunningOnAnotherReplica`"},
+        {"cursor", DataTypeFactory::instance().get("Map(String, Int64)"), "The cursor of an incremental view as of its last successful refresh, for `deltaQuery`. Empty for other views and for views whose target keeps the cursor."},
     };
 }
 
@@ -125,6 +128,7 @@ void StorageSystemViewRefreshes::fillData(
             res_columns[i++]->insert(Field());
             res_columns[i++]->insert(Field());
         }
+        res_columns[i++]->insert(refresh.znode.cursor ? cursorTreeToMap(refresh.znode.cursor) : Map{});
     }
 }
 

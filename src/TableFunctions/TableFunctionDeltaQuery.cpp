@@ -55,7 +55,12 @@ protected:
         const IAST * query = num_arguments ? function.arguments->children[0].get() : nullptr;
         if (const auto * subquery = query ? query->as<ASTSubquery>() : nullptr)
             query = subquery->children.at(0).get();
-        if (!query || !query->as<ASTSelectWithUnionQuery>())
+        const auto * union_query = query ? query->as<ASTSelectWithUnionQuery>() : nullptr;
+        if (!union_query || !std::ranges::all_of(union_query->list_of_selects->children, [](const auto & select)
+            {
+                const auto * select_query = select->template as<ASTSelectQuery>();
+                return select_query && select_query->select();
+            }))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table function '{}' requires a query as its first argument", getName());
         if (num_arguments != 1 + numCursorArguments())
             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Table function '{}' takes a query and {} cursors",
@@ -96,13 +101,16 @@ private:
         return ColumnsDescription(InterpreterSelectQueryAnalyzer::getSampleBlock(query.getQuery()->clone(), context)->getNamesAndTypesList());
     }
 
-    StoragePtr executeImpl(const ASTPtr &, ContextPtr context, const String & table_name, ColumnsDescription, bool) const override
+    StoragePtr executeImpl(const ASTPtr &, ContextPtr context, const String & table_name, ColumnsDescription cached_columns, bool) const override
     {
         DeltaQuery query(delta_query, context);
         checkNoResidual(query);
         ASTCreateQuery create;
         create.set(create.select, query.buildDelta(parseCursor(cursor_arguments[0], context), parseCursor(cursor_arguments[1], context)));
-        ColumnsDescription columns(InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(), context)->getNamesAndTypesList());
+        /// Each term of the delta has the columns of the query. Analyzing the query once is much cheaper than analyzing every
+        /// term, which is most of the planning of a query with many aggregates.
+        ColumnsDescription columns = !cached_columns.empty() ? std::move(cached_columns)
+            : ColumnsDescription(InterpreterSelectQueryAnalyzer::getSampleBlock(query.getQuery()->clone(), context)->getNamesAndTypesList());
         auto storage = std::make_shared<StorageView>(StorageID(getDatabaseName(), table_name), create, columns, "");
         storage->startup();
         return storage;
@@ -155,7 +163,13 @@ A cursor has type `Map(String, Int64)`. Each key is a path `table_uuid.partition
 of the partition that the cursor excludes. An empty map is the cursor before any insert. Get the current cursor with `deltaQueryFrontier`.
 
 The tables must be `MergeTree` or `ReplicatedMergeTree` tables of Atomic databases with `enable_block_number_column = 1`, without mutations
-or lightweight updates. A query that joins tables may use filters, `INNER` and `CROSS` joins, and `GROUP BY`. Each of its result columns is
+or lightweight updates. A query that joins tables may use filters, `INNER` and `CROSS` joins, and `GROUP BY`. With `delta_query_sign_column`
+it may also use `LEFT`, `SEMI`, `ANTI` and `ASOF` joins of a table by `ON` with an equality of columns, and filters by `now()` in `WHERE`
+over the columns of one table. Their deltas retract rows. The cursors of a query with `now()` have the key `now`, the time of the
+snapshot.
+
+`target UNION ALL deltaQuery(query, cursor, frontier)` reads the result of an incremental refreshable materialized view without a residual
+as of now, where `cursor` is the column of `system.view_refreshes` and `frontier` is the cursor that `deltaQueryFrontier` returns. Each of its result columns is
 either free of aggregates or one call of `sum`, `count`, their `-If` forms, `min`, `max`, `any`, `groupBitOr`, `groupBitAnd`, `groupBitXor`,
 or any `-State` aggregate.
 

@@ -6,6 +6,7 @@
 #include <Parsers/IAST_fwd.h>
 
 #include <memory>
+#include <optional>
 #include <vector>
 
 
@@ -22,6 +23,9 @@ namespace DB
 /// of the signs of its signed inputs. A query without aggregates returns the weight of each row as that column. A query
 /// with aggregates weighs its rows in its aggregates. The deltas merge like the deltas of a join.
 ///
+/// A query can also have LEFT, SEMI, ANTI and ASOF joins of a table, and filters by now() in WHERE. Their deltas retract
+/// rows, so they need `delta_query_sign_column`. See `buildDelta`.
+///
 /// With `delta_query_sign_column`, a query can also have a residual: the clauses whose result over the union of the deltas
 /// differs from the union of their results, like HAVING, ORDER BY with LIMIT, LIMIT BY, DISTINCT, window functions,
 /// expressions over aggregates and aggregates like `uniq`. The query then splits into a linear core and the residual. The
@@ -33,6 +37,7 @@ namespace DB
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
 /// table as of a cursor is the rows with `_block_number` below the value, and a missing partition or table has no rows.
+/// The cursor of a query that calls now() also has the key `now`, the time of the snapshot in seconds.
 ///
 /// `deltaQuery` and incremental refreshable materialized views use this class.
 class DeltaQuery
@@ -62,11 +67,17 @@ public:
     /// `CREATE TABLE IF NOT EXISTS` of the integral of the core.
     String getIntegralCreateQuery(const StorageID & integral) const;
 
+    /// Whether the residual compares rows only within the touched values of some keys, like HAVING, LIMIT BY or a window
+    /// with PARTITION BY. A refresh can then recompute the residual for the touched values or for all keys.
+    bool hasPartitionedResidual() const;
+
     /// The rows that make `target` equal to the residual over `integral`, after `integral` absorbed the delta of the core
-    /// in table `delta`. The rows have the sign column. The residual runs over the keys that the delta touched, unless the
-    /// residual can move rows between keys, like a LIMIT over all rows. Then it runs over all keys. An empty `delta`
-    /// touches no keys. An append-only residual runs over the rows of `target` and `delta` instead of `integral`.
-    ASTPtr buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target) const;
+    /// in table `delta`. The rows have the sign column. The residual runs over the keys that the delta touched, unless
+    /// `all_keys` is set or the residual can move rows between keys, like a LIMIT over all rows. Then it runs over all keys.
+    /// An empty `delta` touches no keys. An append-only residual runs over the rows of `target` and `delta` instead of
+    /// `integral`.
+    ASTPtr buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target,
+        bool all_keys = false) const;
 
     struct Input;
     struct SemiJoinEdge;
@@ -82,6 +93,13 @@ private:
     std::vector<Input> inputs;
     std::vector<SemiJoinEdge> semi_join_edges;
     std::shared_ptr<const Residual> residual;
+    String sign_column;
+    /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
+    std::optional<size_t> clock_input;
+    ASTs clock_conjuncts;
+    /// The result columns of a query without aggregates whose delta retracts rows, without the sign column. The delta sums
+    /// the signs of equal rows.
+    Names consolidated_columns;
 };
 
 }
