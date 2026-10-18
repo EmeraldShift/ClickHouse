@@ -56,13 +56,16 @@ public:
     /// Whether the query has a residual. `buildDelta` then returns the deltas of the core, which go to the integral.
     bool hasResidual() const { return residual != nullptr; }
 
+    /// Whether the residual needs no integral, because the target holds all of its state. See `Residual::append_only`.
+    bool isAppendOnly() const;
+
     /// `CREATE TABLE IF NOT EXISTS` of the integral of the core.
     String getIntegralCreateQuery(const StorageID & integral) const;
 
     /// The rows that make `target` equal to the residual over `integral`, after `integral` absorbed the delta of the core
     /// in table `delta`. The rows have the sign column. The residual runs over the keys that the delta touched, unless the
     /// residual can move rows between keys, like a LIMIT over all rows. Then it runs over all keys. An empty `delta`
-    /// touches no keys.
+    /// touches no keys. An append-only residual runs over the rows of `target` and `delta` instead of `integral`.
     ASTPtr buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target) const;
 
     struct Input;

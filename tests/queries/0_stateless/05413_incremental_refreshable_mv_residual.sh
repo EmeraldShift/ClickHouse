@@ -7,7 +7,8 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Maintain queries with residuals in incremental refreshable materialized views: HAVING, expressions over aggregates, avg,
 # a LIMIT over all groups, LIMIT BY, a window with QUALIFY, DISTINCT, aggregates like uniqExact over an unsigned table,
-# sums and averages of Nullable values, and a global aggregate over rows that all fail WHERE.
+# sums and averages of Nullable values, a global aggregate over rows that all fail WHERE, and residuals over the rows of
+# an unsigned table, which keep no integral.
 # After each round of inserts, deletes and updates, compare the net rows of each view with its query over the rows that no
 # row of sign -1 cancels.
 
@@ -37,9 +38,14 @@ q5() { echo "SELECT DISTINCT o.product AS product FROM $1 AS o"; }
 q6() { echo "SELECT k, uniqExact(v) AS u, min(v) AS m, max(v) - min(v) AS spread FROM events GROUP BY k HAVING count() >= 2"; }
 q7() { echo "SELECT k, sum(v) + 1 AS s, avg(v) AS a, avgIf(v, v > 0) AS ai FROM ${3:-readings} GROUP BY k HAVING count() > 0"; }
 q8() { echo "SELECT count() + 1 AS c, sum(v) AS s FROM ${3:-readings} WHERE k > 100"; }
+# Residuals over the rows of the unsigned table events keep no integral.
+q9() { echo "SELECT k, v FROM events ORDER BY v DESC, k LIMIT 3"; }
+q10() { echo "SELECT k, v FROM events ORDER BY v DESC LIMIT 1 BY k"; }
+q11() { echo "SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY v) AS rn FROM events QUALIFY rn <= 2"; }
+q12() { echo "SELECT DISTINCT v FROM events"; }
 
-VIEWS="1 2 3 4 5 6 7 8"
-COLUMNS=("category, qty, avg_price" "id, value" "category, id, qty" "category, id, qty, r" "product" "k, u, m, spread" "k, s, a, ai" "c, s")
+VIEWS="1 2 3 4 5 6 7 8 9 10 11 12"
+COLUMNS=("category, qty, avg_price" "id, value" "category, id, qty" "category, id, qty, r" "product" "k, u, m, spread" "k, s, a, ai" "c, s" "k, v" "k, v" "k, v, rn" "v")
 NET_ORDERS="(SELECT id, product, qty FROM orders GROUP BY ALL HAVING sum(sign) > 0)"
 NET_QUOTES="(SELECT order_id, price FROM quotes GROUP BY ALL HAVING sum(sign) > 0)"
 NET_READINGS="(SELECT k, v FROM readings GROUP BY ALL HAVING sum(sign) > 0)"
@@ -90,7 +96,8 @@ $CLICKHOUSE_CLIENT -q "
     INSERT INTO orders VALUES (3, 'A', 7, -1), (3, 'A', 12, 1), (5, 'C', 2, 1), (4, 'B', 3, -1);
     INSERT INTO quotes VALUES (4, 150, -1), (5, 80, 1);
     INSERT INTO products VALUES ('C', 'toys');
-    INSERT INTO readings VALUES (2, 7, 1), (3, 5, -1);"
+    INSERT INTO readings VALUES (2, 7, 1), (3, 5, -1);
+    INSERT INTO events VALUES (1, 30), (4, 2), (2, 9);"
 end_round 3
 
 # Only quotes change, and nothing changes after that.
@@ -102,7 +109,7 @@ end_round 5
 for i in $VIEWS; do
     $CLICKHOUSE_CLIENT -q "DETACH TABLE view_$i; ATTACH TABLE view_$i;"
 done
-$CLICKHOUSE_CLIENT -q "INSERT INTO readings VALUES (2, 1, 1);"
+$CLICKHOUSE_CLIENT -q "INSERT INTO readings VALUES (2, 1, 1); INSERT INTO events VALUES (3, 1), (2, 9), (5, 40);"
 end_round 6
 
 echo "Net rows of the views"

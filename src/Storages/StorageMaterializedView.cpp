@@ -721,13 +721,26 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
             /// Like a refresh that replaces the target, the definer creates, drops, reads and writes the hidden tables.
             refresh_context->checkAccess(AccessType::DROP_TABLE | AccessType::CREATE_TABLE | AccessType::SELECT | AccessType::INSERT,
                 integral_id.database_name);
-            executeRefreshStep(delta_query.getIntegralCreateQuery(integral_id), refresh_context);
+            const bool append_only = delta_query.isAppendOnly();
+            if (!append_only)
+            {
+                /// An append-only view creates no integral. If an input gained a sign column, the view isn't append-only
+                /// anymore and its integral would miss the rows of the earlier refreshes.
+                if (stream_cursor && !DatabaseCatalog::instance().isTableExist(integral_id, refresh_context))
+                    throw Exception(ErrorCodes::INCORRECT_QUERY,
+                        "The inputs of incremental refreshable materialized view {} have a sign column that they didn't have when "
+                        "the view started, so the view must be created again", getStorageID().getNameForLogs());
+                executeRefreshStep(delta_query.getIntegralCreateQuery(integral_id), refresh_context);
+            }
             executeRefreshStep(fmt::format("CREATE OR REPLACE TABLE {} ENGINE = Memory AS {}", delta_id.getFullTableName(),
                 select_query->formatWithSecretsOneLine()), refresh_context);
-            executeRefreshStep(fmt::format("INSERT INTO {} SELECT * FROM {}", integral_id.getFullTableName(), delta_id.getFullTableName()),
-                refresh_context);
+            if (!append_only)
+                executeRefreshStep(fmt::format("INSERT INTO {} SELECT * FROM {}", integral_id.getFullTableName(),
+                    delta_id.getFullTableName()), refresh_context);
             auto delta_rows = DatabaseCatalog::instance().getTable(delta_id, refresh_context)->totalRows(refresh_context);
             select_query = delta_query.buildResidualDelta(integral_id, delta_id, delta_rows == 0, inner_table_id);
+            /// `RefreshTask` drops the delta after the refresh, which frees its memory.
+            out_temp_table_id = delta_id;
         }
         {
             /// `RefreshTask` persists this cursor after the refresh succeeds. A transactional target commits it with the data.

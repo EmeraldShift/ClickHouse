@@ -116,6 +116,13 @@ struct DeltaQuery::Residual
     /// them. A refresh recomputes the rows of the touched values of these keys. Empty if it recomputes all rows.
     std::vector<size_t> partition_keys;
     Names partition_outputs;
+    /// The output column that equals each key, or empty.
+    Names key_outputs;
+    /// Whether the residual over its own result and new rows equals the residual over all rows. Then the target holds all
+    /// the state and the view needs no integral. That holds over unsigned inputs, which only get inserts, for a residual
+    /// over rows that only drops rows that inserts can't bring back, like LIMIT, LIMIT BY, DISTINCT and QUALIFY with an
+    /// upper bound on a rank. Every key must be an output column, so the target rows can stand for the input rows.
+    bool append_only = false;
 
     /// Filled from the analysis of the core.
     DataTypes key_types;
@@ -126,8 +133,10 @@ struct DeltaQuery::Residual
 
     /// The rows of `integral` that pass `where` merged per key.
     String buildInput(const String & integral, const String & where) const;
-    /// The residual over the rows of `integral` that pass `where`.
-    String buildResidual(const String & integral, const String & where) const;
+    /// The net rows of `target` that pass `where` as rows of keys, and the rows of the delta of the core in `delta`.
+    String buildAppendOnlyInput(const String & target, const String & where, const String & delta) const;
+    /// The residual over `input`, which selects the keys and the merged aggregates.
+    String buildResidual(const String & input) const;
     /// `(c_1, ...) IN (SELECT __key_p1, ... FROM delta)`, where column c_i equals partition key i.
     String buildPartitionFilter(const Names & columns, const String & delta) const;
 };
@@ -723,6 +732,7 @@ bool needsResidual(const QueryNode & query, bool is_signed)
 
 String makeKeyName(size_t key) { return fmt::format("__key_{}", key + 1); }
 
+
 /// Whether the core, the residual or the delta of the residual names its own columns `name`.
 bool isGeneratedName(std::string_view name)
 {
@@ -816,6 +826,46 @@ ASTPtr getWindowPartition(const ASTFunction & function, const ASTSelectQuery & s
     while (!window->partition_by && !window->parent_window_name.empty())
         window = &find_window(window->parent_window_name);
     return window->partition_by;
+}
+
+/// Whether the rows that `select` drops stay dropped after inserts of more rows. LIMIT and LIMIT BY keep the first rows in
+/// order, DISTINCT keeps one row per value, and a filter keeps the rows that pass it. A rank-like window over a partition
+/// only grows for its rows as rows arrive, so QUALIFY with an upper bound on it keeps a prefix of each partition. Windows
+/// combined with a clause that drops rows could read rows that the clause dropped, and so could OFFSET.
+bool dropsRowsForGood(ASTSelectQuery & select, bool with_fill)
+{
+    if (select.limitOffset() || select.limitByOffset() || select.limitAfter() || select.limitUntil() || select.interpolate() || with_fill)
+        return false;
+    static const std::set<String> ranks = {"row_number", "rank", "dense_rank"};
+    bool has_windows = false;
+    bool only_ranks = true;
+    visitResidualClauses(select, [&](const ASTPtr & node) -> ASTPtr
+    {
+        if (const auto * function = node->as<ASTFunction>(); function && function->isWindowFunction())
+        {
+            has_windows = true;
+            only_ranks &= ranks.contains(function->name);
+        }
+        return nullptr;
+    });
+    if (!has_windows)
+        return true;
+    if (!only_ranks || select.limitLength() || select.limitBy() || select.distinct)
+        return false;
+    if (!select.qualify())
+        return true;
+    /// `rank <= c`, `rank < c`, `c >= rank` or `c > rank`.
+    const auto * comparison = select.qualify()->as<ASTFunction>();
+    if (!comparison || !comparison->arguments || comparison->arguments->children.size() != 2)
+        return false;
+    const auto & arguments = comparison->arguments->children;
+    auto is_rank = [](const ASTPtr & ast)
+    {
+        const auto * function = ast->as<ASTFunction>();
+        return function && function->isWindowFunction();
+    };
+    return ((comparison->name == "lessOrEquals" || comparison->name == "less") && is_rank(arguments[0]) && arguments[1]->as<ASTLiteral>())
+        || ((comparison->name == "greaterOrEquals" || comparison->name == "greater") && is_rank(arguments[1]) && arguments[0]->as<ASTLiteral>());
 }
 
 ASTs cloneAll(const ASTs & asts)
@@ -916,6 +966,15 @@ ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, boo
         residual.partition_keys.push_back(i);
         residual.partition_outputs.push_back(residual.outputs.at(column - projection.begin()));
     }
+    for (const auto & key : keys)
+    {
+        const auto & projection = outer.select()->children;
+        auto hash = key->getTreeHash(true);
+        auto column = std::ranges::find_if(projection, [&](const auto & expression) { return expression->getTreeHash(true) == hash; });
+        residual.key_outputs.push_back(column == projection.end() ? "" : residual.outputs.at(column - projection.begin()));
+    }
+    residual.append_only = !is_signed && !residual.has_aggregates && dropsRowsForGood(outer, with_fill)
+        && std::ranges::none_of(residual.key_outputs, [](const String & output) { return output.empty(); });
 
     /// The aggregates of the core by their hashes, and the columns of the integral for them.
     ASTs core_aggregates;
@@ -1011,6 +1070,29 @@ ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, boo
             throwUnsupported(fmt::format("{} outside aggregates and GROUP BY keys", node->formatForErrorMessage()));
         return nullptr;
     });
+
+    /// LIMIT and LIMIT BY keep any of the rows that tie in the ORDER BY. Ordering ties by the keys makes each refresh keep
+    /// the same rows, so the target doesn't swap one tied row for another.
+    if ((outer.limitLength() || outer.limitBy()) && !outer.limit_with_ties)
+    {
+        if (!outer.orderBy())
+            outer.setExpression(ASTSelectQuery::Expression::ORDER_BY, make_intrusive<ASTExpressionList>());
+        auto & elements = outer.orderBy()->children;
+        std::set<String> ordered;
+        for (const auto & element : elements)
+            if (const auto * identifier = element->children.at(0)->as<ASTIdentifier>())
+                ordered.insert(identifier->name());
+        for (size_t i = 0; i < keys.size(); ++i)
+        {
+            if (ordered.contains(makeKeyName(i)))
+                continue;
+            auto element = make_intrusive<ASTOrderByElement>();
+            element->direction = 1;
+            element->nulls_direction = 1;
+            element->children.push_back(make_intrusive<ASTIdentifier>(makeKeyName(i)));
+            elements.push_back(std::move(element));
+        }
+    }
 
     auto having = outer.having();
     outer.setExpression(ASTSelectQuery::Expression::HAVING, nullptr);
@@ -1152,7 +1234,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
 
     /// The residual over an empty integral has the types of the rows that the residual deltas insert.
     split.output_query = parseSelect(fmt::format("SELECT *, toInt8(1) AS {} FROM ({})", backQuote(sign_column),
-        split.buildResidual(fmt::format("null({})", quoteString(joinNames(structure))), "")));
+        split.buildResidual(split.buildInput(fmt::format("null({})", quoteString(joinNames(structure))), ""))));
     for (const auto & column : *InterpreterSelectQueryAnalyzer::getSampleBlock(split.output_query, context))
         if (WhichDataType(column.type).isAggregateFunction())
             throwUnsupported(fmt::format("aggregate states like column {} in the results of queries with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates", column.name));
@@ -1257,13 +1339,38 @@ String DeltaQuery::Residual::buildInput(const String & integral, const String & 
     return fmt::format("SELECT {} FROM {}{}{}{}", joinNames(columns), integral, where, group_by, keys.empty() ? "" : " HAVING `__count` > 0");
 }
 
-String DeltaQuery::Residual::buildResidual(const String & integral, const String & where) const
+String DeltaQuery::Residual::buildAppendOnlyInput(const String & target, const String & where, const String & delta) const
 {
-    auto input = parseSelect(fmt::format("SELECT * FROM ({})", buildInput(integral, where)));
+    Strings outputs_list;
+    for (const auto & output : outputs)
+        outputs_list.push_back(backQuote(output));
+    Strings state;
+    Strings keys;
+    for (size_t i = 0; i < num_keys; ++i)
+    {
+        state.push_back(fmt::format("{} AS {}", backQuote(key_outputs.at(i)), backQuote(makeKeyName(i))));
+        keys.push_back(backQuote(makeKeyName(i)));
+    }
+    /// A row of the target with signs that sum to n stands for n rows, and so does a row of the delta with count n.
+    return fmt::format(
+        "SELECT {0} FROM (SELECT {1}, sum({2}) AS `__count` FROM {3}{4} GROUP BY {1} HAVING `__count` > 0) "
+        "ARRAY JOIN range(toUInt64(`__count`)) AS `__index` "
+        "UNION ALL SELECT {5} FROM {6} ARRAY JOIN range(toUInt64(`__agg_0`)) AS `__index`",
+        joinNames(state), joinNames(outputs_list), backQuote(sign_column), target, where, joinNames(keys), delta);
+}
+
+String DeltaQuery::Residual::buildResidual(const String & input) const
+{
+    auto parsed = parseSelect(fmt::format("SELECT * FROM ({})", input));
     auto result = outer->clone();
     result->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::TABLES,
-        input->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().tables()->clone());
+        parsed->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().tables()->clone());
     return result->formatWithSecretsOneLine();
+}
+
+bool DeltaQuery::isAppendOnly() const
+{
+    return residual && residual->append_only;
 }
 
 String DeltaQuery::Residual::buildPartitionFilter(const Names & columns, const String & delta) const
@@ -1328,12 +1435,15 @@ ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageI
     const auto sign = backQuote(residual->sign_column);
     /// An empty delta leaves the residual unchanged, but a global aggregate has a row before its first delta.
     const bool skip = delta_is_empty && !(residual->has_aggregates && residual->num_keys == 0);
+    const auto input = residual->append_only
+        ? residual->buildAppendOnlyInput(target.getFullTableName(), target_where, delta.getFullTableName())
+        : residual->buildInput(integral.getFullTableName(), where);
     return parseSelect(fmt::format(
         "SELECT {0}, arrayJoin(arrayWithConstant(toUInt64(abs(`__count`)), toInt8(sign(`__count`)))) AS {1} "
         "FROM (SELECT {0}, sum(`__weight`) AS `__count` "
         "FROM (SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}) "
         "GROUP BY {0} HAVING `__count` != 0){5}",
-        columns, sign, residual->buildResidual(integral.getFullTableName(), where), target.getFullTableName(), target_where,
+        columns, sign, residual->buildResidual(input), target.getFullTableName(), target_where,
         skip ? " WHERE 0" : ""));
 }
 
