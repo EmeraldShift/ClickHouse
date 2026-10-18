@@ -1,6 +1,8 @@
 #pragma once
 
+#include <deque>
 #include <map>
+#include <optional>
 #include <vector>
 #include <Core/NamesAndTypes.h>
 #include <Storages/MergeTree/AlterConversions.h>
@@ -134,6 +136,9 @@ struct MergeTreeReadTaskInfo
     PatchPartsForReader patch_parts;
     /// Column names to read during PREWHERE and WHERE
     MergeTreeReadTaskColumns task_columns;
+    /// Column names to read on the ranges where the filter is true on every row. No PREWHERE step runs on them. Unset if
+    /// a PREWHERE step produces a column that the read returns.
+    std::optional<MergeTreeReadTaskColumns> exact_task_columns;
     /// Shared initialized size predictor. It is copied for each new task.
     MergeTreeBlockSizePredictorPtr shared_size_predictor;
     /// Shared constant fields for virtual columns.
@@ -214,7 +219,8 @@ public:
         std::vector<MarkRanges> patches_mark_ranges_,
         const BlockSizeParams & block_size_params_,
         MergeTreeBlockSizePredictorPtr size_predictor_,
-        RuntimeDataflowStatisticsCacheUpdaterPtr updater_);
+        RuntimeDataflowStatisticsCacheUpdaterPtr updater_,
+        std::optional<Extras> exact_readers_extras_ = {});
 
     void initializeReadersChain(
         const PrewhereExprInfo & prewhere_actions,
@@ -223,10 +229,10 @@ public:
         const ReadStepsPerformanceCounters & read_steps_performance_counters,
         bool collect_predicate_statistics);
 
-    void initializeIndexReader(const MergeTreeIndexBuildContextPtr & index_build_context, const LazyMaterializingRowsPtr & lazy_materializing_rows);
+    MergeTreeIndexReadResultPtr initializeIndexReader(const MergeTreeIndexBuildContextPtr & index_build_context, const LazyMaterializingRowsPtr & lazy_materializing_rows);
 
     BlockAndProgress read();
-    bool isFinished() const { return mark_ranges.empty() && readers_chain.isCurrentRangeFinished(); }
+    bool isFinished() const { return mark_ranges.empty() && next_mark_ranges.empty() && activeReadersChain().isCurrentRangeFinished(); }
 
     const MergeTreeReadTaskInfo & getInfo() const { return *info; }
     const MergeTreeReadersChain & getReadersChain() const { return readers_chain; }
@@ -273,6 +279,15 @@ public:
         bool collect_predicate_statistics);
 
 private:
+    static Readers createReaders(
+        const MergeTreeReadTaskInfoPtr & read_info,
+        const MergeTreeReadTaskColumns & task_columns,
+        const Extras & extras,
+        const MarkRanges & ranges,
+        const std::vector<MarkRanges> & patches_ranges,
+        const MarkRangesPtr & read_request_map,
+        const std::vector<MarkRangesPtr> & patch_read_request_maps);
+
     using DataflowCacheUpdateCallback = std::function<void(
         const ColumnsWithTypeAndName & columns,
         const NameSet & partially_read_columns,
@@ -280,6 +295,14 @@ private:
         std::optional<bool> & should_continue_sampling)>;
 
     UInt64 estimateNumRows() const;
+
+    /// Splits `mark_ranges` into runs of exact and other granules, and creates `exact_readers_chain` if there are exact
+    /// granules.
+    void initializeExactReadersChain(
+        const MergeTreeIndexReadResultPtr & index_read_result, const ReadStepsPerformanceCounters & read_steps_performance_counters);
+
+    const MergeTreeReadersChain & activeReadersChain() const { return reading_exact_ranges ? exact_readers_chain : readers_chain; }
+    MergeTreeReadersChain & activeReadersChain() { return reading_exact_ranges ? exact_readers_chain : readers_chain; }
 
     /// Shared information required for reading.
     MergeTreeReadTaskInfoPtr info;
@@ -291,8 +314,16 @@ private:
     /// Range readers chain to read mark_ranges from data_part.
     MergeTreeReadersChain readers_chain;
 
-    /// Ranges to read from data_part.
+    /// Reads the ranges where the filter is true on every row without the PREWHERE steps.
+    Readers exact_readers;
+    MergeTreeReadersChain exact_readers_chain;
+    std::optional<Extras> exact_readers_extras;
+
+    /// Ranges to read from data_part with the active readers chain.
     MarkRanges mark_ranges;
+    /// The ranges to read after `mark_ranges`. Each run is read with the other readers chain than the run before it.
+    std::deque<MarkRanges> next_mark_ranges;
+    bool reading_exact_ranges = false;
 
     /// Ranges to read from patch parts.
     std::vector<MarkRanges> patches_mark_ranges;

@@ -2,7 +2,7 @@
 Expression ((Project names + Projection))
   AggregatingProjection
     Expression (Before GROUP BY)
-      Filter ((WHERE + Change column names to column identifiers))
+      Expression ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.test_nullable_filter)
         Indexes:
           PrimaryKey

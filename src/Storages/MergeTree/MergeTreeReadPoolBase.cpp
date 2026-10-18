@@ -6,6 +6,7 @@
 #include <Core/UUID.h>
 #include <Interpreters/Context.h>
 #include <Processors/QueryPlan/Optimizations/RuntimeDataflowStatistics.h>
+#include <Processors/QueryPlan/SourceStepWithFilter.h>
 #include <Storages/MergeTree/ColumnsCache.h>
 #include <Storages/MergeTree/DeserializationPrefixesCache.h>
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
@@ -43,6 +44,32 @@ namespace ErrorCodes
 
 namespace
 {
+
+/// The columns that the read returns, if they all come from the part without a PREWHERE step.
+std::optional<Names> getColumnsReturnedWithoutPrewhere(
+    const Block & header, const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info)
+{
+    NameSet computed;
+    auto add_computed = [&](const ActionsDAG & dag)
+    {
+        for (const auto * output : dag.getOutputs())
+            if (output->type != ActionsDAG::ActionType::INPUT)
+                computed.insert(output->result_name);
+    };
+    if (row_level_filter)
+        add_computed(row_level_filter->actions);
+    if (prewhere_info)
+        add_computed(prewhere_info->prewhere_actions);
+
+    Names names;
+    for (const auto & column : SourceStepWithFilter::applyPrewhereActions(header, row_level_filter, prewhere_info))
+    {
+        if (computed.contains(column.name) || !header.has(column.name))
+            return {};
+        names.push_back(column.name);
+    }
+    return names;
+}
 
 /// `from` minus `what`, both sorted by `begin` and disjoint.
 MarkRanges subtractMarkRanges(const MarkRanges & from, std::span<const MarkRange> what)
@@ -523,6 +550,31 @@ MergeTreeReadPoolBase::buildReadTaskInfo(const RangesInDataPart & part_with_rang
             has_lightweight_delete);
     }
 
+    /// The patches and the index read steps produce columns of their own, and a vector search reads the rows it found.
+    if ((row_level_filter || prewhere_info) && index_read_tasks.empty() && read_task_info.patch_parts.empty()
+        && !read_task_info.read_hints.vector_search_results)
+    {
+        if (auto names = getColumnsReturnedWithoutPrewhere(header, row_level_filter, prewhere_info))
+        {
+            read_task_info.exact_task_columns = getReadTaskColumns(
+                part_info,
+                storage_snapshot,
+                *names,
+                /*row_level_filter=*/ nullptr,
+                /*prewhere_info=*/ nullptr,
+                read_task_info.mutation_steps,
+                /*index_read_tasks=*/ {},
+                actions_settings,
+                reader_settings,
+                /*with_subcolumns=*/ true);
+
+            /// `getReadTaskColumns` adds the smallest column to count the rows. The index reader of exact ranges counts them
+            /// from the index granularity.
+            if (names->empty())
+                read_task_info.exact_task_columns->columns.clear();
+        }
+    }
+
     read_task_info.index_read_tasks = index_read_tasks;
     read_task_info.const_virtual_fields = shared_virtual_fields;
     read_task_info.const_virtual_fields.emplace("_part_index", read_task_info.part_index_in_query);
@@ -789,7 +841,8 @@ MergeTreeReadTaskPtr MergeTreeReadPoolBase::createTask(
         std::move(patches_ranges),
         block_size_params,
         std::move(task_size_predictor),
-        updater);
+        updater,
+        read_info->exact_task_columns ? std::optional(getExtras()) : std::nullopt);
 }
 
 MergeTreeReadTaskPtr MergeTreeReadPoolBase::createTask(

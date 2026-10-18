@@ -43,7 +43,7 @@ WHERE match(url, '^abcd');
 Expression ((Project names + Projection))
   Aggregating
     Expression (Before GROUP BY)
-      Filter ((WHERE + Change column names to column identifiers))
+      Expression ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.03772_table_match)
         Indexes:
           PrimaryKey
@@ -65,7 +65,7 @@ WHERE match(url, '^https?://clickhouse[.]com/') = false;
 Expression ((Project names + Projection))
   Aggregating
     Expression (Before GROUP BY)
-      Filter ((WHERE + Change column names to column identifiers))
+      Expression ((WHERE + Change column names to column identifiers))
         ReadFromMergeTree (default.03772_table_match)
         Indexes:
           PrimaryKey

@@ -160,6 +160,19 @@ MergeTreeWhereOptimizer::MergeTreeWhereOptimizer(
         total_rows = estimator->getTotalRows();
 }
 
+bool MergeTreeWhereOptimizer::hasIndexedColumn(const NameSet & columns) const
+{
+    auto uses_column = [&](const Names & index_columns)
+    {
+        return std::ranges::any_of(index_columns, [&](const String & column) { return columns.contains(column); });
+    };
+    return uses_column(storage_metadata->getColumnsRequiredForPrimaryKey())
+        || std::ranges::any_of(storage_metadata->getSecondaryIndices(), [&](const IndexDescription & index)
+        {
+            return uses_column(index.expression->getRequiredColumns());
+        });
+}
+
 MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::optimize(const ActionsDAG & filter_dag,
     const std::string & filter_column_name,
     const ContextPtr & context,
@@ -264,7 +277,10 @@ static void collectColumns(
     if (function_name == "indexHint")
         return;
 
-    if (!KeyCondition::atom_map.contains(function_name))
+    /// KeyCondition checks each argument of a root `and`, `or`, or `not` as a root condition.
+    const bool is_logical_root = !parent && (function_name == "and" || function_name == "or" || function_name == "not");
+
+    if (!is_logical_root && !KeyCondition::atom_map.contains(function_name))
     {
         if (!parent)
         {
@@ -288,7 +304,7 @@ static void collectColumns(
     for (size_t i = 0; i < arguments_size; ++i)
     {
         auto function_argument = function_node.getArgumentAt(i);
-        collectColumns(function_argument, &node, columns_names, result_set, has_invalid_column, may_use_primary_index);
+        collectColumns(function_argument, is_logical_root ? nullptr : &node, columns_names, result_set, has_invalid_column, may_use_primary_index);
     }
 }
 
@@ -449,7 +465,10 @@ void MergeTreeWhereOptimizer::analyzeImpl(Conditions & res, const RPNBuilderTree
             /// Do not move conditions involving all queried columns,
             /// unless the condition can be used as a string filter during the scan:
             /// then it is beneficial on its own, because the reader skips copying the non-matching values.
+            /// An index on a column of the condition may find granules where the condition is true on every row. The read
+            /// skips a PREWHERE condition on those granules, and the query plan has no step to skip a WHERE condition there.
             && (info.columns.size() < queried_columns.size()
+                || (info.may_use_primary_index && hasIndexedColumn(info.columns))
                 || (where_optimizer_context.apply_string_filters_during_scan && isConditionSuitableForStringValueFilter(conjunct, where_optimizer_context)));
 
         infos.push_back(std::move(info));
@@ -610,6 +629,7 @@ MergeTreeWhereOptimizer::Conditions MergeTreeWhereOptimizer::analyze(const RPNBu
                 && (!where_optimizer_context.is_final || isDeterministicExpressionOverSortingKey(conjunct, where_optimizer_context.context))
                 && columnsSupportPrewhere(columns)
                 && (columns.size() < queried_columns.size()
+                    || (may_use_primary_index && hasIndexedColumn(columns))
                     || (where_optimizer_context.apply_string_filters_during_scan && isConditionSuitableForStringValueFilter(conjunct, where_optimizer_context)));
             res.emplace_back(std::move(cond));
         }

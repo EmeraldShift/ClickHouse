@@ -96,6 +96,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
     [[maybe_unused]] size_t total_granules = ranges.getNumberOfMarks();
 
     IndexGranulesMap index_granules;
+    MarkRanges exact_ranges;
 
     MergeTreeDataSelectExecutor::PartialDisjunctionResult partial_eval_results;
     if (use_for_disjunctions)
@@ -122,7 +123,7 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
             key_condition_rpn_template->generateForPart(*part_info),
             part_info,
             ranges,
-            /*exact_ranges=*/ nullptr,
+            &exact_ranges,
             input.read_hints,
             reader_settings,
             mark_cache.get(),
@@ -245,6 +246,15 @@ SkipIndexReadResultPtr MergeTreeSkipIndexReader::read(
     {
         for (auto i = range.begin; i < range.end; ++i)
             (*res).granules_selected[i] = true;
+    }
+
+    /// The condition of each index is the whole filter, so one index is enough to make a granule exact. The conditions of
+    /// the dynamic indexes above are only the runtime filters, and they may only drop granules.
+    res->granules_exact.resize(res->granules_selected.size(), false);
+    for (const auto & range : exact_ranges)
+    {
+        for (auto i = range.begin; i < range.end; ++i)
+            res->granules_exact[i] = res->granules_selected[i];
     }
 
     res->index_granules = std::move(index_granules);
@@ -699,6 +709,11 @@ bool MergeTreeIndexReadResult::canSkipMark(size_t mark, const MergeTreeIndexGran
     }
 
     return false;
+}
+
+bool MergeTreeIndexReadResult::isMarkExact(size_t mark) const
+{
+    return skip_index_read_result && skip_index_read_result->granules_exact.at(mark);
 }
 
 MergeTreeIndexReadResultPool::MergeTreeIndexReadResultPool(

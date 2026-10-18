@@ -23,6 +23,8 @@ struct SkipIndexReadInput;
 struct SkipIndexReadResult
 {
     std::vector<bool> granules_selected; /// granules selected by skip index(es) at read time
+    /// The selected granules where a skip index checks that the filter is true on every row.
+    std::vector<bool> granules_exact;
     std::shared_ptr<MergeTreeIndexBulkGranulesMinMax> min_max_index_for_top_k;
     TopKThresholdTrackerPtr threshold_tracker;
 
@@ -225,6 +227,9 @@ struct MergeTreeIndexReadResult
 
     /// Whether all rows of the granule are filtered out by the present index read results.
     bool canSkipMark(size_t mark, const MergeTreeIndexGranularity & index_granularity) const;
+
+    /// Whether the filter is true on every row of the granule.
+    bool isMarkExact(size_t mark) const;
 };
 
 using MergeTreeIndexReadResultPtr = std::shared_ptr<MergeTreeIndexReadResult>;

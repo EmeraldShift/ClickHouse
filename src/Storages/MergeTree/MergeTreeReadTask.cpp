@@ -143,9 +143,11 @@ MergeTreeReadTask::MergeTreeReadTask(
     std::vector<MarkRanges> patches_mark_ranges_,
     const BlockSizeParams & block_size_params_,
     MergeTreeBlockSizePredictorPtr size_predictor_,
-    RuntimeDataflowStatisticsCacheUpdaterPtr updater_)
+    RuntimeDataflowStatisticsCacheUpdaterPtr updater_,
+    std::optional<Extras> exact_readers_extras_)
     : info(std::move(info_))
     , readers(std::move(readers_))
+    , exact_readers_extras(std::move(exact_readers_extras_))
     , mark_ranges(std::move(mark_ranges_))
     , patches_mark_ranges(std::move(patches_mark_ranges_))
     , block_size_params(block_size_params_)
@@ -259,6 +261,18 @@ MergeTreeReadTask::Readers MergeTreeReadTask::createReaders(
     const MarkRangesPtr & read_request_map,
     const std::vector<MarkRangesPtr> & patch_read_request_maps)
 {
+    return createReaders(read_info, read_info->task_columns, extras, ranges, patches_ranges, read_request_map, patch_read_request_maps);
+}
+
+MergeTreeReadTask::Readers MergeTreeReadTask::createReaders(
+    const MergeTreeReadTaskInfoPtr & read_info,
+    const MergeTreeReadTaskColumns & task_columns,
+    const Extras & extras,
+    const MarkRanges & ranges,
+    const std::vector<MarkRanges> & patches_ranges,
+    const MarkRangesPtr & read_request_map,
+    const std::vector<MarkRangesPtr> & patch_read_request_maps)
+{
     Readers new_readers;
 
     auto create_reader = [&](const NamesAndTypesList & columns_to_read, bool is_prewhere)
@@ -279,13 +293,13 @@ MergeTreeReadTask::Readers MergeTreeReadTask::createReaders(
             extras.profile_callback);
     };
 
-    new_readers.main = create_reader(read_info->task_columns.columns, false);
+    new_readers.main = create_reader(task_columns.columns, false);
 
     bool is_vector_search = read_info->read_hints.vector_search_results.has_value();
     if (is_vector_search)
-        new_readers.main->setReadHints(read_info->read_hints, read_info->task_columns.columns);
+        new_readers.main->setReadHints(read_info->read_hints, task_columns.columns);
 
-    for (const auto & pre_columns_per_step : read_info->task_columns.pre_columns)
+    for (const auto & pre_columns_per_step : task_columns.pre_columns)
     {
         /// Index-read-tasks (skip-index-on-data-read) are coordinator-only, so the concrete part
         /// is present whenever the list is non-empty; skip the concrete access otherwise.
@@ -314,7 +328,7 @@ MergeTreeReadTask::Readers MergeTreeReadTask::createReaders(
     {
         return createMergeTreeReader(
             read_info->patch_parts[part_idx].part,
-            read_info->task_columns.patch_columns[part_idx],
+            task_columns.patch_columns[part_idx],
             extras.storage_snapshot,
             read_info->data_part_info->getStorageSettings(),
             patches_ranges[part_idx],
@@ -430,8 +444,9 @@ void MergeTreeReadTask::initializeReadersChain(
 
     PrewhereExprInfo all_prewhere_actions;
 
+    MergeTreeIndexReadResultPtr index_read_result;
     if (index_build_context || lazy_materializing_rows)
-        initializeIndexReader(index_build_context, lazy_materializing_rows);
+        index_read_result = initializeIndexReader(index_build_context, lazy_materializing_rows);
 
     for (const auto & step : info->mutation_steps)
         all_prewhere_actions.steps.push_back(step);
@@ -439,12 +454,68 @@ void MergeTreeReadTask::initializeReadersChain(
     for (const auto & step : prewhere_actions.steps)
         all_prewhere_actions.steps.push_back(step);
 
+    /// The rows of lazy materialization come from the filter of the first read, so every row has to pass the index reader.
+    if (index_read_result && info->exact_task_columns && !lazy_materializing_rows)
+        initializeExactReadersChain(index_read_result, read_steps_performance_counters);
+
     readers_chain = createReadersChain(
         readers, all_prewhere_actions, read_steps_performance_counters,
         collect_predicate_statistics);
 }
 
-void MergeTreeReadTask::initializeIndexReader(const MergeTreeIndexBuildContextPtr & index_build_context, const LazyMaterializingRowsPtr & lazy_materializing_rows)
+void MergeTreeReadTask::initializeExactReadersChain(
+    const MergeTreeIndexReadResultPtr & index_read_result, const ReadStepsPerformanceCounters & read_steps_performance_counters)
+{
+    std::deque<MarkRanges> runs;
+    bool run_is_exact = false;
+    for (const auto & range : mark_ranges)
+    {
+        for (size_t mark = range.begin; mark < range.end; ++mark)
+        {
+            const bool is_exact = index_read_result->isMarkExact(mark);
+            if (runs.empty() || is_exact != run_is_exact)
+            {
+                if (runs.empty())
+                    reading_exact_ranges = is_exact;
+                runs.emplace_back();
+                run_is_exact = is_exact;
+            }
+
+            auto & run = runs.back();
+            if (!run.empty() && run.back().end == mark)
+                ++run.back().end;
+            else
+                run.emplace_back(mark, mark + 1);
+        }
+    }
+
+    if (runs.size() <= 1 && !reading_exact_ranges)
+        return;
+
+    MarkRanges exact_ranges;
+    MarkRanges other_ranges;
+    for (size_t i = 0; i < runs.size(); ++i)
+    {
+        auto & ranges = (i % 2 == 0) == reading_exact_ranges ? exact_ranges : other_ranges;
+        ranges.insert(ranges.end(), runs[i].begin(), runs[i].end());
+    }
+
+    mark_ranges = std::move(runs.front());
+    runs.pop_front();
+    next_mark_ranges = std::move(runs);
+
+    readers.updateAllMarkRanges(other_ranges, patches_mark_ranges);
+
+    chassert(info->patch_parts.empty());
+    exact_readers = createReaders(info, *info->exact_task_columns, *exact_readers_extras, exact_ranges, {}, info->read_request_map, {});
+    exact_readers.prepared_index = std::make_unique<MergeTreeReaderIndex>(exact_readers.main.get(), index_read_result, nullptr);
+
+    PrewhereExprInfo mutation_actions;
+    mutation_actions.steps = info->mutation_steps;
+    exact_readers_chain = createReadersChain(exact_readers, mutation_actions, read_steps_performance_counters, /*collect_predicate_statistics=*/ false);
+}
+
+MergeTreeIndexReadResultPtr MergeTreeReadTask::initializeIndexReader(const MergeTreeIndexBuildContextPtr & index_build_context, const LazyMaterializingRowsPtr & lazy_materializing_rows)
 {
     /// Optionally initialize the index filter for the current read task. If the build context exists and contains
     /// relevant read ranges for the current part, retrieve or construct index filter for all involved skip indexes.
@@ -473,9 +544,10 @@ void MergeTreeReadTask::initializeIndexReader(const MergeTreeIndexBuildContextPt
 
     if (index_read_result || lazy_materializing_rows)
     {
-        readers.prepared_index = std::make_unique<MergeTreeReaderIndex>(readers.main.get(), std::move(index_read_result), part_rows);
+        readers.prepared_index = std::make_unique<MergeTreeReaderIndex>(readers.main.get(), index_read_result, part_rows);
     }
 
+    return index_read_result;
 }
 
 UInt64 MergeTreeReadTask::estimateNumRows() const
@@ -493,7 +565,8 @@ UInt64 MergeTreeReadTask::estimateNumRows() const
     if (!rows_to_read)
         return rows_to_read;
 
-    auto total_row_in_current_granule = readers_chain.numRowsInCurrentGranule();
+    const auto & readers_chain_to_read = activeReadersChain();
+    auto total_row_in_current_granule = readers_chain_to_read.numRowsInCurrentGranule();
     rows_to_read = std::max(total_row_in_current_granule, rows_to_read);
 
     if (block_size_params.preferred_max_column_in_block_size_bytes)
@@ -510,30 +583,39 @@ UInt64 MergeTreeReadTask::estimateNumRows() const
         rows_to_read = std::min(rows_to_read, rows_to_read_for_max_size_column_with_filtration);
     }
 
-    auto unread_rows_in_current_granule = readers_chain.numPendingRowsInCurrentGranule();
+    auto unread_rows_in_current_granule = readers_chain_to_read.numPendingRowsInCurrentGranule();
     if (unread_rows_in_current_granule >= rows_to_read)
         return rows_to_read;
 
     const auto & index_granularity = info->data_part_info->getIndexGranularity();
-    return index_granularity.countRowsForRows(readers_chain.currentMark(), rows_to_read, readers_chain.numReadRowsInCurrentGranule());
+    return index_granularity.countRowsForRows(readers_chain_to_read.currentMark(), rows_to_read, readers_chain_to_read.numReadRowsInCurrentGranule());
 }
 
 MergeTreeReadTask::BlockAndProgress MergeTreeReadTask::read()
 {
     auto component_guard = Coordination::setCurrentComponent("MergeTreeReadTask::read");
+
+    if (mark_ranges.empty() && activeReadersChain().isCurrentRangeFinished() && !next_mark_ranges.empty())
+    {
+        mark_ranges = std::move(next_mark_ranges.front());
+        next_mark_ranges.pop_front();
+        reading_exact_ranges = !reading_exact_ranges;
+    }
+
     if (size_predictor)
         size_predictor->startBlock();
 
     UInt64 recommended_rows = estimateNumRows();
     UInt64 rows_to_read = std::max(static_cast<UInt64>(1), std::min(block_size_params.max_block_size_rows, recommended_rows));
 
-    auto read_result = readers_chain.read(rows_to_read, mark_ranges, patches_mark_ranges, dataflow_cache_update_cb);
+    auto & readers_chain_to_read = activeReadersChain();
+    auto read_result = readers_chain_to_read.read(rows_to_read, mark_ranges, patches_mark_ranges, dataflow_cache_update_cb);
 
     /// All rows were filtered. Repeat.
     if (read_result.num_rows == 0)
         read_result.columns.clear();
 
-    const auto & sample_block = readers_chain.getSampleBlock();
+    const auto & sample_block = readers_chain_to_read.getSampleBlock();
     if (read_result.num_rows != 0 && sample_block.columns() != read_result.columns.size())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Inconsistent number of columns got from MergeTreeRangeReader. "
                         "Have {} in sample block and {} columns in list",
@@ -548,7 +630,8 @@ MergeTreeReadTask::BlockAndProgress MergeTreeReadTask::read()
     if (size_predictor)
     {
         size_predictor->updateFilteredRowsRation(read_result.numReadRows(), num_filtered_rows);
-        if (!read_result.columns.empty())
+        /// The predictor estimates the columns of the readers chain with PREWHERE.
+        if (!read_result.columns.empty() && !reading_exact_ranges)
             size_predictor->update(sample_block, read_result.columns, read_result.num_rows);
     }
 

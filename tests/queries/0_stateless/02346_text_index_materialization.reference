@@ -16,7 +16,7 @@ Granules: 4/196
 After CLEAR INDEX idx_text
 0
 111
-Filter column: like(__table1.text, \'%v322%\'_String) (removed)
+Prewhere filter column: like(__table1.text, \'%v322%\'_String) (removed)
 Granules: 196/196
 Granules: 196/196
 1

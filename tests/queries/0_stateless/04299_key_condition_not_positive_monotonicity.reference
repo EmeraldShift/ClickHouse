@@ -41,7 +41,7 @@ SELECT c0 FROM test_divide_neg WHERE 0 < c0 ORDER BY c0 SETTINGS force_primary_k
 EXPLAIN indexes = 1
 SELECT c0 FROM test_divide_neg WHERE c0 < 0;
 Expression ((Project names + Projection))
-  Filter ((WHERE + Change column names to column identifiers))
+  Expression ((WHERE + Change column names to column identifiers))
     ReadFromMergeTree (default.test_divide_neg)
     Indexes:
       PrimaryKey
@@ -83,7 +83,7 @@ SELECT c0 FROM test_intdiv_neg WHERE c0 != 0 ORDER BY c0 SETTINGS force_primary_
 EXPLAIN indexes = 1
 SELECT c0 FROM test_intdiv_neg WHERE c0 < 0;
 Expression ((Project names + Projection))
-  Filter ((WHERE + Change column names to column identifiers))
+  Expression ((WHERE + Change column names to column identifiers))
     ReadFromMergeTree (default.test_intdiv_neg)
     Indexes:
       PrimaryKey
@@ -108,7 +108,7 @@ SELECT c0 FROM test_double_neg WHERE c0 > 0 ORDER BY c0 SETTINGS force_primary_k
 EXPLAIN indexes = 1
 SELECT c0 FROM test_double_neg WHERE c0 < 0;
 Expression ((Project names + Projection))
-  Filter ((WHERE + Change column names to column identifiers))
+  Expression ((WHERE + Change column names to column identifiers))
     ReadFromMergeTree (default.test_double_neg)
     Indexes:
       PrimaryKey
@@ -133,7 +133,7 @@ SELECT c0 FROM test_mixed_neg WHERE c0 > 0 ORDER BY c0 SETTINGS force_primary_ke
 EXPLAIN indexes = 1
 SELECT c0 FROM test_mixed_neg WHERE c0 < 0;
 Expression ((Project names + Projection))
-  Filter ((WHERE + Change column names to column identifiers))
+  Expression ((WHERE + Change column names to column identifiers))
     ReadFromMergeTree (default.test_mixed_neg)
     Indexes:
       PrimaryKey
@@ -159,7 +159,7 @@ SELECT c0 FROM test_negate WHERE c0 > 0 ORDER BY c0;
 EXPLAIN indexes = 1
 SELECT c0 FROM test_negate WHERE c0 < 0;
 Expression ((Project names + Projection))
-  Filter ((WHERE + Change column names to column identifiers))
+  Expression ((WHERE + Change column names to column identifiers))
     ReadFromMergeTree (default.test_negate)
     Indexes:
       PrimaryKey
@@ -182,7 +182,7 @@ SELECT c0 FROM test_multiply_neg WHERE c0 > 0 ORDER BY c0;
 EXPLAIN indexes = 1
 SELECT c0 FROM test_multiply_neg WHERE c0 < 0;
 Expression ((Project names + Projection))
-  Filter ((WHERE + Change column names to column identifiers))
+  Expression ((WHERE + Change column names to column identifiers))
     ReadFromMergeTree (default.test_multiply_neg)
     Indexes:
       PrimaryKey

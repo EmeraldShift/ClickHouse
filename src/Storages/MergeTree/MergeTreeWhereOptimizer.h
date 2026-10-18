@@ -163,6 +163,9 @@ private:
 
     UInt64 getColumnsSize(const NameSet & columns) const;
 
+    /// Whether the primary key or a skip index uses one of `columns`.
+    bool hasIndexedColumn(const NameSet & columns) const;
+
     double approximateBytesPerRow(const NameSet & columns) const;
     double approximateBytesPerRowAndColumn(const String & column) const;
 
