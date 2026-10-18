@@ -152,6 +152,13 @@ public:
 
     const MergeTreeReaderSettings & getSettings() const { return reader_settings; }
 
+    /// The conditions of the PREWHERE steps, in the order the steps evaluate them. The row-level filter is first. Then
+    /// come the conditions of the PREWHERE that are split into steps, or the whole PREWHERE if it is not split.
+    static ActionsDAG::NodeRawConstPtrs getPrewhereConditions(
+        const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info, bool enable_multiple_prewhere_read_steps);
+
+    /// `true_conditions` marks the conditions of `getPrewhereConditions` that are true on every row the steps read. The
+    /// steps skip them. Empty means none.
     static PrewhereExprInfo getPrewhereActions(
         const FilterDAGInfoPtr & row_level_filter,
         const PrewhereInfoPtr & prewhere_info,
@@ -160,7 +167,8 @@ public:
         bool enable_multiple_prewhere_read_steps,
         bool force_short_circuit_execution,
         bool read_ahead_prewhere_columns,
-        const ColumnsDescription * columns = nullptr);
+        const ColumnsDescription * columns = nullptr,
+        const std::vector<bool> & true_conditions = {});
 
     void addPartLevelToChunk(bool add_part_level_) { add_part_level = add_part_level_; }
 

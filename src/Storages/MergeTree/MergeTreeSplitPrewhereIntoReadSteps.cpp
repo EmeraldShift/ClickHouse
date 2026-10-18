@@ -259,6 +259,26 @@ const ActionsDAG::Node & addFunction(
 
 }
 
+std::optional<ActionsDAG::NodeRawConstPtrs> getSplitPrewhereConditions(const PrewhereInfo & prewhere_info)
+{
+    /// Steps pass columns to each other by name, which cannot tell an input from a computed node
+    /// that reuses its name (e.g. a `Buffer` converting its destination's column).
+    if (prewhere_info.prewhere_actions.hasInputNameShadowedByComputedNode())
+        return {};
+
+    const auto & condition_root = prewhere_info.prewhere_actions.findInOutputs(prewhere_info.prewhere_column_name);
+    const bool is_conjunction = (condition_root.type == ActionsDAG::ActionType::FUNCTION && condition_root.function_base->getName() == "and");
+    if (!is_conjunction)
+        return {};
+    /// Nested conjunctions are flattened, so that a condition list like
+    /// `and(existing_prewhere, and(guard, throwing))` (built by optimizePrewhere when a moved WHERE
+    /// is merged into an existing PREWHERE) is grouped condition by condition in `tryBuildPrewhereSteps`
+    /// instead of treating the inner AND as one atomic condition.
+    ActionsDAG::NodeRawConstPtrs condition_nodes;
+    flattenConjunction(&condition_root, condition_nodes);
+    return condition_nodes;
+}
+
 /// We want to build a sequence of steps that will compute parts of the prewhere condition.
 /// Each step reads some new columns and computes some new expressions and a filter condition.
 /// The last step computes the final filter condition and the remaining expressions that are required for the main query.
@@ -286,27 +306,24 @@ bool tryBuildPrewhereSteps(
     bool force_short_circuit_execution,
     const ColumnsDescription * columns,
     bool read_ahead_columns,
-    const IndexReadTasks * index_read_tasks)
+    const IndexReadTasks * index_read_tasks,
+    const std::vector<bool> & true_conditions)
 {
     if (!prewhere_info)
         return true;
 
-    /// Steps pass columns to each other by name, which cannot tell an input from a computed node
-    /// that reuses its name (e.g. a `Buffer` converting its destination's column).
-    if (prewhere_info->prewhere_actions.hasInputNameShadowedByComputedNode())
+    /// 1. List all condition nodes that are combined with AND into PREWHERE condition
+    auto all_condition_nodes = getSplitPrewhereConditions(*prewhere_info);
+    if (!all_condition_nodes)
         return false;
 
-    /// 1. List all condition nodes that are combined with AND into PREWHERE condition
-    const auto & condition_root = prewhere_info->prewhere_actions.findInOutputs(prewhere_info->prewhere_column_name);
-    const bool is_conjunction = (condition_root.type == ActionsDAG::ActionType::FUNCTION && condition_root.function_base->getName() == "and");
-    if (!is_conjunction)
-        return false;
-    /// Nested conjunctions are flattened, so that a condition list like
-    /// `and(existing_prewhere, and(guard, throwing))` (built by optimizePrewhere when a moved WHERE
-    /// is merged into an existing PREWHERE) is grouped condition by condition below instead of
-    /// treating the inner AND as one atomic condition.
+    /// A condition that is true on every row needs no step.
     ActionsDAG::NodeRawConstPtrs condition_nodes;
-    flattenConjunction(&condition_root, condition_nodes);
+    for (size_t i = 0; i < all_condition_nodes->size(); ++i)
+        if (true_conditions.empty() || !true_conditions[i])
+            condition_nodes.push_back((*all_condition_nodes)[i]);
+    if (condition_nodes.empty())
+        return true;
 
     /// Conditions covered by the query condition cache attribution get their own steps, unless PREWHERE was rewritten since.
     size_t num_attributed_conditions = 0;

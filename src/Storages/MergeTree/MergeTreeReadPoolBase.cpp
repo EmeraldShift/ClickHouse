@@ -10,11 +10,13 @@
 #include <Storages/MergeTree/ColumnsCache.h>
 #include <Storages/MergeTree/DeserializationPrefixesCache.h>
 #include <Storages/MergeTree/LoadedMergeTreeDataPartInfoForReader.h>
+#include <Storages/MergeTree/MergeTreeSelectProcessor.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
 #include <Access/ContextAccess.h>
 #include <Storages/MergeTree/MergeTreeVirtualColumns.h>
 #include <Storages/MergeTree/PatchParts/MergeTreePatchReader.h>
 
+#include <set>
 #include <span>
 
 namespace ProfileEvents
@@ -45,26 +47,40 @@ namespace ErrorCodes
 namespace
 {
 
-/// The columns that the read returns, if they all come from the part without a PREWHERE step.
-std::optional<Names> getColumnsReturnedWithoutPrewhere(
-    const Block & header, const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info)
+/// The columns that the read returns from the part, if the PREWHERE steps that skip the `true_conditions` compute the
+/// others. A filter whose conditions are all true has no step, so it can only return the columns it reads.
+std::optional<Names> getColumnsReturnedWithTrueConditions(
+    const Block & header,
+    const FilterDAGInfoPtr & row_level_filter,
+    const PrewhereInfoPtr & prewhere_info,
+    const std::vector<bool> & true_conditions)
 {
-    NameSet computed;
-    auto add_computed = [&](const ActionsDAG & dag)
+    /// The row-level filter is the first condition.
+    const auto prewhere_conditions_begin = true_conditions.begin() + (row_level_filter ? 1 : 0);
+    const bool row_level_filter_has_step = row_level_filter && !true_conditions.front();
+    const bool prewhere_has_step = std::find(prewhere_conditions_begin, true_conditions.end(), false) != true_conditions.end();
+
+    NameSet computed_by_steps;
+    NameSet computed_without_step;
+    auto add_computed = [&](const ActionsDAG & dag, bool has_step)
     {
         for (const auto * output : dag.getOutputs())
             if (output->type != ActionsDAG::ActionType::INPUT)
-                computed.insert(output->result_name);
+                (has_step ? computed_by_steps : computed_without_step).insert(output->result_name);
     };
     if (row_level_filter)
-        add_computed(row_level_filter->actions);
+        add_computed(row_level_filter->actions, row_level_filter_has_step);
     if (prewhere_info)
-        add_computed(prewhere_info->prewhere_actions);
+        add_computed(prewhere_info->prewhere_actions, prewhere_has_step);
 
     Names names;
     for (const auto & column : SourceStepWithFilter::applyPrewhereActions(header, row_level_filter, prewhere_info))
     {
-        if (computed.contains(column.name) || !header.has(column.name))
+        if (computed_without_step.contains(column.name))
+            return {};
+        if (computed_by_steps.contains(column.name))
+            continue;
+        if (!header.has(column.name))
             return {};
         names.push_back(column.name);
     }
@@ -533,7 +549,9 @@ MergeTreeReadPoolBase::buildReadTaskInfo(const RangesInDataPart & part_with_rang
         index_read_tasks,
         actions_settings,
         reader_settings,
-        /*with_subcolumns=*/ true);
+        /*with_subcolumns=*/ true,
+        /*true_conditions=*/ {},
+        /*prewhere_actions=*/ nullptr);
 
     if (read_task_info.alter_conversions->hasPatches())
     {
@@ -554,27 +572,63 @@ MergeTreeReadPoolBase::buildReadTaskInfo(const RangesInDataPart & part_with_rang
     if ((row_level_filter || prewhere_info) && index_read_tasks.empty() && read_task_info.patch_parts.empty()
         && !read_task_info.read_hints.vector_search_results)
     {
-        if (auto names = getColumnsReturnedWithoutPrewhere(header, row_level_filter, prewhere_info))
+        const auto conditions = MergeTreeSelectProcessor::getPrewhereConditions(
+            row_level_filter, prewhere_info, reader_settings.enable_multiple_prewhere_read_steps);
+
+        /// The sets of conditions that are true on every row of a granule. Every condition is true on the exact ranges, and
+        /// the skip indexes can find more exact granules at read time.
+        std::set<std::vector<bool>> sets_of_true_conditions{std::vector<bool>(conditions.size(), true)};
+        /// Only a part that index analysis didn't analyse by condition has no ranges for the conditions.
+        chassert(part_with_ranges.exact_ranges_by_condition.empty() || part_with_ranges.exact_ranges_by_condition.size() == conditions.size());
+        if (!part_with_ranges.exact_ranges_by_condition.empty())
         {
-            read_task_info.exact_task_columns = getReadTaskColumns(
+            std::vector<bool> true_conditions(conditions.size());
+            for (const auto & range : part_with_ranges.ranges)
+            {
+                for (size_t mark = range.begin; mark < range.end; ++mark)
+                {
+                    if (part_with_ranges.exact_ranges.contains(mark))
+                        continue;
+                    for (size_t i = 0; i < conditions.size(); ++i)
+                        true_conditions[i] = part_with_ranges.exact_ranges_by_condition[i].contains(mark);
+                    if (std::ranges::find(true_conditions, true) != true_conditions.end())
+                        sets_of_true_conditions.insert(true_conditions);
+                }
+            }
+            /// The task finds the true conditions of each mark only if some marks have true conditions.
+            if (sets_of_true_conditions.size() > 1)
+                read_task_info.exact_ranges_by_condition = part_with_ranges.exact_ranges_by_condition;
+        }
+
+        for (const auto & true_conditions : sets_of_true_conditions)
+        {
+            auto names = getColumnsReturnedWithTrueConditions(header, row_level_filter, prewhere_info, true_conditions);
+            if (!names)
+                continue;
+
+            auto & residual_read = read_task_info.residual_reads.emplace_back();
+            residual_read.true_conditions = true_conditions;
+            residual_read.task_columns = getReadTaskColumns(
                 part_info,
                 storage_snapshot,
                 *names,
-                /*row_level_filter=*/ nullptr,
-                /*prewhere_info=*/ nullptr,
+                row_level_filter,
+                prewhere_info,
                 read_task_info.mutation_steps,
                 /*index_read_tasks=*/ {},
                 actions_settings,
                 reader_settings,
-                /*with_subcolumns=*/ true);
+                /*with_subcolumns=*/ true,
+                true_conditions,
+                &residual_read.prewhere_actions);
 
-            /// `getReadTaskColumns` adds the smallest column to count the rows. The index reader of exact ranges counts them
+            /// `getReadTaskColumns` adds the smallest column to count the rows. The index reader of these ranges counts them
             /// from the index granularity.
             if (names->empty())
-                read_task_info.exact_task_columns->columns.clear();
-
-            read_task_info.exact_ranges = part_with_ranges.exact_ranges;
+                residual_read.task_columns.columns.clear();
         }
+
+        read_task_info.exact_ranges = part_with_ranges.exact_ranges;
     }
 
     read_task_info.index_read_tasks = index_read_tasks;
@@ -844,7 +898,7 @@ MergeTreeReadTaskPtr MergeTreeReadPoolBase::createTask(
         block_size_params,
         std::move(task_size_predictor),
         updater,
-        read_info->exact_task_columns ? std::optional(getExtras()) : std::nullopt);
+        read_info->residual_reads.empty() ? std::nullopt : std::optional(getExtras()));
 }
 
 MergeTreeReadTaskPtr MergeTreeReadPoolBase::createTask(

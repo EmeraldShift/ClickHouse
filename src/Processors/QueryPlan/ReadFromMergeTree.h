@@ -699,6 +699,15 @@ private:
         bool skip_partition_pruning_,
         bool require_ready_sets = false);
 
+    static ConditionTemplate<KeyCondition>::Ptr buildPrimaryKeyCondition(
+        const std::shared_ptr<ActionsDAGWithInversionPushDown> & filter_dag_ptr,
+        const ContextPtr & query_context,
+        const StorageMetadataPtr & metadata_snapshot,
+        bool skip_constant_folding);
+
+    /// Fills `exact_ranges_by_condition` of the parts for the conditions of the PREWHERE steps.
+    void findExactRangesByCondition(RangesInDataParts & parts_with_ranges) const;
+
     MergeTreeSettingsPtr data_settings;
     MergeTreeReaderSettings reader_settings;
 

@@ -113,6 +113,9 @@ struct RangesInDataPart
     size_t part_starting_offset_in_query;
     MarkRanges ranges;
     MarkRanges exact_ranges;
+    /// For each condition of `MergeTreeSelectProcessor::getPrewhereConditions`, the ranges where the condition is true on
+    /// every row.
+    std::vector<MarkRanges> exact_ranges_by_condition;
     RangesInDataPartReadHints read_hints;
 
     /// The above "ranges" member is the selected ranges after index analysis.

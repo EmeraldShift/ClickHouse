@@ -3057,6 +3057,70 @@ RangesInDataParts ReadFromMergeTree::filterPartsForStatistics(
         /* check_index_usage */ false);
 }
 
+ConditionTemplate<KeyCondition>::Ptr ReadFromMergeTree::buildPrimaryKeyCondition(
+    const std::shared_ptr<ActionsDAGWithInversionPushDown> & filter_dag_ptr,
+    const ContextPtr & query_context,
+    const StorageMetadataPtr & metadata_snapshot,
+    bool skip_constant_folding)
+{
+    auto key_condition_factory = [query_context, metadata_snapshot](const ActionsDAG *, const ActionsDAG::Node * predicate)
+    {
+        ActionsDAGWithInversionPushDown wrapped(predicate, query_context, /* boolean_context */ false);
+        return KeyCondition{wrapped, query_context, metadata_snapshot->getPrimaryKey(), /* single_point_ = */ false, !query_context->getSettingsRef()[Setting::use_primary_key]};
+    };
+    return std::make_shared<ConditionTemplate<KeyCondition>>(filter_dag_ptr, std::move(key_condition_factory), metadata_snapshot, query_context, skip_constant_folding);
+}
+
+void ReadFromMergeTree::findExactRangesByCondition(RangesInDataParts & parts_with_ranges) const
+{
+    const auto conditions = MergeTreeSelectProcessor::getPrewhereConditions(
+        query_info.row_level_filter, query_info.prewhere_info, reader_settings.enable_multiple_prewhere_read_steps);
+    if (conditions.empty() || parts_with_ranges.empty() || parts_with_ranges.front().data_part->isProjectionPart())
+        return;
+
+    const auto & settings = context->getSettingsRef();
+    const auto & metadata_snapshot = storage_snapshot->metadata;
+    const bool skip_constant_folding = skip_partition_pruning || !settings[Setting::use_constant_folding_in_index_analysis];
+
+    std::vector<Indexes> indexes_by_condition;
+    for (const auto * condition : conditions)
+    {
+        auto filter_dag = std::make_shared<ActionsDAGWithInversionPushDown>(condition, context, /* boolean_context */ true);
+        auto & condition_indexes = indexes_by_condition.emplace_back(buildPrimaryKeyCondition(filter_dag, context, metadata_snapshot, skip_constant_folding));
+        buildPartitionPruningIndexes(condition_indexes, filter_dag, data, context, metadata_snapshot, skip_partition_pruning);
+    }
+
+    const auto minmax_columns_types = MergeTreeData::getMinMaxColumns(metadata_snapshot->getPartitionKey(), data.getSettings()).getTypes();
+    for (auto & part : parts_with_ranges)
+    {
+        part.exact_ranges_by_condition.resize(conditions.size());
+        for (size_t i = 0; i < conditions.size(); ++i)
+        {
+            const auto & condition_indexes = indexes_by_condition[i];
+            Truth part_truth;
+            if (condition_indexes.minmax_idx_condition)
+                part_truth = condition_indexes.minmax_idx_condition->generateForPart(part.data_part).checkBoundsInHyperrectangle(
+                    part.data_part->getMinMaxIndex()->hyperrectangle, minmax_columns_types);
+            if (condition_indexes.partition_pruner)
+                part_truth = Truth::meet(part_truth, condition_indexes.partition_pruner->checkPartition(*part.data_part));
+
+            if (part_truth.is_true.level() == Side::Always)
+                part.exact_ranges_by_condition[i] = part.ranges;
+            else if (metadata_snapshot->hasPrimaryKey())
+                MergeTreeDataSelectExecutor::markRangesFromPKRange(
+                    part,
+                    metadata_snapshot,
+                    condition_indexes.key_condition->generateForPart(part.data_part),
+                    /*part_offset_condition=*/ nullptr,
+                    /*total_offset_condition=*/ nullptr,
+                    &part.exact_ranges_by_condition[i],
+                    /*pk_to_minmax_slot=*/ nullptr,
+                    settings,
+                    log);
+        }
+    }
+}
+
 void ReadFromMergeTree::buildIndexes(
     std::optional<ReadFromMergeTree::Indexes> & indexes,
     const ActionsDAG * filter_actions_dag_,
@@ -3081,15 +3145,7 @@ void ReadFromMergeTree::buildIndexes(
     auto filter_dag_ptr = std::make_shared<ActionsDAGWithInversionPushDown>(filter_actions_dag_ ? filter_actions_dag_->getOutputs().front() : nullptr, query_context, /* boolean_context */ true);
     const auto & filter_dag = *filter_dag_ptr;
 
-    {
-        auto key_condition_factory = [query_context, metadata_snapshot](const ActionsDAG *, const ActionsDAG::Node * predicate)
-        {
-            ActionsDAGWithInversionPushDown wrapped(predicate, query_context, /* boolean_context */ false);
-            return KeyCondition{wrapped, query_context, metadata_snapshot->getPrimaryKey(), /* single_point_ = */ false, !query_context->getSettingsRef()[Setting::use_primary_key]};
-        };
-        auto key_condition_template = std::make_shared<ConditionTemplate<KeyCondition>>(filter_dag_ptr, std::move(key_condition_factory), metadata_snapshot, query_context, skip_constant_folding);
-        indexes.emplace(std::move(key_condition_template));
-    }
+    indexes.emplace(buildPrimaryKeyCondition(filter_dag_ptr, query_context, metadata_snapshot, skip_constant_folding));
 
     {
         auto key_condition_factory = [query_context](const ActionsDAG *, const ActionsDAG::Node * predicate)
@@ -5297,6 +5353,9 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, [[ma
             deferred_prewhere_info != nullptr,
             fmt::join(result.column_names_to_read, ","));
     }
+
+    /// The PREWHERE steps are final here. Index analysis may run before `optimizePrewhere` moves conditions to PREWHERE.
+    findExactRangesByCondition(result.parts_with_ranges);
 
     shared_virtual_fields.emplace("_sample_factor", result.sampling.used_sample_factor);
     shared_virtual_fields.emplace("_table", data.getStorageID().getTableName());

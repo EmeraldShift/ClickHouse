@@ -394,6 +394,24 @@ static void addIndexReadSteps(PrewhereExprSteps & steps, const IndexReadTasks & 
     steps = std::move(result);
 }
 
+ActionsDAG::NodeRawConstPtrs MergeTreeSelectProcessor::getPrewhereConditions(
+    const FilterDAGInfoPtr & row_level_filter, const PrewhereInfoPtr & prewhere_info, bool enable_multiple_prewhere_read_steps)
+{
+    ActionsDAG::NodeRawConstPtrs conditions;
+    if (row_level_filter)
+        conditions.push_back(&row_level_filter->actions.findInOutputs(row_level_filter->column_name));
+
+    if (prewhere_info)
+    {
+        auto prewhere_conditions = enable_multiple_prewhere_read_steps ? getSplitPrewhereConditions(*prewhere_info) : std::nullopt;
+        if (prewhere_conditions)
+            conditions.insert(conditions.end(), prewhere_conditions->begin(), prewhere_conditions->end());
+        else
+            conditions.push_back(&prewhere_info->prewhere_actions.findInOutputs(prewhere_info->prewhere_column_name));
+    }
+    return conditions;
+}
+
 PrewhereExprInfo MergeTreeSelectProcessor::getPrewhereActions(
     const FilterDAGInfoPtr & row_level_filter,
     const PrewhereInfoPtr & prewhere_info,
@@ -402,11 +420,17 @@ PrewhereExprInfo MergeTreeSelectProcessor::getPrewhereActions(
     bool enable_multiple_prewhere_read_steps,
     bool force_short_circuit_execution,
     bool read_ahead_prewhere_columns,
-    const ColumnsDescription * columns)
+    const ColumnsDescription * columns,
+    const std::vector<bool> & true_conditions)
 {
     PrewhereExprInfo prewhere_actions;
 
-    if (row_level_filter)
+    /// The row-level filter is the first condition.
+    const bool skip_row_level_filter = row_level_filter && !true_conditions.empty() && true_conditions.front();
+    const std::vector<bool> true_prewhere_conditions(
+        true_conditions.begin() + (row_level_filter && !true_conditions.empty()), true_conditions.end());
+
+    if (row_level_filter && !skip_row_level_filter)
     {
         PrewhereExprStep row_level_filter_step
         {
@@ -424,7 +448,9 @@ PrewhereExprInfo MergeTreeSelectProcessor::getPrewhereActions(
     }
 
     if (prewhere_info &&
-        (!enable_multiple_prewhere_read_steps || !tryBuildPrewhereSteps(prewhere_info, actions_settings, prewhere_actions, force_short_circuit_execution, columns, read_ahead_prewhere_columns, &index_read_tasks)))
+        (!enable_multiple_prewhere_read_steps || !tryBuildPrewhereSteps(prewhere_info, actions_settings, prewhere_actions, force_short_circuit_execution, columns, read_ahead_prewhere_columns, &index_read_tasks, true_prewhere_conditions))
+        /// The PREWHERE that is not split into steps is one condition.
+        && (true_prewhere_conditions.empty() || !true_prewhere_conditions.front()))
     {
         PrewhereExprStep prewhere_step
         {

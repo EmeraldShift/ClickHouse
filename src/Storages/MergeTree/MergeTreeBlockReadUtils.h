@@ -32,6 +32,8 @@ void addPatchPartsColumns(
     const Names & all_columns_to_read,
     bool has_lightweight_delete);
 
+/// The PREWHERE steps skip the `true_conditions`, see `MergeTreeSelectProcessor::getPrewhereActions`. If
+/// `prewhere_actions` is set, it receives the steps.
 MergeTreeReadTaskColumns getReadTaskColumns(
     const IMergeTreeDataPartInfoForReader & data_part_info_for_reader,
     const StorageSnapshotPtr & storage_snapshot,
@@ -42,7 +44,9 @@ MergeTreeReadTaskColumns getReadTaskColumns(
     const IndexReadTasks & index_read_tasks,
     const ExpressionActionsSettings & actions_settings,
     const MergeTreeReaderSettings & reader_settings,
-    bool with_subcolumns);
+    bool with_subcolumns,
+    const std::vector<bool> & true_conditions,
+    PrewhereExprInfo * prewhere_actions);
 
 MergeTreeReadTaskColumns getReadTaskColumnsForMerge(
     const IMergeTreeDataPartInfoForReader & data_part_info_for_reader,

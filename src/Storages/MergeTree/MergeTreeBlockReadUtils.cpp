@@ -486,7 +486,9 @@ MergeTreeReadTaskColumns getReadTaskColumns(
     const IndexReadTasks & index_read_tasks,
     const ExpressionActionsSettings & actions_settings,
     const MergeTreeReaderSettings & reader_settings,
-    bool with_subcolumns)
+    bool with_subcolumns,
+    const std::vector<bool> & true_conditions,
+    PrewhereExprInfo * prewhere_actions)
 {
     MergeTreeReadTaskColumns result;
     NameSet columns_from_previous_steps;
@@ -556,7 +558,7 @@ MergeTreeReadTaskColumns getReadTaskColumns(
 
     if (prewhere_info || row_level_filter || !index_read_tasks.empty())
     {
-        auto prewhere_actions = MergeTreeSelectProcessor::getPrewhereActions(
+        auto steps = MergeTreeSelectProcessor::getPrewhereActions(
             row_level_filter,
             prewhere_info,
             index_read_tasks,
@@ -564,10 +566,14 @@ MergeTreeReadTaskColumns getReadTaskColumns(
             reader_settings.enable_multiple_prewhere_read_steps,
             reader_settings.force_short_circuit_execution,
             reader_settings.read_ahead_prewhere_columns,
-            &storage_snapshot->metadata->getColumns());
+            &storage_snapshot->metadata->getColumns(),
+            true_conditions);
 
-        for (const auto & step : prewhere_actions.steps)
+        for (const auto & step : steps.steps)
             add_step(*step);
+
+        if (prewhere_actions)
+            *prewhere_actions = std::move(steps);
     }
 
     /// Remove columns read in prewehere from the list of columns to read.
@@ -598,7 +604,9 @@ MergeTreeReadTaskColumns getReadTaskColumnsForMerge(
         /*index_read_tasks*/ {},
         /*actions_settings=*/ {},
         /*reader_settings=*/ MergeTreeReaderSettings::createFromSettings(),
-        storage_snapshot->storage.supportsSubcolumns());
+        storage_snapshot->storage.supportsSubcolumns(),
+        /*true_conditions=*/ {},
+        /*prewhere_actions=*/ nullptr);
 }
 
 }

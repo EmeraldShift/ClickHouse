@@ -43,6 +43,8 @@ struct MarkRanges : public DevectorWithMemoryTracking<MarkRange>
 
     size_t getNumberOfMarks() const;
     bool isOneRangeForWholePart(size_t num_marks_in_part) const;
+    /// The ranges must be sorted and non-intersecting.
+    bool contains(size_t mark) const;
 
     void serialize(WriteBuffer & out) const;
     String describe() const;

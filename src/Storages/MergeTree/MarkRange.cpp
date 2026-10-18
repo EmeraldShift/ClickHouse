@@ -95,6 +95,12 @@ bool MarkRanges::isOneRangeForWholePart(size_t num_marks_in_part) const
     return size() == 1 && front().begin == 0 && front().end == num_marks_in_part;
 }
 
+bool MarkRanges::contains(size_t mark) const
+{
+    auto next = std::ranges::upper_bound(*this, mark, {}, &MarkRange::begin);
+    return next != begin() && mark < std::prev(next)->end;
+}
+
 void MarkRanges::serialize(WriteBuffer & out) const
 {
     writeBinaryLittleEndian(this->size(), out);
