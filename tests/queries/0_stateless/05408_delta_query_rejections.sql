@@ -22,8 +22,8 @@ SELECT * FROM deltaQueryFrontier((SELECT t.k, sum(v) FROM t JOIN u ON t.k = u.k 
 SELECT * FROM deltaQueryFrontier((SELECT t.k, row_number() OVER () FROM t JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT avg(v) FROM t JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT uniq(v) FROM t JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT min(v) FROM t JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT t.k, maxIf(v, v > 0) FROM t JOIN u ON t.k = u.k GROUP BY t.k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT t.k, anyLast(v) FROM t JOIN u ON t.k = u.k GROUP BY t.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT t.k, sum(v) + 1 FROM t JOIN u ON t.k = u.k GROUP BY t.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT t.k, sum(v) AS s, s * 2 FROM t JOIN u ON t.k = u.k GROUP BY t.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((WITH sum(v) AS s SELECT t.k, -s FROM t JOIN u ON t.k = u.k GROUP BY t.k)); -- { serverError NOT_IMPLEMENTED }
@@ -45,6 +45,7 @@ SELECT * FROM deltaQueryFrontier((SELECT k FROM shadowing)); -- { serverError NO
 
 -- Accepted result columns of joins.
 SELECT * FROM deltaQueryFrontier((SELECT sum(v), count(), sumIf(v, v > 0), countIf(v > 0), avgState(v), uniqState(t.k) FROM t JOIN u ON t.k = u.k)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT min(v), max(v), any(v), groupBitOr(t.k), groupBitAnd(t.k), groupBitXor(t.k) FROM t JOIN u ON t.k = u.k)) FORMAT Null;
 SELECT * FROM deltaQueryFrontier((SELECT t.k + 1 AS j, sum(v * 2) AS s, s FROM t JOIN u ON t.k = u.k GROUP BY t.k)) FORMAT Null;
 
 -- A query over one table runs over the new rows, so any query shape is accepted.

@@ -20,6 +20,7 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSubquery.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -28,6 +29,7 @@
 
 #include <deque>
 #include <map>
+#include <set>
 #include <unordered_map>
 
 
@@ -82,8 +84,9 @@ using InputIndexes = std::unordered_map<const IQueryTreeNode *, size_t>;
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support {}", construct);
 }
 
-/// Aggregates whose results over disjoint inputs, including empty ones, merge into the result over their union.
-/// That excludes finalized `min` and `max`, which return 0 for an empty input.
+/// Aggregates whose results over disjoint inputs merge into the result over their union. A join term without GROUP BY
+/// returns no row when it reads no rows. Only the groups of the terms then need to merge. A group can have no rows that
+/// pass the condition of an `-If` form, and `minIf` or `maxIf` then returns 0. So only `sum` and `count` take `-If`.
 bool isMergeableAggregate(const String & name)
 {
     const auto & combinators = AggregateFunctionCombinatorFactory::instance();
@@ -91,14 +94,19 @@ bool isMergeableAggregate(const String & name)
         return true;
 
     String base = name;
+    bool has_if = false;
     while (auto combinator = combinators.tryFindSuffix(base))
     {
         if (combinator->getName() != "If")
             return false;
+        has_if = true;
         base.resize(base.size() - combinator->getName().size());
     }
     const String & canonical = AggregateFunctionFactory::instance().getCanonicalNameIfAny(base);
-    return canonical == "sum" || canonical == "count";
+    if (canonical == "sum" || canonical == "count")
+        return true;
+    static const std::set<String> without_if = {"min", "max", "any", "groupBitOr", "groupBitAnd", "groupBitXor"};
+    return !has_if && without_if.contains(canonical);
 }
 
 /// Appends the tables of the join tree in order, and the ON expressions of its joins. Throws unless the join tree joins
@@ -248,7 +256,8 @@ void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
 ///
 /// The semi-join reduction rewrites `a.x = b.y` into `b.y IN (SELECT x FROM a ...)`. `IN` casts `b.y` to the type of `x`
 /// and looks it up by its binary representation. That lookup can disagree with `=`. For example, `-0.0 = 0.0` is true and
-/// `-0.0 IN (SELECT 0.0)` is false. So only integer and string columns of one type count as join keys.
+/// `-0.0 IN (SELECT 0.0)` is false. So only columns of one type whose equal values have one representation count as join
+/// keys, like integers, strings, UUIDs and decimals. Floats don't.
 std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions, const InputIndexes & input_indexes)
 {
     QueryTreeNodes conjuncts;
@@ -271,7 +280,8 @@ std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions
             continue;
         auto type = removeLowCardinalityAndNullable(a->getColumnType());
         if (!type->equals(*removeLowCardinalityAndNullable(b->getColumnType()))
-            || !(type->isValueRepresentedByInteger() || isStringOrFixedString(type)))
+            || !(type->isValueRepresentedByInteger() || isStringOrFixedString(type) || isUUID(type) || isDecimal(type)
+                || isDateTime64(type) || isIPv4(type) || isIPv6(type)))
             continue;
         edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName()});
         edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName()});
@@ -437,6 +447,16 @@ void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String
         conjuncts.push_back(makeASTFunction("greaterOrEquals", makeColumn(qualifier, "_block_number"), makeBound(qualifier, *lower)));
         conjuncts.push_back(makeASTFunction("greaterOrEquals", part_block("max_block"), makeBound(qualifier, *lower)));
     }
+}
+
+/// Adds `SETTINGS name = value` to `select`, keeping its other settings.
+void setSetting(ASTSelectQuery & select, std::string_view name, const Field & value)
+{
+    auto settings = select.settings() ? select.settings()->clone() : make_intrusive<ASTSetQuery>();
+    auto & set_query = settings->as<ASTSetQuery &>();
+    set_query.is_standalone = false;
+    set_query.changes.setSetting(name, value);
+    select.setExpression(ASTSelectQuery::Expression::SETTINGS, std::move(settings));
 }
 
 /// `(SELECT column FROM input WHERE where)`
@@ -605,7 +625,11 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         }
 
         auto term = select.clone();
-        term->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::WHERE, makeASTFunction("and", std::move(conjuncts)));
+        auto & term_select = term->as<ASTSelectQuery &>();
+        term_select.setExpression(ASTSelectQuery::Expression::WHERE, makeASTFunction("and", std::move(conjuncts)));
+        /// Without GROUP BY, a term that reads no rows still returns one row by default, with 0 for `min` and `max`.
+        if (is_join && !term_select.groupBy())
+            setSetting(term_select, "empty_result_for_aggregation_by_empty_set", true);
         terms->children.push_back(std::move(term));
     }
 

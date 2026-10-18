@@ -23,12 +23,16 @@ $CLICKHOUSE_CLIENT -q "
     CREATE TABLE pairs (product String, pairs SimpleAggregateFunction(sum, UInt64), qq SimpleAggregateFunction(sum, Int64))
         ENGINE = AggregatingMergeTree ORDER BY product;
     CREATE TABLE view_revenue AS revenue;
+    CREATE TABLE extremes (lo SimpleAggregateFunction(min, Int64), hi SimpleAggregateFunction(max, Int64),
+        ids SimpleAggregateFunction(groupBitOr, UInt64), n SimpleAggregateFunction(sum, UInt64)) ENGINE = AggregatingMergeTree ORDER BY tuple();
 "
 
 Q1="SELECT p.category AS category, o.product AS product, sum(o.qty * q.price) AS revenue, count() AS n, uniqExactState(o.id) AS orders
     FROM orders AS o INNER JOIN quotes AS q ON q.order_id = o.id INNER JOIN products AS p ON p.product = o.product
     WHERE q.version < 5 GROUP BY category, product"
 Q2="SELECT a.product AS product, count() AS pairs, sum(a.qty * b.qty) AS qq FROM orders AS a INNER JOIN orders AS b ON a.product = b.product GROUP BY product"
+# Every price is positive, so a term that read no rows and returned a row with 0 would lower the minimum.
+Q3="SELECT min(q.price) AS lo, max(q.price) AS hi, groupBitOr(o.id) AS ids, count() AS n FROM orders AS o INNER JOIN quotes AS q ON q.order_id = o.id"
 
 $CLICKHOUSE_CLIENT -q "CREATE MATERIALIZED VIEW revenue_view REFRESH EVERY 10 YEAR APPEND INCREMENTAL TO view_revenue EMPTY AS $Q1"
 
@@ -40,13 +44,15 @@ end_round()
     local r=$1
     $CLICKHOUSE_CLIENT -q "
         INSERT INTO cursors SELECT 1, $r, cursor FROM deltaQueryFrontier(($Q1));
-        INSERT INTO cursors SELECT 2, $r, cursor FROM deltaQueryFrontier(($Q2));"
+        INSERT INTO cursors SELECT 2, $r, cursor FROM deltaQueryFrontier(($Q2));
+        INSERT INTO cursors SELECT 3, $r, cursor FROM deltaQueryFrontier(($Q3));"
     [ "$r" = 0 ] && return
     $CLICKHOUSE_CLIENT -q "
         INSERT INTO revenue SELECT * FROM deltaQuery(($Q1), $(cursor 1 $((r - 1))), $(cursor 1 "$r"));
         INSERT INTO revenue_deltas SELECT $r, category, product, revenue, n, finalizeAggregation(orders)
             FROM deltaQuery(($Q1), $(cursor 1 $((r - 1))), $(cursor 1 "$r"));
         INSERT INTO pairs SELECT * FROM deltaQuery(($Q2), $(cursor 2 $((r - 1))), $(cursor 2 "$r"));
+        INSERT INTO extremes SELECT * FROM deltaQuery(($Q3), $(cursor 3 $((r - 1))), $(cursor 3 "$r"));
         SYSTEM REFRESH VIEW revenue_view;
         SYSTEM WAIT VIEW revenue_view;"
 }
@@ -117,6 +123,10 @@ $CLICKHOUSE_CLIENT -q "
     SELECT 'maintained only', * FROM (SELECT * FROM maintained EXCEPT ALL SELECT * FROM recomputed)
     UNION ALL
     SELECT 'recomputed only', * FROM (SELECT * FROM recomputed EXCEPT ALL SELECT * FROM maintained)"
+
+echo "Maintained and recomputed extremes"
+$CLICKHOUSE_CLIENT -q "SELECT min(lo), max(hi), groupBitOr(ids), sum(n) FROM extremes"
+$CLICKHOUSE_CLIENT -q "$Q3"
 
 # Rerunning an old delta after later inserts and merges returns the same rows.
 echo "Round 2 delta rerun differences"
