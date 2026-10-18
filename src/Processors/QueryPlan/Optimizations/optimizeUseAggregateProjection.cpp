@@ -618,7 +618,7 @@ struct AggregateProjectionCandidates
 };
 
 /// Check if the whole aggregation can be answered from per-part column statistics: there is no
-/// GROUP BY and no filter, and every aggregate is count() or min/max over a physical column
+/// GROUP BY, and every aggregate is count() or min/max over a physical column
 /// that has statistics with min/max (StatisticsType::MinMax or StatisticsType::Basic) declared
 /// in the table metadata for a type whose min/max these statistics actually track
 /// (canStatisticsTrackMinMax).
@@ -644,10 +644,6 @@ static std::vector<StatisticsMinMaxAggregate> getStatisticsMinMaxAggregates(
 
     const auto & aggregates = aggregating.getParams().aggregates;
     if (aggregates.empty())
-        return {};
-
-    const auto & query_info = reading.getQueryInfo();
-    if (query_info.prewhere_info || query_info.row_level_filter || query_info.filter_actions_dag)
         return {};
 
     /// TODO(unique-key): support statistics-based answers; they don't see the delete bitmap.
@@ -882,7 +878,7 @@ static AggregateProjectionCandidates getAggregateProjectionCandidates(
     /// When no projection can serve the aggregation, try to answer min/max/count directly
     /// from per-part column statistics.
     if (allow_implicit_projections && !candidates.minmax_projection && candidates.real.empty()
-        && candidates.only_count_column.empty() && !dag.filter_node)
+        && candidates.only_count_column.empty())
     {
         candidates.statistics_min_max_aggregates
             = getStatisticsMinMaxAggregates(aggregating, reading, metadata, query_index, context);
@@ -978,6 +974,7 @@ static constexpr const char * STATISTICS_MIN_MAX_PROJECTION_NAME = "_statistics_
 /// with one row of aggregate function states, or an empty block if no part could be covered.
 static Block makeBlockWithMinMaxFromStatistics(
     const std::vector<StatisticsMinMaxAggregate> & stats_aggregates,
+    bool has_filter,
     ReadFromMergeTree::AnalysisResult & remaining_select_result,
     const LoggerPtr & logger)
 {
@@ -995,8 +992,10 @@ static Block makeBlockWithMinMaxFromStatistics(
         if (part->hasLightweightDelete())
             return false;
 
-        /// Part-level statistics can only answer a full-part read.
-        if (part->index_granularity->getRowsCountInRanges(part_with_ranges.ranges) != part->rows_count)
+        /// Part-level statistics can only answer a full-part read. With a filter, the filter must also be true on every
+        /// row of the part.
+        const auto & matching_ranges = has_filter ? part_with_ranges.exact_ranges : part_with_ranges.ranges;
+        if (part->index_granularity->getRowsCountInRanges(matching_ranges) != part->rows_count)
             return false;
 
         /// An empty part has no extremes, but `getExtremes` reports zeros for it. Read it instead;
@@ -1243,7 +1242,10 @@ UseProjectionsResult optimizeUseAggregateProjections(
         /// remaining parts (without statistics), to be used for normal reading.
         inexact_ranges_select_result = std::make_shared<ReadFromMergeTree::AnalysisResult>(*parent_reading_select_result);
         statistics_min_max_block = makeBlockWithMinMaxFromStatistics(
-            candidates.statistics_min_max_aggregates, *inexact_ranges_select_result, logger);
+            candidates.statistics_min_max_aggregates,
+            candidates.has_filter,
+            *inexact_ranges_select_result,
+            logger);
 
         if (statistics_min_max_block.empty())
             return result;

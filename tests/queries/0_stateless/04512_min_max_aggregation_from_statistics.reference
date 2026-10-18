@@ -18,7 +18,7 @@ not applied: Nullable column
 not applied: no statistics for String columns
 0	foo
 0
-not applied: there is a filter
+not applied: the filter is not true on every row of a part
 2020-01-01	2020-12-30
 0
 applied: monotonic arithmetic is rewritten to be applied over the aggregation

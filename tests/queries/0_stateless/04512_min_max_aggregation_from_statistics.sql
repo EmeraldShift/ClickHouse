@@ -64,7 +64,7 @@ SELECT 'not applied: no statistics for String columns';
 SELECT min(str), max(str) FROM t_min_max_from_stats;
 SELECT count() FROM (EXPLAIN SELECT min(str), max(str) FROM t_min_max_from_stats) WHERE explain LIKE '%_statistics_min_max_projection%';
 
-SELECT 'not applied: there is a filter';
+SELECT 'not applied: the filter is not true on every row of a part';
 SELECT min(date), max(date) FROM t_min_max_from_stats WHERE key < 1000;
 SELECT count() FROM (EXPLAIN SELECT min(date), max(date) FROM t_min_max_from_stats WHERE key < 1000) WHERE explain LIKE '%_statistics_min_max_projection%';
 
