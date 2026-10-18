@@ -171,31 +171,31 @@ Input makeInput(const TableNode & table)
     return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage)};
 }
 
-/// Rejects subqueries and tables outside FROM, which could read tables that the cursors do not cover. A join query also
-/// rejects window functions, whose result over the union of the terms differs from the union of their results.
+/// Rejects subqueries, which could read tables that the cursors do not cover. Resolution replaces scalar subqueries by
+/// their values, so this check runs on the AST.
+void checkNoSubqueries(const IAST & ast)
+{
+    for (const auto & child : ast.children)
+    {
+        if (child->as<ASTSubquery>())
+            throwUnsupported("subqueries");
+        checkNoSubqueries(*child);
+    }
+}
+
+/// Rejects tables outside FROM, like in `k IN t`, which the cursors do not cover. A join query also rejects window
+/// functions, whose result over the union of the terms differs from the union of their results.
 void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_indexes, bool is_join)
 {
     for (const auto & child : node.getChildren())
     {
         if (!child)
             continue;
-        switch (child->getNodeType())
-        {
-            case QueryTreeNodeType::QUERY:
-            case QueryTreeNodeType::UNION:
-                throwUnsupported("subqueries");
-            case QueryTreeNodeType::TABLE:
-            case QueryTreeNodeType::TABLE_FUNCTION:
-                if (!input_indexes.contains(child.get()))
-                    throwUnsupported("IN over tables");
-                break;
-            case QueryTreeNodeType::FUNCTION:
-                if (is_join && child->as<FunctionNode &>().isWindowFunction())
-                    throwUnsupported("window functions in joins");
-                break;
-            default:
-                break;
-        }
+        auto type = child->getNodeType();
+        if ((type == QueryTreeNodeType::TABLE || type == QueryTreeNodeType::TABLE_FUNCTION) && !input_indexes.contains(child.get()))
+            throwUnsupported("IN over tables");
+        if (const auto * function = child->as<FunctionNode>(); is_join && function && function->isWindowFunction())
+            throwUnsupported("window functions in joins");
         checkExpressions(*child, input_indexes, is_join);
     }
 }
@@ -422,14 +422,6 @@ ASTPtr makeBound(const String & qualifier, const std::map<String, Int64> & parti
 /// Conjuncts that keep the rows of an input with `lower` <= `_block_number` < `upper`, where a null `lower` keeps every row
 /// below `upper`. The conjuncts on `mergeTreePartInfo(_part)` depend only on the part, so they skip the parts outside the
 /// bounds before reading them.
-/// XCR review-bar: Preserve the original query's column-grant requirements when adding these bounds. A user with
-/// `SELECT(k, public)` on `t` can run `SELECT t.public FROM t JOIN u ON t.k = u.k`, but its `deltaQuery` fails with
-/// `ACCESS_DENIED` until granted `SELECT(_block_number, _partition_id, _part)` too. The single-table case fails as well.
-/// Don't require grants on implementation-only virtual columns that the user's query doesn't read.
-///
-/// aide on behalf of mjarrett: Declined. Skipping the check for these columns would need the planner to know which
-/// columns of a query the rewrite generated, and the delta runs as a plain query from the table function and from the
-/// refresh's INSERT. The docs of `deltaQuery` and of APPEND INCREMENTAL state the requirement, and 05409 tests it.
 void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
     const std::map<String, Int64> & upper)
 {
@@ -469,6 +461,7 @@ ASTPtr makeSemiJoinSubquery(const Input & input, const String & column, ASTPtr w
 
 DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context)
 {
+    checkNoSubqueries(*query_);
     InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     auto query_tree = interpreter.getQueryTree()->clone();
 

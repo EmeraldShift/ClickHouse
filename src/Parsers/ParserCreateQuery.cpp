@@ -3339,7 +3339,7 @@ The `REFRESH` clause must specify at least one of `EVERY`, `AFTER`, or `DEPENDS 
 
 Periodically runs the corresponding query and stores its result into a table.
 * If `APPEND` is specified, each refresh inserts rows into the table without deleting existing rows. The insert is not atomic, just like a regular `INSERT INTO ... SELECT` query.
-* If `APPEND INCREMENTAL` is specified, each refresh appends what the result gains from the rows committed to the source tables since the previous refresh. A query over one table runs over the new rows of the table. A query that joins tables appends, for each table occurrence, its new rows joined with the rows of the other occurrences, like the `deltaQuery` table function.
+* If `APPEND INCREMENTAL` is specified, each refresh appends what the result gains from the rows committed to the source tables since the previous refresh. A query over one table runs over the new rows of the table. A query that joins tables appends, for each table occurrence, its new rows joined with the rows of the other occurrences, like the `deltaQuery` table function. The refresh also reads the virtual columns `_block_number`, `_partition_id` and `_part` of the source tables, so with column-level grants the definer of the view needs `SELECT` on them.
 * Otherwise, each refresh atomically replaces the table's previous contents.
 
 Differences from regular non-refreshable materialized views:
