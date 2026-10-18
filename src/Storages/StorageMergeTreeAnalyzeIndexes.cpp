@@ -219,7 +219,6 @@ protected:
             .reader_settings = reader_settings,
             .log = getLogger("MergeTreeAnalyzeIndexSource"),
             .num_streams = num_streams,
-            .find_exact_ranges = false,
             .is_parallel_reading_from_replicas = false,
             .has_projections = false,
             .check_row_limits = true,

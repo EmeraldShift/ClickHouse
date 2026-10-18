@@ -1016,7 +1016,6 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
     bool use_skip_indexes_for_disjunctions_ = filter_context.indexes.use_skip_indexes_for_disjunctions;
     bool use_skip_indexes_on_data_read_ = filter_context.indexes.use_skip_indexes_on_data_read;
     bool use_skip_indexes_if_final_exact_mode_ = filter_context.indexes.use_skip_indexes_if_final_exact_mode;
-    bool find_exact_ranges = filter_context.find_exact_ranges;
     bool is_final_query = filter_context.query_info.isFinal();
     bool has_projections = filter_context.has_projections;
     auto & result = filter_context.result;
@@ -1249,12 +1248,11 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
             auto & ranges = parts_with_ranges[part_index];
 
-            /// The filter is true on every row of these ranges, so every skip index keeps them, and they are not read.
-            /// `selectPartsToRead` sets `exact_ranges` to the whole part if the filter is true on every row of its partition.
-            /// The primary key and the skip indexes add more.
+            /// The filter is true on every row of these ranges, so every skip index keeps them, and they are not read. The
+            /// read skips the PREWHERE steps there. `selectPartsToRead` sets `exact_ranges` to the whole part if the filter
+            /// is true on every row of its partition. The primary key and the skip indexes add more.
             MarkRanges exact_ranges = std::move(ranges.exact_ranges);
             ranges.exact_ranges.clear();
-            const bool find_pk_exact_ranges = find_exact_ranges || !skip_indexes.useful_indices.empty();
 
             if (exact_ranges.empty() && (metadata_snapshot->hasPrimaryKey() || part_offset_condition || total_offset_condition))
             {
@@ -1272,7 +1270,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
                     key_condition->generateForPart(ranges.data_part),
                     part_offset_condition ? &part_offset_condition->generateForPart(ranges.data_part) : nullptr,
                     total_offset_condition ? &total_offset_condition->generateForPart(ranges.data_part) : nullptr,
-                    find_pk_exact_ranges ? &exact_ranges : nullptr,
+                    &exact_ranges,
                     pk_to_minmax_slot_ptr,
                     settings,
                     log);
@@ -1433,8 +1431,7 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
 
             }
 
-            if (find_exact_ranges)
-                ranges.exact_ranges = std::move(exact_ranges);
+            ranges.exact_ranges = std::move(exact_ranges);
 
             /// Optimize ORDER BY <col> LIMIT n - if <col> is scalar numeric / date / datetime and has a minmax index
             if (perform_top_k_optimization

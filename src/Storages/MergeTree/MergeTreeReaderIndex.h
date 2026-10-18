@@ -14,7 +14,7 @@ using LazyMaterializingRowsPtr = std::shared_ptr<LazyMaterializingRows>;
 /// A reader used in the initial stage of reading to apply index-based filtering. Currently, both skip indexes and
 /// projection indexes are used to identify which granules are relevant to the query, and only those are passed to
 /// subsequent readers. In addition, the projection index constructs a row-level filter to further reduce I/O within
-/// selected granules.
+/// selected granules. Without an index read result or rows of lazy materialization, the reader only counts the rows.
 class MergeTreeReaderIndex : public IMergeTreeReader
 {
 public:

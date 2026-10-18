@@ -572,6 +572,8 @@ MergeTreeReadPoolBase::buildReadTaskInfo(const RangesInDataPart & part_with_rang
             /// from the index granularity.
             if (names->empty())
                 read_task_info.exact_task_columns->columns.clear();
+
+            read_task_info.exact_ranges = part_with_ranges.exact_ranges;
         }
     }
 

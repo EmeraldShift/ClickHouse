@@ -455,7 +455,7 @@ void MergeTreeReadTask::initializeReadersChain(
         all_prewhere_actions.steps.push_back(step);
 
     /// The rows of lazy materialization come from the filter of the first read, so every row has to pass the index reader.
-    if (index_read_result && info->exact_task_columns && !lazy_materializing_rows)
+    if ((index_read_result || !info->exact_ranges.empty()) && info->exact_task_columns && !lazy_materializing_rows)
         initializeExactReadersChain(index_read_result, read_steps_performance_counters);
 
     readers_chain = createReadersChain(
@@ -466,13 +466,20 @@ void MergeTreeReadTask::initializeReadersChain(
 void MergeTreeReadTask::initializeExactReadersChain(
     const MergeTreeIndexReadResultPtr & index_read_result, const ReadStepsPerformanceCounters & read_steps_performance_counters)
 {
+    auto is_mark_exact = [&](size_t mark)
+    {
+        auto next = std::ranges::upper_bound(info->exact_ranges, mark, {}, &MarkRange::begin);
+        return (next != info->exact_ranges.begin() && mark < std::prev(next)->end)
+            || (index_read_result && index_read_result->isMarkExact(mark));
+    };
+
     std::deque<MarkRanges> runs;
     bool run_is_exact = false;
     for (const auto & range : mark_ranges)
     {
         for (size_t mark = range.begin; mark < range.end; ++mark)
         {
-            const bool is_exact = index_read_result->isMarkExact(mark);
+            const bool is_exact = is_mark_exact(mark);
             if (runs.empty() || is_exact != run_is_exact)
             {
                 if (runs.empty())

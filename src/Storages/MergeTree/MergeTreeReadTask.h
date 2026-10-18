@@ -139,6 +139,8 @@ struct MergeTreeReadTaskInfo
     /// Column names to read on the ranges where the filter is true on every row. No PREWHERE step runs on them. Unset if
     /// a PREWHERE step produces a column that the read returns.
     std::optional<MergeTreeReadTaskColumns> exact_task_columns;
+    /// The ranges where index analysis finds that the filter is true on every row.
+    MarkRanges exact_ranges;
     /// Shared initialized size predictor. It is copied for each new task.
     MergeTreeBlockSizePredictorPtr shared_size_predictor;
     /// Shared constant fields for virtual columns.

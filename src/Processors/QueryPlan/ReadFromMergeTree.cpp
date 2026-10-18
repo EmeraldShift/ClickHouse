@@ -3704,7 +3704,6 @@ ReadFromMergeTree::AnalysisResultPtr ReadFromMergeTree::selectRangesToRead(
         .reader_settings = reader_settings,
         .log = log,
         .num_streams = num_streams,
-        .find_exact_ranges = find_exact_ranges,
         .is_parallel_reading_from_replicas = is_parallel_reading_from_replicas_,
         .has_projections = has_projections,
         .check_row_limits = check_row_limits,

@@ -36,8 +36,7 @@ MergeTreeReaderIndex::MergeTreeReaderIndex(const IMergeTreeReader * main_reader_
     , lazy_materializing_rows(lazy_materializing_rows_)
     , main_reader(main_reader_)
 {
-    chassert(lazy_materializing_rows || index_read_result);
-    chassert(lazy_materializing_rows || index_read_result->skip_index_read_result || index_read_result->projection_index_read_result);
+    chassert(!index_read_result || index_read_result->skip_index_read_result || index_read_result->projection_index_read_result);
 }
 
 size_t MergeTreeReaderIndex::readRows(
