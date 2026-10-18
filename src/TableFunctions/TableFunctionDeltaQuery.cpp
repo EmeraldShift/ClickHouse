@@ -150,7 +150,7 @@ or any `-State` aggregate.
 With the setting `delta_query_sign_column`, each table that has a column of that name is signed. A row of sign 1 inserts the row, and a row
 of sign -1 retracts an earlier row with the same values. A query without aggregates returns the product of the signs of the signed tables
 as a column of that name, for a `CollapsingMergeTree` target. A query with aggregates over signed tables supports only `count`, `sum`, their
-`-If` forms and `exponentialMovingAverageState`. Their deltas sum to the result over the rows that remain, for a `SummingMergeTree`
+`-If` forms. Their deltas sum to the result over the rows that remain, for a `SummingMergeTree`
 target. A query
 over one table then follows the rules of a query that joins tables.
 

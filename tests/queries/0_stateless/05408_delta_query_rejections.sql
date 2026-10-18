@@ -90,6 +90,7 @@ SELECT * FROM deltaQueryFrontier((SELECT k, min(v) FROM s GROUP BY k)); -- { ser
 SELECT * FROM deltaQueryFrontier((SELECT k, avg(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, uniqState(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, sumState(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, exponentialMovingAverageState(1)(v, k) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT s.k, min(v) FROM s JOIN t ON s.k = t.k GROUP BY s.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, sign FROM s)); -- { serverError NOT_IMPLEMENTED }
@@ -104,8 +105,7 @@ SELECT * FROM deltaQueryFrontier((SELECT k, count() FROM t GROUP BY k HAVING cou
 SELECT * FROM deltaQueryFrontier((SELECT k, row_number() OVER () FROM t)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT DISTINCT k FROM t)); -- { serverError NOT_IMPLEMENTED }
 -- Accepted result columns over signed inputs, and over unsigned inputs with the setting.
-SELECT * FROM deltaQueryFrontier((SELECT k, count(), count(v), countIf(v > 0), sum(v), sumIf(v, v > 0), exponentialMovingAverageState(1)(v, k)
-    FROM s GROUP BY k)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT k, count(), count(v), countIf(v > 0), sum(v), sumIf(v, v > 0) FROM s GROUP BY k)) FORMAT Null;
 SELECT * FROM deltaQueryFrontier((SELECT min(v), uniqState(k) FROM t)) FORMAT Null;
 -- The query can set the setting in its SETTINGS clause.
 SET delta_query_sign_column = '';

@@ -113,26 +113,16 @@ std::pair<String, std::vector<String>> splitCombinators(const String & name)
 bool isInvertibleAggregate(const String & name)
 {
     const auto [base, suffixes] = splitCombinators(name);
-    if (base == "sum" || base == "count")
-        return suffixes.empty() || suffixes == std::vector<String>{"If"};
-    return base == "exponentialMovingAverage" && suffixes == std::vector<String>{"State"};
+    return (base == "sum" || base == "count") && (suffixes.empty() || suffixes == std::vector<String>{"If"});
 }
 
-/// The aggregate `function` with each row weighted by `weight`. `isInvertibleAggregate` must accept `function`. The result
-/// over rows of weight 1 and -1 is the result of `function` over the rows of weight 1 that no row of weight -1 cancels.
-ASTPtr makeWeightedAggregate(const ASTFunction & function, const ASTPtr & weight)
+/// The aggregate `function` with each row weighted by `weight`. `isInvertibleAggregate` must accept `function`, and `node`
+/// is its node in the query tree. The result over rows of weight 1 and -1 is the result of `function` over the rows of
+/// weight 1 that no row of weight -1 cancels.
+ASTPtr makeWeightedAggregate(const ASTFunction & function, const FunctionNode & node, const ASTPtr & weight)
 {
     const auto [base, suffixes] = splitCombinators(function.name);
     ASTs arguments = function.arguments ? function.arguments->children : ASTs{};
-    if (base == "exponentialMovingAverage")
-    {
-        /// The state is a sum of values scaled by the decay to the latest time. So scaling the values by the weights retracts.
-        auto result = function.clone();
-        auto & result_arguments = result->as<ASTFunction &>().arguments->children;
-        result_arguments.at(0) = makeASTFunction("multiply", result_arguments.at(0), weight->clone());
-        return result;
-    }
-
     ASTs conditions;
     if (!suffixes.empty() && !arguments.empty())
     {
@@ -141,7 +131,19 @@ ASTPtr makeWeightedAggregate(const ASTFunction & function, const ASTPtr & weight
     }
     ASTPtr value;
     if (base == "sum" && arguments.size() == 1)
-        value = makeASTFunction("multiply", arguments[0], weight->clone());
+    {
+        /// The product of an unsigned integer and a signed weight has the signed type of the same width. That type can't
+        /// hold every value of the unsigned type. So the value is first converted to the signed type of twice the width.
+        auto summed = arguments[0];
+        WhichDataType type(removeLowCardinalityAndNullable(node.getArguments().getNodes().at(0)->getResultType()));
+        if (type.isUInt64())
+            summed = makeASTFunction("toInt128", summed);
+        else if (type.isUInt128())
+            summed = makeASTFunction("toInt256", summed);
+        else if (type.isUInt256())
+            throwUnsupported("sums of UInt256 over signed inputs");
+        value = makeASTFunction("multiply", summed, weight->clone());
+    }
     else if (base == "count" && arguments.size() <= 1)
     {
         value = weight->clone();
@@ -299,8 +301,7 @@ void checkResultColumns(const QueryNode & query, bool is_signed)
         {
             const auto & name = function->getFunctionName();
             if (is_signed && !isInvertibleAggregate(name))
-                throwUnsupported(fmt::format("aggregate function {} over signed inputs, use count, sum, their -If forms "
-                    "or exponentialMovingAverageState instead", name));
+                throwUnsupported(fmt::format("aggregate function {} over signed inputs, use count, sum or their -If forms instead", name));
             if (!is_signed && !isMergeableAggregate(name))
                 throwUnsupported(fmt::format("aggregate function {} in {}, use its -State form instead", name, linear_queries));
         }
@@ -591,7 +592,7 @@ void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & s
         if (!function || !function->isAggregateFunction())
             continue;
         /// The alias keeps the name of the result column.
-        projection[i] = makeWeightedAggregate(projection[i]->as<ASTFunction &>(), weight);
+        projection[i] = makeWeightedAggregate(projection[i]->as<ASTFunction &>(), *function, weight);
         projection[i]->setAlias(columns[i].name);
         has_aggregates = true;
     }
