@@ -2,8 +2,10 @@
 
 #include <Core/Streaming/CursorTree.h>
 #include <Interpreters/Context_fwd.h>
+#include <Interpreters/StorageID.h>
 #include <Parsers/IAST_fwd.h>
 
+#include <memory>
 #include <vector>
 
 
@@ -19,6 +21,14 @@ namespace DB
 /// the row, and a row with sign -1 retracts an earlier row with the same values. The weight of a joined row is the product
 /// of the signs of its signed inputs. A query without aggregates returns the weight of each row as that column. A query
 /// with aggregates weighs its rows in its aggregates. The deltas merge like the deltas of a join.
+///
+/// With `delta_query_sign_column`, a query can also have a residual: the clauses whose result over the union of the deltas
+/// differs from the union of their results, like HAVING, ORDER BY with LIMIT, LIMIT BY, DISTINCT, window functions,
+/// expressions over aggregates and aggregates like `uniq`. The query then splits into a linear core and the residual. The
+/// core groups the rows by keys, which are the GROUP BY keys or else the columns that the residual reads, and its deltas
+/// have the form above. An integral table sums the deltas of the core. Each refresh evaluates the residual over the rows of
+/// the integral whose keys the delta touched, and diffs the result with the rows that the target has for those keys. The
+/// rows of the diff have the sign column, so the target can be a `CollapsingMergeTree`.
 ///
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
@@ -39,17 +49,36 @@ public:
     /// `old_cursor` <= `new_cursor` and this server has committed every block that the delta reads.
     ASTPtr buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
 
-    /// The query that each delta evaluates over part of the inputs. Every delta has its result columns.
-    const ASTPtr & getQuery() const { return query; }
+    /// A query with the result columns of the rows that the deltas insert into a target. That is the query that each delta
+    /// evaluates over part of the inputs, or for a query with a residual, the residual with the sign column.
+    ASTPtr getQuery() const;
+
+    /// Whether the query has a residual. `buildDelta` then returns the deltas of the core, which go to the integral.
+    bool hasResidual() const { return residual != nullptr; }
+
+    /// `CREATE TABLE IF NOT EXISTS` of the integral of the core.
+    String getIntegralCreateQuery(const StorageID & integral) const;
+
+    /// The rows that make `target` equal to the residual over `integral`, after `integral` absorbed the delta of the core
+    /// in table `delta`. The rows have the sign column. The residual runs over the keys that the delta touched, unless the
+    /// residual can move rows between keys, like a LIMIT over all rows. Then it runs over all keys. An empty `delta`
+    /// touches no keys.
+    ASTPtr buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target) const;
 
     struct Input;
     struct SemiJoinEdge;
+    struct Residual;
 
 private:
-    /// The resolved query, whose tables have unique aliases.
+    /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
+    /// fills `split` and returns its core instead, which the caller analyzes.
+    ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
+
+    /// The resolved query, whose tables have unique aliases. For a query with a residual, its core.
     ASTPtr query;
     std::vector<Input> inputs;
     std::vector<SemiJoinEdge> semi_join_edges;
+    std::shared_ptr<const Residual> residual;
 };
 
 }

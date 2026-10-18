@@ -9,25 +9,36 @@
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/QueryNode.h>
 #include <Analyzer/TableNode.h>
+#include <Analyzer/WindowFunctionsUtils.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <Core/Joins.h>
+#include <Common/quoteString.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/InterpreterSetQuery.h>
+#include <Interpreters/NormalizeSelectWithUnionQueryVisitor.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTOrderByElement.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTWindowDefinition.h>
+#include <Parsers/ParserSelectWithUnionQuery.h>
+#include <Parsers/parseQuery.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
 #include <Storages/StorageProxy.h>
+
+#include <boost/algorithm/string/replace.hpp>
+#include <fmt/ranges.h>
 
 #include <deque>
 #include <map>
@@ -42,6 +53,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -73,6 +85,42 @@ struct DeltaQuery::SemiJoinEdge
     String from_column;
     size_t to;
     String to_column;
+};
+
+/// The residual of a query and how to evaluate it over the integral of the core. The integral has a column `__key_i` per
+/// key and a column `__agg_m` per aggregate of the core, where `__agg_0` is `count()`.
+struct DeltaQuery::Residual
+{
+    String sign_column;
+    /// Whether the keys are GROUP BY keys. Otherwise they are the columns that the residual reads, and each row of the
+    /// integral stands for `__agg_0` rows.
+    bool has_aggregates = false;
+    size_t num_keys = 0;
+    /// The function of the `SimpleAggregateFunction` of each aggregate column of the integral, or empty for a state.
+    Strings simple_functions;
+    /// The merge of each aggregate `__val_j` of the residual, which reads the aggregate columns of the integral.
+    ASTs merges;
+    /// The residual as a select over the placeholder table `residual_input`.
+    String outer;
+    Names outputs;
+    /// The keys whose values bound the rows that a change of the integral can change, and the output columns that equal
+    /// them. A refresh recomputes the rows of the touched values of these keys. Empty if it recomputes all rows.
+    std::vector<size_t> partition_keys;
+    Names partition_outputs;
+
+    /// Filled from the analysis of the core.
+    DataTypes key_types;
+    NamesAndTypesList integral_columns;
+    /// `merge AS __val_j` for each merge.
+    Strings values;
+    ASTPtr output_query;
+
+    /// The rows of `integral` that pass `where` merged per key.
+    String buildInput(const String & integral, const String & where) const;
+    /// The residual over the rows of `integral` that pass `where`.
+    String buildResidual(const String & integral, const String & where) const;
+    /// `(c_1, ...) IN (SELECT __key_p1, ... FROM delta)`, where column c_i equals partition key i.
+    String buildPartitionFilter(const Names & columns, const String & delta) const;
 };
 
 namespace
@@ -619,6 +667,16 @@ void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & s
         throwUnsupported("GROUP BY without aggregates over signed inputs, add count() to see which groups have rows");
 }
 
+ASTPtr makeSelectWithUnion(ASTPtr select)
+{
+    auto selects = make_intrusive<ASTExpressionList>();
+    selects->children.push_back(std::move(select));
+    auto query = make_intrusive<ASTSelectWithUnionQuery>();
+    query->list_of_selects = selects;
+    query->children.push_back(std::move(selects));
+    return query;
+}
+
 /// `(SELECT column FROM input WHERE where)`
 ASTPtr makeSemiJoinSubquery(const Input & input, const String & column, ASTPtr where)
 {
@@ -628,13 +686,360 @@ ASTPtr makeSemiJoinSubquery(const Input & input, const String & column, ASTPtr w
     select->setExpression(ASTSelectQuery::Expression::SELECT, std::move(columns));
     select->replaceDatabaseAndTable(input.storage->getStorageID());
     select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(where));
+    return make_intrusive<ASTSubquery>(makeSelectWithUnion(std::move(select)));
+}
 
-    auto selects = make_intrusive<ASTExpressionList>();
-    selects->children.push_back(std::move(select));
-    auto query = make_intrusive<ASTSelectWithUnionQuery>();
-    query->list_of_selects = selects;
-    query->children.push_back(std::move(selects));
-    return make_intrusive<ASTSubquery>(std::move(query));
+/// Whether the clauses of a query with `delta_query_sign_column` need the integral of the core. The core is the rest of the
+/// query, which `checkLinearClauses` and `checkResultColumns` accept.
+bool needsResidual(const QueryNode & query, bool is_signed)
+{
+    if (query.isDistinct() || query.hasHaving() || query.hasWindow() || query.hasQualify() || query.hasOrderBy() || query.hasInterpolate()
+        || query.hasLimitBy() || query.hasLimit() || query.hasOffset() || query.hasLimitAfter() || query.hasLimitUntil())
+        return true;
+    for (const auto & column : query.getProjection().getNodes())
+    {
+        if (hasWindowFunctionNodes(column))
+            return true;
+        if (const auto * function = column->as<FunctionNode>(); function && function->isAggregateFunction())
+        {
+            const auto & name = function->getFunctionName();
+            if (is_signed ? !isInvertibleAggregate(name) : !isMergeableAggregate(name))
+                return true;
+        }
+        else if (hasAggregateFunctionNodes(column))
+            return true;
+    }
+    return false;
+}
+
+/// The name of the table that stands for the merged rows of the integral in `Residual::outer`.
+constexpr std::string_view residual_input = "__residual_input";
+
+String makeKeyName(size_t key) { return fmt::format("__key_{}", key + 1); }
+
+bool isAggregate(const IAST & ast)
+{
+    const auto * function = ast.as<ASTFunction>();
+    return function && !function->isWindowFunction() && AggregateFunctionFactory::instance().isAggregateFunctionName(function->name);
+}
+
+using Visit = std::function<ASTPtr(const ASTPtr & node)>;
+
+/// Calls `visit` on the nodes of the expression `node` of `parent` top-down. A node that `visit` returns replaces `node`,
+/// and its children aren't visited. Neither are the identifiers of lambda parameters.
+void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::multiset<String> & lambda_parameters)
+{
+    if (const auto * identifier = node->as<ASTIdentifier>(); identifier && lambda_parameters.contains(identifier->name()))
+        return;
+    if (auto replacement = visit(node))
+    {
+        const IAST * old = node.get();
+        node = std::move(replacement);
+        parent.updatePointerToChild(old, node);
+        return;
+    }
+    if (auto * function = node->as<ASTFunction>(); function && function->isLambdaFunction())
+    {
+        auto & arguments = function->arguments->children;
+        Names names;
+        for (const auto & parameter : arguments.at(0)->as<ASTFunction &>().arguments->children)
+            names.push_back(parameter->as<ASTIdentifier &>().name());
+        for (const auto & name : names)
+            lambda_parameters.insert(name);
+        visitExpression(arguments.at(1), *function->arguments, visit, lambda_parameters);
+        for (const auto & name : names)
+            lambda_parameters.erase(lambda_parameters.find(name));
+        return;
+    }
+    for (auto & child : node->children)
+        if (child)
+            visitExpression(child, *node, visit, lambda_parameters);
+}
+
+/// Visits the clauses of `select` that the residual evaluates.
+void visitResidualClauses(ASTSelectQuery & select, const Visit & visit)
+{
+    std::multiset<String> lambda_parameters;
+    for (const auto & list : {select.select(), select.window(), select.orderBy(), select.limitBy(), select.interpolate()})
+        if (list)
+            for (auto & child : list->children)
+                visitExpression(child, *list, visit, lambda_parameters);
+    if (select.having())
+        visitExpression(select.refHaving(), select, visit, lambda_parameters);
+    if (select.qualify())
+        visitExpression(select.refQualify(), select, visit, lambda_parameters);
+}
+
+/// The PARTITION BY of the window of `function`, or null for a window over all rows.
+ASTPtr getWindowPartition(const ASTFunction & function, const ASTSelectQuery & select)
+{
+    auto find_window = [&](const String & name) -> const ASTWindowDefinition &
+    {
+        if (select.window())
+            for (const auto & element : select.window()->children)
+                if (const auto & window = element->as<ASTWindowListElement &>(); window.name == name)
+                    return window.definition->as<ASTWindowDefinition &>();
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Window {} is not defined", name);
+    };
+    const auto * window = function.window_definition ? &function.window_definition->as<ASTWindowDefinition &>() : &find_window(function.window_name);
+    while (!window->partition_by && !window->parent_window_name.empty())
+        window = &find_window(window->parent_window_name);
+    return window->partition_by;
+}
+
+ASTs cloneAll(const ASTs & asts)
+{
+    ASTs result;
+    for (const auto & ast : asts)
+        result.push_back(ast->clone());
+    return result;
+}
+
+/// Splits the resolved `select` of `query` into its core, which it returns, and the residual, which it fills in.
+///
+/// The keys of the core are the GROUP BY keys, or else the columns that the residual reads. The core selects the keys as
+/// `__key_i` and the aggregates of the integral as `__agg_m`. The residual is `select` with each key and aggregate replaced
+/// by a column of its input, GROUP BY dropped and HAVING turned into WHERE. Its input selects the keys and merges the
+/// aggregate columns of the integral per key as `__val_j`. Nodes match by their hashes without aliases.
+ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, bool is_signed, DeltaQuery::Residual & residual)
+{
+    if (query.isGroupByWithTotals() || query.isGroupByWithRollup() || query.isGroupByWithCube() || query.isGroupByWithGroupingSets())
+        throwUnsupported(fmt::format("WITH TOTALS, ROLLUP, CUBE or GROUPING SETS in {}", linear_queries));
+    for (const auto & column : query.getProjectionColumns())
+    {
+        if (column.name == residual.sign_column)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The delta query returns column {}, which delta_query_sign_column names", column.name);
+        if (std::ranges::find(residual.outputs, column.name) != residual.outputs.end())
+            throwUnsupported(fmt::format("two result columns named {} in queries with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates", column.name));
+        residual.outputs.push_back(column.name);
+    }
+
+    auto outer_ast = select.clone();
+    auto & outer = outer_ast->as<ASTSelectQuery &>();
+
+    ASTs keys;
+    std::map<IASTHash, size_t> key_indexes;
+    auto add_key = [&](const ASTPtr & key)
+    {
+        if (key_indexes.try_emplace(key->getTreeHash(true), keys.size()).second)
+            keys.push_back(key->clone());
+    };
+    residual.has_aggregates = query.hasGroupBy();
+    visitResidualClauses(outer, [&](const ASTPtr & node) -> ASTPtr
+    {
+        residual.has_aggregates |= isAggregate(*node);
+        return nullptr;
+    });
+    if (residual.has_aggregates)
+    {
+        for (const auto & key : query.getGroupBy().getNodes())
+            add_key(key->toAST());
+    }
+    else
+    {
+        visitResidualClauses(outer, [&](const ASTPtr & node) -> ASTPtr
+        {
+            if (node->as<ASTIdentifier>())
+                add_key(node);
+            return nullptr;
+        });
+    }
+    residual.num_keys = keys.size();
+
+    /// The partition starts with all keys and keeps those that every clause that compares rows across keys compares by.
+    std::vector<bool> in_partition(keys.size(), true);
+    auto restrict_to = [&](const ASTPtr & list)
+    {
+        std::vector<bool> matched(keys.size());
+        if (list)
+            for (const auto & expression : list->children)
+                if (auto key = key_indexes.find(expression->getTreeHash(true)); key != key_indexes.end())
+                    matched[key->second] = true;
+        for (size_t i = 0; i < keys.size(); ++i)
+            in_partition[i] = in_partition[i] && matched[i];
+    };
+    bool with_fill = false;
+    if (outer.orderBy())
+        for (const auto & element : outer.orderBy()->children)
+            with_fill |= element->as<ASTOrderByElement &>().with_fill;
+    if (outer.limitLength() || outer.limitOffset() || outer.limitAfter() || outer.limitUntil() || outer.interpolate() || with_fill)
+        restrict_to(nullptr);
+    if (outer.limitBy())
+        restrict_to(outer.limitBy());
+    visitResidualClauses(outer, [&](const ASTPtr & node) -> ASTPtr
+    {
+        if (const auto * function = node->as<ASTFunction>(); function && function->isWindowFunction())
+            restrict_to(getWindowPartition(*function, outer));
+        return nullptr;
+    });
+    /// The rows of the target for a touched value are read by the output column of the key.
+    restrict_to(outer.select());
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        if (!in_partition[i])
+            continue;
+        const auto & projection = outer.select()->children;
+        auto hash = keys[i]->getTreeHash(true);
+        auto column = std::ranges::find_if(projection, [&](const auto & expression) { return expression->getTreeHash(true) == hash; });
+        residual.partition_keys.push_back(i);
+        residual.partition_outputs.push_back(residual.outputs.at(column - projection.begin()));
+    }
+
+    /// The aggregates of the core by their hashes, and the columns of the integral for them.
+    ASTs core_aggregates;
+    std::map<IASTHash, String> core_aggregate_columns;
+    auto add_core_aggregate = [&](ASTPtr aggregate, const String & simple_function) -> ASTPtr
+    {
+        auto [column, inserted] = core_aggregate_columns.try_emplace(aggregate->getTreeHash(true), fmt::format("__agg_{}", core_aggregates.size()));
+        if (inserted)
+        {
+            aggregate->setAlias(column->second);
+            core_aggregates.push_back(std::move(aggregate));
+            residual.simple_functions.push_back(simple_function);
+        }
+        return make_intrusive<ASTIdentifier>(column->second);
+    };
+    add_core_aggregate(makeASTFunction("count"), "sum");
+
+    /// `name(arguments)` with the parameters of `like`.
+    auto make_aggregate = [](const String & name, const ASTFunction & like, ASTs arguments)
+    {
+        auto function = makeASTFunction(name, std::move(arguments));
+        if (like.parameters)
+        {
+            function->parameters = like.parameters->clone();
+            function->children.push_back(function->parameters);
+        }
+        return function;
+    };
+    /// Adds the aggregates of the core that `function` merges from, and returns the merge.
+    auto add_aggregate = [&](const ASTFunction & function) -> ASTPtr
+    {
+        const auto [base, suffixes] = splitCombinators(function.name);
+        const ASTs arguments = function.arguments ? function.arguments->children : ASTs{};
+        const bool is_sum = suffixes.empty() || suffixes == std::vector<String>{"If"};
+        if (!suffixes.empty() && suffixes.front() == "State")
+        {
+            if (is_signed && !isInvertibleAggregate(function.name))
+                throwUnsupported(fmt::format("aggregate function {} over signed inputs", function.name));
+            auto column = add_core_aggregate(function.clone(), "");
+            return make_aggregate(function.name.substr(0, function.name.size() - String("State").size()) + "MergeState", function, {column});
+        }
+        if ((base == "sum" || base == "count") && is_sum)
+            return makeASTFunction("sum", add_core_aggregate(function.clone(), "sum"));
+        if (base == "avg" && is_sum)
+        {
+            /// `avg(x)` is `sum(x) / count(x)`, which sums over rows.
+            const String suffix = suffixes.empty() ? "" : "If";
+            auto sum = add_core_aggregate(makeASTFunction("sum" + suffix, cloneAll(arguments)), "sum");
+            auto count = add_core_aggregate(makeASTFunction("count" + suffix, cloneAll(arguments)), "sum");
+            return makeASTFunction("divide", makeASTFunction("sum", std::move(sum)), makeASTFunction("sum", std::move(count)));
+        }
+        if (is_signed)
+            throwUnsupported(fmt::format("aggregate function {} over signed inputs, use count, sum, avg, their -If forms or exponentialMovingAverageState instead", function.name));
+        static const std::set<String> simple = {"min", "max", "any", "groupBitOr", "groupBitAnd", "groupBitXor"};
+        if (suffixes.empty() && simple.contains(base))
+            return makeASTFunction(base, add_core_aggregate(function.clone(), base));
+        auto column = add_core_aggregate(make_aggregate(function.name + "State", function, cloneAll(arguments)), "");
+        return make_aggregate(function.name + "Merge", function, {column});
+    };
+
+    std::unordered_set<const IAST *> replacements;
+    auto replace_by = [&](const String & name, const ASTPtr & node) -> ASTPtr
+    {
+        auto identifier = make_intrusive<ASTIdentifier>(name);
+        identifier->setAlias(node->tryGetAlias());
+        replacements.insert(identifier.get());
+        return identifier;
+    };
+    std::map<IASTHash, size_t> value_indexes;
+    visitResidualClauses(outer, [&](const ASTPtr & node) -> ASTPtr
+    {
+        auto hash = node->getTreeHash(true);
+        if (auto key = key_indexes.find(hash); key != key_indexes.end())
+            return replace_by(makeKeyName(key->second), node);
+        if (!isAggregate(*node))
+            return nullptr;
+        auto [value, inserted] = value_indexes.try_emplace(hash, residual.merges.size());
+        if (inserted)
+            residual.merges.push_back(add_aggregate(node->as<ASTFunction &>()));
+        return replace_by(fmt::format("__val_{}", value->second + 1), node);
+    });
+    visitResidualClauses(outer, [&](const ASTPtr & node) -> ASTPtr
+    {
+        if (node->as<ASTIdentifier>() && !replacements.contains(node.get()))
+            throwUnsupported(fmt::format("{} outside aggregates and GROUP BY keys", node->formatForErrorMessage()));
+        return nullptr;
+    });
+
+    auto having = outer.having();
+    outer.setExpression(ASTSelectQuery::Expression::HAVING, nullptr);
+    outer.setExpression(ASTSelectQuery::Expression::WHERE, std::move(having));
+    for (auto clause : {ASTSelectQuery::Expression::WITH, ASTSelectQuery::Expression::PREWHERE, ASTSelectQuery::Expression::GROUP_BY,
+            ASTSelectQuery::Expression::SETTINGS, ASTSelectQuery::Expression::TABLES})
+        outer.setExpression(clause, nullptr);
+    outer.group_by_all = false;
+    outer.replaceDatabaseAndTable(StorageID("", String(residual_input)));
+    for (size_t i = 0; i < residual.outputs.size(); ++i)
+        outer.select()->children[i]->setAlias(residual.outputs[i]);
+    residual.outer = outer_ast->formatWithSecretsOneLine();
+
+    auto core_ast = select.clone();
+    auto & core = core_ast->as<ASTSelectQuery &>();
+    auto projection = make_intrusive<ASTExpressionList>();
+    auto group_by = make_intrusive<ASTExpressionList>();
+    for (size_t i = 0; i < keys.size(); ++i)
+    {
+        auto key = keys[i]->clone();
+        key->setAlias("");
+        group_by->children.push_back(key->clone());
+        key->setAlias(makeKeyName(i));
+        projection->children.push_back(std::move(key));
+    }
+    std::ranges::move(core_aggregates, std::back_inserter(projection->children));
+    core.setExpression(ASTSelectQuery::Expression::SELECT, std::move(projection));
+    core.setExpression(ASTSelectQuery::Expression::GROUP_BY, nullptr);
+    if (!keys.empty())
+        core.setExpression(ASTSelectQuery::Expression::GROUP_BY, std::move(group_by));
+    for (auto clause : {ASTSelectQuery::Expression::HAVING, ASTSelectQuery::Expression::WINDOW, ASTSelectQuery::Expression::QUALIFY,
+            ASTSelectQuery::Expression::ORDER_BY, ASTSelectQuery::Expression::INTERPOLATE, ASTSelectQuery::Expression::LIMIT_BY_OFFSET,
+            ASTSelectQuery::Expression::LIMIT_BY_LENGTH, ASTSelectQuery::Expression::LIMIT_BY, ASTSelectQuery::Expression::LIMIT_OFFSET,
+            ASTSelectQuery::Expression::LIMIT_LENGTH, ASTSelectQuery::Expression::LIMIT_AFTER, ASTSelectQuery::Expression::LIMIT_UNTIL})
+        core.setExpression(clause, nullptr);
+    core.distinct = false;
+    core.group_by_all = false;
+    core.limit_with_ties = false;
+    core.limit_by_all = false;
+    core.limit_after_all = false;
+    return makeSelectWithUnion(std::move(core_ast));
+}
+
+String joinNames(const Strings & names)
+{
+    return fmt::format("{}", fmt::join(names, ", "));
+}
+
+/// Parses `sql`, whose unions have explicit modes.
+ASTPtr parseSelect(const String & sql)
+{
+    ParserSelectWithUnionQuery parser;
+    auto ast = parseQuery(parser, sql, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    NormalizeSelectWithUnionQueryVisitor::Data data{SetOperationMode::ALL};
+    NormalizeSelectWithUnionQueryVisitor(data).visit(ast);
+    return ast;
+}
+
+/// Replaces the identifiers of the columns in `types` within `ast` by casts to their types.
+void castColumns(IAST & ast, const std::map<String, String> & types)
+{
+    for (auto & child : ast.children)
+    {
+        const auto * identifier = child->as<ASTIdentifier>();
+        if (!identifier)
+            castColumns(*child, types);
+        else if (auto type = types.find(identifier->name()); type != types.end())
+            child = makeASTFunction("CAST", child, make_intrusive<ASTLiteral>(type->second));
+    }
 }
 
 }
@@ -647,6 +1052,52 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     InterpreterSetQuery::applySettingsFromQuery(query_, context);
     const String sign_column = context->getSettingsRef()[Setting::delta_query_sign_column];
 
+    Residual split;
+    split.sign_column = sign_column;
+    auto core = analyze(query_, context, sign_column, sign_column.empty() ? nullptr : &split);
+    if (!core)
+        return;
+    analyze(core, context, sign_column, nullptr);
+
+    /// The integral has the columns of the deltas of the core, and merges the aggregate columns.
+    const auto core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
+    Strings structure;
+    /// The merges of a `SimpleAggregateFunction` column would have its type, so they read the values of the column.
+    std::map<String, String> simple_types;
+    size_t index = 0;
+    for (const auto & column : core_columns)
+    {
+        auto type = column.type;
+        if (index < split.num_keys)
+            split.key_types.push_back(type);
+        else if (const auto & function = split.simple_functions.at(index - split.num_keys); !function.empty())
+        {
+            const auto value_type = removeLowCardinality(type)->getName();
+            simple_types.emplace(column.name, value_type);
+            type = DataTypeFactory::instance().get(fmt::format("SimpleAggregateFunction({}, {})", function, value_type));
+        }
+        split.integral_columns.emplace_back(column.name, type);
+        structure.push_back(fmt::format("{} {}", backQuote(column.name), type->getName()));
+        ++index;
+    }
+    for (size_t i = 0; i < split.merges.size(); ++i)
+    {
+        castColumns(*split.merges[i], simple_types);
+        split.values.push_back(fmt::format("{} AS {}", split.merges[i]->formatWithSecretsOneLine(), backQuote(fmt::format("__val_{}", i + 1))));
+    }
+
+    /// The residual over an empty integral has the types of the rows that the residual deltas insert.
+    split.output_query = parseSelect(fmt::format("SELECT *, toInt8(1) AS {} FROM ({})", backQuote(sign_column),
+        split.buildResidual(fmt::format("null({})", quoteString(joinNames(structure))), "")));
+    for (const auto & column : *InterpreterSelectQueryAnalyzer::getSampleBlock(split.output_query, context))
+        if (WhichDataType(column.type).isAggregateFunction())
+            throwUnsupported(fmt::format("aggregate states like column {} in the results of queries with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates", column.name));
+    residual = std::make_shared<const Residual>(std::move(split));
+}
+
+ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split)
+{
+    inputs.clear();
     InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     auto query_tree = interpreter.getQueryTree()->clone();
 
@@ -681,7 +1132,14 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
         signed_tables.insert(tables[i].get());
     }
     checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
-    checkExpressions(*query_tree, input_indexes, is_linear);
+    const bool has_residual = split && needsResidual(*query_node, !signs.empty());
+    checkExpressions(*query_tree, input_indexes, is_linear && !has_residual);
+    if (has_residual)
+    {
+        auto resolved = query_tree->toAST();
+        return splitResidual(*query_node, resolved->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>(),
+            !signs.empty(), *split);
+    }
     if (is_linear)
     {
         checkLinearClauses(*query_node);
@@ -703,9 +1161,113 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     /// Resolution checks only that the user can see the tables. Building the plan checks the grants on the columns that
     /// the query reads.
     interpreter.getSampleBlock();
+    return nullptr;
 }
 
 DeltaQuery::~DeltaQuery() = default;
+
+ASTPtr DeltaQuery::getQuery() const
+{
+    return residual ? residual->output_query : query;
+}
+
+String DeltaQuery::Residual::buildInput(const String & integral, const String & where) const
+{
+    Strings keys;
+    for (size_t i = 0; i < num_keys; ++i)
+        keys.push_back(backQuote(makeKeyName(i)));
+    const String group_by = keys.empty() ? "" : " GROUP BY " + joinNames(keys);
+    auto columns = keys;
+    if (!has_aggregates)
+    {
+        /// A row of the integral with count n stands for n rows.
+        columns.push_back("sum(`__agg_0`) AS `__count`");
+        auto expanded = keys;
+        expanded.push_back("`__index`");
+        return fmt::format("SELECT {} FROM (SELECT {} FROM {}{}{} HAVING `__count` > 0) ARRAY JOIN range(toUInt64(`__count`)) AS `__index`",
+            joinNames(expanded), joinNames(columns), integral, where, group_by);
+    }
+    /// A group whose rows were all retracted has count 0. A query without GROUP BY returns its one row anyway.
+    columns.insert(columns.end(), values.begin(), values.end());
+    columns.push_back("sum(`__agg_0`) AS `__count`");
+    return fmt::format("SELECT {} FROM {}{}{}{}", joinNames(columns), integral, where, group_by, keys.empty() ? "" : " HAVING `__count` > 0");
+}
+
+String DeltaQuery::Residual::buildResidual(const String & integral, const String & where) const
+{
+    auto result = outer;
+    boost::replace_first(result, fmt::format("FROM {}", residual_input), fmt::format("FROM ({})", buildInput(integral, where)));
+    return result;
+}
+
+String DeltaQuery::Residual::buildPartitionFilter(const Names & columns, const String & delta) const
+{
+    /// `IN` drops NULLs, so a nullable key compares as whether it is NULL and its value otherwise.
+    Strings left;
+    Strings right;
+    for (size_t i = 0; i < partition_keys.size(); ++i)
+    {
+        auto column = backQuote(columns.at(i));
+        auto key = backQuote(makeKeyName(partition_keys[i]));
+        if (isNullableOrLowCardinalityNullable(key_types.at(partition_keys[i])))
+        {
+            left.insert(left.end(), {fmt::format("isNull({})", column), fmt::format("assumeNotNull({})", column)});
+            right.insert(right.end(), {fmt::format("isNull({})", key), fmt::format("assumeNotNull({})", key)});
+        }
+        else
+        {
+            left.push_back(column);
+            right.push_back(key);
+        }
+    }
+    return fmt::format("({}) IN (SELECT {} FROM {})", joinNames(left), joinNames(right), delta);
+}
+
+String DeltaQuery::getIntegralCreateQuery(const StorageID & integral) const
+{
+    chassert(residual);
+    Strings columns;
+    for (const auto & column : residual->integral_columns)
+        columns.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
+    /// The keys of the partition come first, so that the filter by touched values reads ranges of the primary key.
+    Strings order;
+    for (auto key : residual->partition_keys)
+        order.push_back(backQuote(makeKeyName(key)));
+    for (size_t i = 0; i < residual->num_keys; ++i)
+        if (std::ranges::find(residual->partition_keys, i) == residual->partition_keys.end())
+            order.push_back(backQuote(makeKeyName(i)));
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} SETTINGS allow_nullable_key = 1",
+        integral.getFullTableName(), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
+}
+
+/// The residual over the touched keys counts each of its rows once, and the target counts each of its rows of those keys by
+/// the sum of their signs. The difference of the counts per row is the delta, which becomes that many rows of sign 1 or -1.
+ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target) const
+{
+    chassert(residual);
+    String where;
+    String target_where;
+    if (!residual->partition_keys.empty())
+    {
+        Names keys;
+        for (auto key : residual->partition_keys)
+            keys.push_back(makeKeyName(key));
+        where = " WHERE " + residual->buildPartitionFilter(keys, delta.getFullTableName());
+        target_where = " WHERE " + residual->buildPartitionFilter(residual->partition_outputs, delta.getFullTableName());
+    }
+    Strings outputs;
+    for (const auto & output : residual->outputs)
+        outputs.push_back(backQuote(output));
+    const auto columns = joinNames(outputs);
+    const auto sign = backQuote(residual->sign_column);
+    return parseSelect(fmt::format(
+        "SELECT {0}, arrayJoin(arrayWithConstant(toUInt64(abs(`__count`)), toInt8(sign(`__count`)))) AS {1} "
+        "FROM (SELECT {0}, sum(`__weight`) AS `__count` "
+        "FROM (SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}) "
+        "GROUP BY {0} HAVING `__count` != 0){5}",
+        columns, sign, residual->buildResidual(integral.getFullTableName(), where), target.getFullTableName(), target_where,
+        delta_is_empty ? " WHERE 0" : ""));
+}
 
 CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
 {

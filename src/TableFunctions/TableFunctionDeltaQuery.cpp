@@ -21,6 +21,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
@@ -69,6 +70,15 @@ protected:
     ASTs cursor_arguments;
 };
 
+/// The residual of a query runs over the integral of its core, which only a view keeps.
+void checkNoResidual(const DeltaQuery & query)
+{
+    if (query.hasResidual())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Table function deltaQuery does not support HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates "
+            "with delta_query_sign_column. Incremental refreshable materialized views support them");
+}
+
 class TableFunctionDeltaQuery : public TableFunctionDeltaQueryBase
 {
 public:
@@ -81,13 +91,15 @@ private:
 
     ColumnsDescription getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const override
     {
-        auto query = DeltaQuery(delta_query, context).getQuery()->clone();
-        return ColumnsDescription(InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList());
+        DeltaQuery query(delta_query, context);
+        checkNoResidual(query);
+        return ColumnsDescription(InterpreterSelectQueryAnalyzer::getSampleBlock(query.getQuery()->clone(), context)->getNamesAndTypesList());
     }
 
     StoragePtr executeImpl(const ASTPtr &, ContextPtr context, const String & table_name, ColumnsDescription, bool) const override
     {
         DeltaQuery query(delta_query, context);
+        checkNoResidual(query);
         ASTCreateQuery create;
         create.set(create.select, query.buildDelta(parseCursor(cursor_arguments[0], context), parseCursor(cursor_arguments[1], context)));
         ColumnsDescription columns(InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(), context)->getNamesAndTypesList());
@@ -154,6 +166,8 @@ as a column of that name, for a `CollapsingMergeTree` target. A query with aggre
 including retracted rows. The deltas sum to the result over the rows that remain, for a `SummingMergeTree`
 target. A query
 over one table then follows the rules of a query that joins tables.
+`deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows, expressions over aggregates or other aggregates with the
+setting. Incremental refreshable materialized views support them.
 
 Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
 the tables of `query`.

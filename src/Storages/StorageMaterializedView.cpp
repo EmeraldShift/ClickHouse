@@ -45,6 +45,7 @@
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/Sinks/SinkToStorage.h>
 #include <QueryPipeline/Pipe.h>
+#include <Common/CurrentThread.h>
 #include <Common/checkStackSize.h>
 #include <Common/typeid_cast.h>
 #include <Common/randomSeed.h>
@@ -108,6 +109,30 @@ static void removeNonCommonColumns(const Block & src_header, Block & target_head
 
 namespace
 {
+    /// The hidden tables of an incremental refreshable materialized view whose query has a residual: the integral of the
+    /// core of the query, and the delta of the core in the last refresh.
+    std::pair<StorageID, StorageID> getResidualTableIds(const StorageID & view_id)
+    {
+        const auto uuid = toString(view_id.uuid);
+        return {StorageID(view_id.database_name, ".inner_integral." + uuid), StorageID(view_id.database_name, ".inner_delta." + uuid)};
+    }
+
+    /// Runs `query` as an internal query of the refresh.
+    void executeRefreshStep(const String & query, const ContextPtr & refresh_context)
+    {
+        auto context = Context::createCopy(refresh_context);
+        context->makeQueryContext();
+        context->setCurrentQueryId("");
+        context->setStreamingCursor(nullptr);
+        /// The key types of the integral are those of the query, which the user could create.
+        context->setSetting("allow_suspicious_low_cardinality_types", true);
+        QueryScope query_scope;
+        if (!CurrentThread::getGroup())
+            query_scope = QueryScope::create(context);
+        auto io = executeQuery(query, context, QueryFlags{.internal = true}).second;
+        executeTrivialBlockIO(io, context);
+    }
+
     void checkTargetTableHasQueryOutputColumns(const ColumnsDescription & target_table_columns, const ColumnsDescription & select_query_output_columns)
     {
         for (const auto & column : select_query_output_columns)
@@ -181,7 +206,19 @@ StorageMaterializedView::StorageMaterializedView(
         if (query.create_or_replace || query.replace_view)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "CREATE OR REPLACE and REPLACE are not supported for incremental refreshable materialized views");
-        DeltaQuery(select.select_query, mv_db_context);
+        DeltaQuery delta_query(select.select_query, mv_db_context);
+        if (delta_query.hasResidual())
+        {
+            /// The integral is a local table named by the UUID of the view.
+            if (!table_id_.hasUUID())
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "Incremental refreshable materialized views with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over "
+                    "aggregates require an Atomic database");
+            if (DatabaseCatalog::instance().getDatabase(table_id_.database_name)->getEngineName() == "Replicated")
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "Incremental refreshable materialized views with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over "
+                    "aggregates do not support Replicated databases");
+        }
     }
 
     storage_metadata.setSelectQuery(select);
@@ -540,12 +577,18 @@ void StorageMaterializedView::drop()
 
 void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
 {
-    if (!has_inner_table)
-        return;
-
-    std::vector<StorageID> to_drop = {getTargetTableId()};
-    if (!fixed_uuid)
-        to_drop.push_back(StorageID(to_drop[0].getDatabaseName(), ".tmp" + to_drop[0].getTableName()));
+    std::vector<StorageID> to_drop;
+    if (getStorageID().hasUUID())
+    {
+        auto [integral_id, delta_id] = getResidualTableIds(getStorageID());
+        to_drop = {integral_id, delta_id};
+    }
+    if (has_inner_table)
+    {
+        to_drop.push_back(getTargetTableId());
+        if (!fixed_uuid)
+            to_drop.push_back(StorageID(getTargetTableId().getDatabaseName(), ".tmp" + getTargetTableId().getTableName()));
+    }
 
     for (const StorageID & inner_table_id : to_drop)
     {
@@ -663,6 +706,20 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
         DeltaQuery delta_query(select_query, refresh_context);
         auto new_cursor = delta_query.getFrontier(stream_cursor);
         select_query = delta_query.buildDelta(stream_cursor, new_cursor);
+        if (delta_query.hasResidual())
+        {
+            /// The integral absorbs the delta of the core, and the refresh inserts the rows that make the target equal to
+            /// the residual over the integral. A failure after the integral absorbs the delta and before the cursor persists
+            /// makes the next refresh add the delta again.
+            auto [integral_id, delta_id] = getResidualTableIds(getStorageID());
+            executeRefreshStep(delta_query.getIntegralCreateQuery(integral_id), refresh_context);
+            executeRefreshStep(fmt::format("CREATE OR REPLACE TABLE {} ENGINE = Memory AS {}", delta_id.getFullTableName(),
+                select_query->formatWithSecretsOneLine()), refresh_context);
+            executeRefreshStep(fmt::format("INSERT INTO {} SELECT * FROM {}", integral_id.getFullTableName(), delta_id.getFullTableName()),
+                refresh_context);
+            auto delta_rows = DatabaseCatalog::instance().getTable(delta_id, refresh_context)->totalRows(refresh_context);
+            select_query = delta_query.buildResidualDelta(integral_id, delta_id, delta_rows == 0, inner_table_id);
+        }
         {
             /// `RefreshTask` persists this cursor after the refresh succeeds. A transactional target commits it with the data.
             auto holder = refresh_context->getStreamingCursor();
