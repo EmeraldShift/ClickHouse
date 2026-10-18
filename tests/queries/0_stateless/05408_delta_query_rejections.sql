@@ -80,3 +80,33 @@ ALTER TABLE days DROP PARTITION 1;
 INSERT INTO days VALUES (2, 2);
 SELECT 'dropped partition', * FROM deltaQuery((SELECT d.day, d.k FROM days AS d JOIN t ON d.k = t.k), (SELECT cursor FROM cursors),
     (SELECT cursor FROM deltaQueryFrontier((SELECT d.k FROM days AS d JOIN t ON d.k = t.k))));
+
+-- Signed inputs, whose rows of sign -1 retract earlier rows.
+CREATE TABLE s (k UInt64, v Int64, sign Int8) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+CREATE TABLE string_sign (k UInt64, sign String) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+CREATE TABLE unsigned_sign (k UInt64, sign UInt8) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+SET delta_query_sign_column = 'sign';
+SELECT * FROM deltaQueryFrontier((SELECT k, min(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, avg(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, uniqState(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, sumState(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT s.k, min(v) FROM s JOIN t ON s.k = t.k GROUP BY s.k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, sign FROM s)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT * FROM s)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM s WHERE sign > 0)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, v AS sign FROM s)); -- { serverError BAD_ARGUMENTS }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM string_sign)); -- { serverError BAD_ARGUMENTS }
+SELECT * FROM deltaQueryFrontier((SELECT k FROM unsigned_sign)); -- { serverError BAD_ARGUMENTS }
+-- With the setting, a query over one table follows the rules of joins.
+SELECT * FROM deltaQueryFrontier((SELECT k FROM t ORDER BY k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, count() FROM t GROUP BY k HAVING count() > 1)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, row_number() OVER () FROM t)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT DISTINCT k FROM t)); -- { serverError NOT_IMPLEMENTED }
+-- Accepted result columns over signed inputs, and over unsigned inputs with the setting.
+SELECT * FROM deltaQueryFrontier((SELECT k, count(), count(v), countIf(v > 0), sum(v), sumIf(v, v > 0), exponentialMovingAverageState(1)(v, k)
+    FROM s GROUP BY k)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT min(v), uniqState(k) FROM t)) FORMAT Null;
+-- The query can set the setting in its SETTINGS clause.
+SET delta_query_sign_column = '';
+SELECT * FROM deltaQueryFrontier((SELECT k, min(v) FROM s GROUP BY k SETTINGS delta_query_sign_column = 'sign')); -- { serverError NOT_IMPLEMENTED }

@@ -81,7 +81,8 @@ private:
 
     ColumnsDescription getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const override
     {
-        return ColumnsDescription(InterpreterSelectQueryAnalyzer::getSampleBlock(delta_query, context)->getNamesAndTypesList());
+        auto query = DeltaQuery(delta_query, context).getQuery()->clone();
+        return ColumnsDescription(InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList());
     }
 
     StoragePtr executeImpl(const ASTPtr &, ContextPtr context, const String & table_name, ColumnsDescription, bool) const override
@@ -143,7 +144,15 @@ of the partition that the cursor excludes. An empty map is the cursor before any
 
 The tables must be `MergeTree` or `ReplicatedMergeTree` tables of Atomic databases with `enable_block_number_column = 1`, without mutations
 or lightweight updates. A query that joins tables may use filters, `INNER` and `CROSS` joins, and `GROUP BY`. Each of its result columns is
-either free of aggregates or one call of `sum`, `count`, their `-If` forms, or any `-State` aggregate.
+either free of aggregates or one call of `sum`, `count`, their `-If` forms, `min`, `max`, `any`, `groupBitOr`, `groupBitAnd`, `groupBitXor`,
+or any `-State` aggregate.
+
+With the setting `delta_query_sign_column`, each table that has a column of that name is signed. A row of sign 1 inserts the row, and a row
+of sign -1 retracts an earlier row with the same values. A query without aggregates returns the product of the signs of the signed tables
+as a column of that name, for a `CollapsingMergeTree` target. A query with aggregates over signed tables supports only `count`, `sum`, their
+`-If` forms and `exponentialMovingAverageState`. Their deltas sum to the result over the rows that remain, for a `SummingMergeTree`
+target. A query
+over one table then follows the rules of a query that joins tables.
 
 Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
 the tables of `query`.
