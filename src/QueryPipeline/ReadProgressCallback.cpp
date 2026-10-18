@@ -74,9 +74,12 @@ bool ReadProgressCallback::onProgress(uint64_t read_rows, uint64_t read_bytes, c
             /// If the mode is "throw" and estimate of total rows is known, then throw early if an estimate is too high.
             /// If the mode is "break", then allow to read before limit even if estimate is very high.
 
-            size_t rows_to_check_limit = progress.read_rows;
-            if (limits.local_limits.size_limits.overflow_mode == OverflowMode::THROW && progress.total_rows_to_read > progress.read_rows)
-                rows_to_check_limit = progress.total_rows_to_read;
+            auto rows_to_check_limit = [&](const SizeLimits & size_limits)
+            {
+                if (size_limits.overflow_mode == OverflowMode::THROW && progress.total_rows_to_read > progress.read_rows)
+                    return progress.total_rows_to_read;
+                return progress.read_rows;
+            };
 
             /// Check the restrictions on the
             ///  * amount of data to read
@@ -87,7 +90,7 @@ bool ReadProgressCallback::onProgress(uint64_t read_rows, uint64_t read_bytes, c
             if (limits.local_limits.mode == LimitsMode::LIMITS_TOTAL)
             {
                 if (!limits.local_limits.size_limits.check(
-                        rows_to_check_limit, progress.read_bytes, "rows or bytes to read",
+                        rows_to_check_limit(limits.local_limits.size_limits), progress.read_bytes, "rows or bytes to read",
                         ErrorCodes::TOO_MANY_ROWS, ErrorCodes::TOO_MANY_BYTES))
                 {
                     return false;
@@ -95,7 +98,7 @@ bool ReadProgressCallback::onProgress(uint64_t read_rows, uint64_t read_bytes, c
             }
 
             if (!limits.leaf_limits.check(
-                    rows_to_check_limit, progress.read_bytes, "rows or bytes to read on leaf node",
+                    rows_to_check_limit(limits.leaf_limits), progress.read_bytes, "rows or bytes to read on leaf node",
                     ErrorCodes::TOO_MANY_ROWS, ErrorCodes::TOO_MANY_BYTES))
             {
                 return false;
