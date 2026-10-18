@@ -113,7 +113,25 @@ std::pair<String, std::vector<String>> splitCombinators(const String & name)
 bool isInvertibleAggregate(const String & name)
 {
     const auto [base, suffixes] = splitCombinators(name);
-    return (base == "sum" || base == "count") && (suffixes.empty() || suffixes == std::vector<String>{"If"});
+    if (base == "sum" || base == "count")
+        return suffixes.empty() || suffixes == std::vector<String>{"If"};
+    return base == "exponentialMovingAverage" && suffixes == std::vector<String>{"State"};
+}
+
+/// `value * weight`, where `argument` is the node of `value` in the query tree.
+ASTPtr makeWeightedValue(const ASTPtr & value, const QueryTreeNodePtr & argument, const ASTPtr & weight)
+{
+    /// The product of an unsigned integer and a signed weight has the signed type of the same width. That type can't hold
+    /// every value of the unsigned type. So the value is first converted to the signed type of twice the width.
+    auto weighted = value;
+    WhichDataType type(removeLowCardinalityAndNullable(argument->getResultType()));
+    if (type.isUInt64())
+        weighted = makeASTFunction("toInt128", weighted);
+    else if (type.isUInt128())
+        weighted = makeASTFunction("toInt256", weighted);
+    else if (type.isUInt256())
+        throwUnsupported("aggregates of UInt256 over signed inputs");
+    return makeASTFunction("multiply", weighted, weight->clone());
 }
 
 /// The aggregate `function` with each row weighted by `weight`. `isInvertibleAggregate` must accept `function`, and `node`
@@ -123,6 +141,18 @@ ASTPtr makeWeightedAggregate(const ASTFunction & function, const FunctionNode & 
 {
     const auto [base, suffixes] = splitCombinators(function.name);
     ASTs arguments = function.arguments ? function.arguments->children : ASTs{};
+    const auto & argument_nodes = node.getArguments().getNodes();
+    if (base == "exponentialMovingAverage")
+    {
+        /// The state is a sum of the values decayed to the latest time of its rows. A row of weight -1 cancels the term of
+        /// its row of weight 1. The latest time stays the same, so the average is as of the latest time of any row of the
+        /// group, including canceled rows.
+        auto result = function.clone();
+        auto & result_arguments = result->as<ASTFunction &>().arguments->children;
+        result_arguments.at(0) = makeWeightedValue(result_arguments.at(0), argument_nodes.at(0), weight);
+        return result;
+    }
+
     ASTs conditions;
     if (!suffixes.empty() && !arguments.empty())
     {
@@ -131,19 +161,7 @@ ASTPtr makeWeightedAggregate(const ASTFunction & function, const FunctionNode & 
     }
     ASTPtr value;
     if (base == "sum" && arguments.size() == 1)
-    {
-        /// The product of an unsigned integer and a signed weight has the signed type of the same width. That type can't
-        /// hold every value of the unsigned type. So the value is first converted to the signed type of twice the width.
-        auto summed = arguments[0];
-        WhichDataType type(removeLowCardinalityAndNullable(node.getArguments().getNodes().at(0)->getResultType()));
-        if (type.isUInt64())
-            summed = makeASTFunction("toInt128", summed);
-        else if (type.isUInt128())
-            summed = makeASTFunction("toInt256", summed);
-        else if (type.isUInt256())
-            throwUnsupported("sums of UInt256 over signed inputs");
-        value = makeASTFunction("multiply", summed, weight->clone());
-    }
+        value = makeWeightedValue(arguments[0], argument_nodes.at(0), weight);
     else if (base == "count" && arguments.size() <= 1)
     {
         value = weight->clone();
@@ -301,7 +319,7 @@ void checkResultColumns(const QueryNode & query, bool is_signed)
         {
             const auto & name = function->getFunctionName();
             if (is_signed && !isInvertibleAggregate(name))
-                throwUnsupported(fmt::format("aggregate function {} over signed inputs, use count, sum or their -If forms instead", name));
+                throwUnsupported(fmt::format("aggregate function {} over signed inputs, use count, sum, their -If forms or exponentialMovingAverageState instead", name));
             if (!is_signed && !isMergeableAggregate(name))
                 throwUnsupported(fmt::format("aggregate function {} in {}, use its -State form instead", name, linear_queries));
         }

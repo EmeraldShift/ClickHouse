@@ -46,3 +46,9 @@ Maintained and recomputed totals
 21	3
 Sum of UInt64
 9223372036854775809	Int128
+Maintained and recomputed moving averages
+1	0.334835
+2	0.848148
+1	0.66967
+2	0.848148
+0.334835

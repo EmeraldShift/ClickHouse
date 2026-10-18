@@ -130,3 +130,22 @@ $CLICKHOUSE_CLIENT -q "
     INSERT INTO big VALUES (9223372036854775808, 1), (1, 1), (5, 1), (5, -1);
     SELECT s, toTypeName(s) FROM deltaQuery((SELECT sum(u) AS s FROM big $S), map(),
         (SELECT cursor FROM deltaQueryFrontier((SELECT sum(u) FROM big $S))));"
+
+# Group 1 retracts its latest sample, so its moving average stays as of time 11, like the average of its other sample and
+# a sample of 0 at time 11. Group 2 corrects its latest sample at the same time, so its moving average matches the
+# recomputed one.
+echo "Maintained and recomputed moving averages"
+$CLICKHOUSE_CLIENT -q "
+    CREATE TABLE samples (g UInt8, v Float64, t UInt32, sign Int8) ENGINE = MergeTree ORDER BY g SETTINGS enable_block_number_column = 1;
+    CREATE TABLE emas (g UInt8, ema AggregateFunction(exponentialMovingAverage(10), Float64, UInt32)) ENGINE = AggregatingMergeTree ORDER BY g;
+    INSERT INTO samples VALUES (1, 10, 1, 1), (1, 20, 11, 1), (2, 5, 1, 1), (2, 7, 2, 1);
+    INSERT INTO cursors SELECT 4, 1, cursor FROM deltaQueryFrontier((SELECT g, exponentialMovingAverageState(10)(v, t) FROM samples GROUP BY g $S));
+    INSERT INTO samples VALUES (1, 20, 11, -1), (2, 7, 2, -1), (2, 8, 2, 1);
+    INSERT INTO cursors SELECT 4, 2, cursor FROM deltaQueryFrontier((SELECT g, exponentialMovingAverageState(10)(v, t) FROM samples GROUP BY g $S));"
+for r in 1 2; do
+    $CLICKHOUSE_CLIENT -q "INSERT INTO emas SELECT * FROM deltaQuery((SELECT g, exponentialMovingAverageState(10)(v, t) AS ema FROM samples GROUP BY g $S),
+        $([ $r = 1 ] && echo 'map()' || cursor 4 1), $(cursor 4 $r))"
+done
+$CLICKHOUSE_CLIENT -q "SELECT g, round(exponentialMovingAverageMerge(10)(ema), 6) FROM emas GROUP BY g ORDER BY g"
+$CLICKHOUSE_CLIENT -q "SELECT g, round(exponentialMovingAverage(10)(v, t), 6) FROM (SELECT g, v, t FROM samples GROUP BY ALL HAVING sum(sign) > 0) GROUP BY g ORDER BY g"
+$CLICKHOUSE_CLIENT -q "SELECT round(exponentialMovingAverage(10)(v, t), 6) FROM values('v Float64, t UInt32', (10, 1), (0, 11))"
