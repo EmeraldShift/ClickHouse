@@ -55,6 +55,11 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// table as of a cursor is the rows with `_block_number` below the value, and a missing partition or table has no rows.
 /// The cursor of a query that calls now() also has the key `now`, the time of the snapshot in seconds.
 ///
+/// A query can also read `Distributed` tables of one cluster. Each shard then runs the query over its local tables, as
+/// with `distributed_product_mode = 'local'`. So the rows that the query joins must be on the same shard. Each shard reads
+/// the other tables of the query itself. The analysis reads the local tables of this server. A cursor maps the number of
+/// each shard to the cursor of the query of the shard.
+///
 /// A lightweight update of a `MergeTree` table takes a block number too, and the table as of a cursor has the updates
 /// below it. The delta reads the rows that the updates in between change as of both cursors, see `buildDelta`. Merges
 /// that write later updates into older rows lose the rows as of a cursor, and the delta then throws
@@ -69,15 +74,17 @@ public:
     ~DeltaQuery();
 
     /// The cursor `from` extended by the blocks that this server has committed since. A null `from` is the empty cursor.
+    /// For a query over `Distributed` tables, each shard extends its cursor.
     CursorTreeNodePtr getFrontier(const CursorTreeNodePtr & from) const;
 
     /// Runs `callback` each time an input commits blocks after `cursor`, on a background thread of the input. Lookup tables
-    /// don't run it, because their new rows don't change the result. Destroying the subscriptions stops the calls.
+    /// don't run it, because their new rows don't change the result. Destroying the subscriptions stops the calls. A query
+    /// over `Distributed` tables gets no subscriptions, because its inputs are on the shards.
     std::vector<StreamSubscriptionPtr> subscribeToCommits(const CursorTreeNodePtr & cursor, std::function<void()> callback) const;
 
     /// Keeps the merges of the inputs from losing their rows as of `cursor` while the guards live, so that the delta from
     /// `cursor` can read them, see `StorageMergeTree::holdDeltaQueryBounds`. The delta reads lookup tables only as of its new
-    /// cursor, so they have no guards.
+    /// cursor, so they have no guards. Nor do the inputs of a query over `Distributed` tables, which are on the shards.
     std::vector<scope_guard> holdCursor(const CursorTreeNodePtr & cursor) const;
 
     /// The delta between `old_cursor` and `new_cursor`. A null `old_cursor` is the empty cursor. Throws unless
@@ -154,6 +161,12 @@ private:
     /// The result columns of a query with aggregates over signed inputs that are all sums, like `count` and `sum`. The flag
     /// marks the aggregates. The rows of a target with equal other columns add up.
     std::vector<std::pair<String, bool>> summed_columns;
+    /// For a query over `Distributed` tables, their cluster and the query that each shard runs over its local tables. For a
+    /// query with a residual, that is the core.
+    String cluster;
+    ASTPtr shard_query;
+    /// The context that reads the frontiers of the shards.
+    ContextPtr shard_context;
 };
 
 /// Throws `DELTA_QUERY_HISTORY_LOST` unless `parts` of `storage` hold its rows as of `bounds`, the first block number that

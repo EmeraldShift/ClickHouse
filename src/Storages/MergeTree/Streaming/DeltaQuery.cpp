@@ -16,6 +16,7 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
@@ -37,10 +38,12 @@
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ParserSelectWithUnionQuery.h>
 #include <Parsers/parseQuery.h>
+#include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/Streaming/Subscription/MergeTreeBoundsSubscription.h>
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
+#include <Storages/StorageDistributed.h>
 #include <Storages/StorageMergeTree.h>
 #include <Storages/StorageProxy.h>
 
@@ -463,6 +466,52 @@ size_t countTableReferences(const IAST & ast, const String & name)
     for (const auto & child : ast.children)
         count += countTableReferences(*child, name);
     return count;
+}
+
+/// `query` with each `Distributed` table in FROM replaced by its local table, under the name of the `Distributed` table
+/// unless it has an alias. The other tables get the current database, because a shard resolves tables in its own default
+/// database. Returns null if `query` reads no `Distributed` table. Sets `cluster` to the cluster of the `Distributed`
+/// tables, which must be the same.
+ASTPtr readLocalTables(const ASTPtr & query, const ContextPtr & context, String & cluster)
+{
+    auto result = query->clone();
+    for (const auto & select : result->as<ASTSelectWithUnionQuery &>().list_of_selects->children)
+    {
+        /// The analysis rejects UNION.
+        const auto * select_query = select->as<ASTSelectQuery>();
+        const auto & tables = select_query ? select_query->tables() : nullptr;
+        if (!tables)
+            continue;
+        for (const auto & element : tables->children)
+        {
+            const auto & table_expression = element->as<ASTTablesInSelectQueryElement &>().table_expression;
+            auto * expression = table_expression ? table_expression->as<ASTTableExpression>() : nullptr;
+            const auto * identifier = expression && expression->database_and_table_name
+                ? expression->database_and_table_name->as<ASTTableIdentifier>() : nullptr;
+            if (!identifier)
+                continue;
+            const auto table_id = context->resolveStorageID(identifier->getTableId());
+            auto storage = DatabaseCatalog::instance().tryGetTable(table_id, context);
+            if (!storage)
+                continue;
+            ASTPtr table;
+            auto alias = identifier->tryGetAlias();
+            if (auto distributed = castStorage<StorageDistributed>(storage, DeferredTable::Load))
+            {
+                if (!cluster.empty() && cluster != distributed->getCluster()->getName())
+                    throwUnsupported("Distributed tables of different clusters");
+                cluster = distributed->getCluster()->getName();
+                table = make_intrusive<ASTTableIdentifier>(distributed->getRemoteDatabaseName(), distributed->getRemoteTableName());
+                if (alias.empty())
+                    alias = table_id.table_name;
+            }
+            else
+                table = make_intrusive<ASTTableIdentifier>(table_id.database_name, table_id.table_name);
+            table->setAlias(alias);
+            setTable(*expression, std::move(table));
+        }
+    }
+    return cluster.empty() ? nullptr : result;
 }
 
 bool isAggregate(const IAST & ast);
@@ -1538,6 +1587,29 @@ void castColumns(IAST & ast, const std::map<String, String> & types)
     }
 }
 
+/// `SELECT columns FROM cluster(cluster, view(query))`. It runs `query` on one replica of each shard, and all shards must
+/// run it. This server runs its own shard over a connection too. Then `shardNum()` in `query` is the number of the shard.
+/// A local read would reuse the table functions of `query` that this server evaluates for the header, with `shardNum()` 0.
+String readShards(const String & cluster, const String & columns, const String & query)
+{
+    return fmt::format("SELECT {} FROM cluster({}, view({})) SETTINGS prefer_localhost_replica = 0, skip_unavailable_shards = 0",
+        columns, quoteString(cluster), query);
+}
+
+/// The expression that each shard evaluates to its cursor in `cursor`, the subtree of its number.
+String makeShardCursor(const CursorTreeNodePtr & cursor)
+{
+    Strings entries;
+    for (const auto & entry : cursor ? cursorTreeToMap(cursor) : Map{})
+    {
+        const auto & pair = entry.safeGet<Tuple>();
+        entries.push_back(fmt::format("{}, {}", quoteString(pair.at(0).safeGet<String>()), pair.at(1).safeGet<Int64>()));
+    }
+    return fmt::format("mapApply((key, value) -> (substring(key, length(toString(shardNum())) + 2), value), "
+        "mapFilter((key, value) -> startsWith(key, concat(toString(shardNum()), '.')), CAST(map({}), 'Map(String, Int64)')))",
+        fmt::join(entries, ", "));
+}
+
 }
 
 void checkReadableAsOf(const MergeTreeData & storage, const DataPartsVector & parts, const std::map<String, Int64> & bounds)
@@ -1584,6 +1656,8 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
         {
             if (part.residual || part.recursion)
                 throwUnsupported("recursive CTEs with HAVING, ORDER BY, LIMIT, DISTINCT, windows or WITH RECURSIVE");
+            if (!part.cluster.empty())
+                throwUnsupported("recursive CTEs over Distributed tables");
         };
         split->base = std::make_unique<DeltaQuery>(makeSelectWithUnion(parts[0]), context);
         check_part(*split->base);
@@ -1624,12 +1698,16 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     }
     checkNoSubqueries(*query_);
     const String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
+    shard_query = readLocalTables(query_, context, cluster);
+    shard_context = context;
 
     Residual split;
     split.sign_column = sign_column_setting;
-    auto core = analyze(query_, context, sign_column_setting, sign_column_setting.empty() ? nullptr : &split);
+    auto core = analyze(shard_query ? shard_query : query_, context, sign_column_setting, sign_column_setting.empty() ? nullptr : &split);
     if (!core)
         return;
+    if (shard_query)
+        shard_query = core;
     analyze(core, context, sign_column_setting, nullptr);
     /// The deltas of the core bind the sign of each term. The sign doesn't change the types.
     auto get_core_columns = [&]
@@ -2137,6 +2215,21 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
             }
         return tree;
     }
+    if (!cluster.empty())
+    {
+        auto tree = from ? from->clone() : std::make_shared<CursorTreeNode>();
+        const auto shard_frontiers = readShards(cluster, "_shard_num, cursor", fmt::format("SELECT cursor FROM deltaQueryFrontier(({}), {})",
+            shard_query->formatWithSecretsOneLine(), makeShardCursor(from)));
+        InterpreterSelectQueryAnalyzer interpreter(parseSelect(shard_frontiers), shard_context, SelectQueryOptions());
+        auto io = interpreter.execute();
+        PullingPipelineExecutor executor(io.pipeline);
+        Block block;
+        while (executor.pull(block))
+            for (size_t row = 0; row < block.rows(); ++row)
+                tree->setSubtree(toString((*block.getByPosition(0).column)[row].safeGet<UInt64>()),
+                    buildCursorTree((*block.getByPosition(1).column)[row].safeGet<Map>()));
+        return tree;
+    }
     const auto tables = snapshotTables(inputs);
     auto frontier = parseCursor(from, inputs, tables, "cursor");
     for (const auto & [key, blocks] : tables)
@@ -2164,6 +2257,8 @@ std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTr
             std::ranges::move(step->subscribeToCommits(step->restrictCursor(cursor), callback), std::back_inserter(subscriptions));
         return subscriptions;
     }
+    if (!cluster.empty())
+        return {};
     const auto tables = snapshotTables(inputs);
     const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
     std::vector<StreamSubscriptionPtr> subscriptions;
@@ -2196,6 +2291,8 @@ std::vector<scope_guard> DeltaQuery::holdCursor(const CursorTreeNodePtr & cursor
             std::ranges::move(step->holdCursor(step->restrictCursor(cursor)), std::back_inserter(guards));
         return guards;
     }
+    if (!cluster.empty())
+        return {};
     const auto tables = snapshotTables(inputs);
     const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
     std::vector<scope_guard> guards;
@@ -2232,6 +2329,9 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
 {
     if (recursion)
         return buildRecursiveDelta(old_cursor, new_cursor);
+    if (!cluster.empty())
+        return parseSelect(readShards(cluster, "*", fmt::format("SELECT * FROM deltaQuery(({}), {}, {})",
+            shard_query->formatWithSecretsOneLine(), makeShardCursor(old_cursor), makeShardCursor(new_cursor))));
     const auto tables = snapshotTables(inputs);
     const auto old_bounds = parseCursor(old_cursor, inputs, tables, "old cursor");
     const auto new_bounds = parseCursor(new_cursor, inputs, tables, "new cursor");

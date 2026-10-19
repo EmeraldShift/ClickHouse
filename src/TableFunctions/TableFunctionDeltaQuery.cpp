@@ -76,14 +76,15 @@ protected:
             query = subquery->children.at(0).get();
         if (!query || !query->as<ASTSelectWithUnionQuery>())
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table function '{}' requires a query as its first argument", getName());
-        if (num_arguments != 1 + numCursorArguments())
+        if (const auto [min, max] = numCursorArguments(); num_arguments < 1 + min || num_arguments > 1 + max)
             throw Exception(ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH, "Table function '{}' takes a query and {} cursors",
-                getName(), numCursorArguments());
+                getName(), min == max ? fmt::format("{}", min) : fmt::format("{} or {}", min, max));
         delta_query = query->clone();
         cursor_arguments.assign(function.arguments->children.begin() + 1, function.arguments->children.end());
     }
 
-    virtual size_t numCursorArguments() const = 0;
+    /// The least and the most cursors that the function takes.
+    virtual std::pair<size_t, size_t> numCursorArguments() const = 0;
 
     ASTPtr delta_query;
     ASTs cursor_arguments;
@@ -105,7 +106,7 @@ public:
     std::string getName() const override { return name; }
 
 private:
-    size_t numCursorArguments() const override { return 2; }
+    std::pair<size_t, size_t> numCursorArguments() const override { return {2, 2}; }
     const char * getStorageEngineName() const override { return "View"; }
 
     ColumnsDescription getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const override
@@ -138,7 +139,7 @@ public:
     std::string getName() const override { return name; }
 
 private:
-    size_t numCursorArguments() const override { return 0; }
+    std::pair<size_t, size_t> numCursorArguments() const override { return {0, 1}; }
     /// `StorageValues` is not a registered table engine, as in `TableFunctionValues`.
     const char * getStorageEngineName() const override { return ""; }
 
@@ -151,7 +152,8 @@ private:
     {
         auto type = getCursorType();
         auto column = type->createColumn();
-        column->insert(cursorTreeToMap(DeltaQuery(delta_query, context).getFrontier(nullptr)));
+        const auto from = cursor_arguments.empty() ? nullptr : parseCursor(cursor_arguments[0], context);
+        column->insert(cursorTreeToMap(DeltaQuery(delta_query, context).getFrontier(from)));
         Block block{{std::move(column), type, "cursor"}};
         auto storage = std::make_shared<StorageValues>(
             StorageID(getDatabaseName(), table_name), getActualTableStructure(context, false), std::move(block));
@@ -412,6 +414,13 @@ the new rows of the inputs with the rows of that table, and then repeats the ste
 An incremental refreshable materialized view over such a query keeps `r` in its target, so the target must be a `MergeTree` with
 `enable_block_number_column = 1`, with the sign column if the query sets `delta_query_sign_column`. A second view can read the target to aggregate `r`.
 
+A query can also read `Distributed` tables of one cluster. Each shard then runs the query over its local tables, as with
+`distributed_product_mode = 'local'`. So the rows that the query joins must be on the same shard. Each shard reads the other tables
+of the query itself, and `delta_query_lookup_tables` names local tables. The server that runs `deltaQuery` analyzes the query over
+its own local tables, so it must have them. Each key of a cursor then starts with the number of a shard, and the shards must keep
+their numbers. The replicas of a shard must share block numbers, as `ReplicatedMergeTree` replicas do. The delta reads the shards with
+the `cluster` table function, so it needs the grant `READ ON REMOTE`.
+
 Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
 the tables of `query`, and on `_block_offset` of the tables with lightweight updates.
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction}, SecretArgumentsSpec{}, {.allow_readonly = true});
@@ -431,7 +440,8 @@ up to the upper bounds change. `deltaQueryPatches(database, table, lower, upper)
 
     factory.registerFunction<TableFunctionDeltaQueryFrontier>({.description = R"DOCS_MD(
 Returns one row with column `cursor`, the cursor of the blocks that the server has committed to the tables of a query.
-Pass it to `deltaQuery` as a cursor.
+Pass it to `deltaQuery` as a cursor. `deltaQueryFrontier(query, cursor)` returns `cursor` extended by the blocks committed
+since, so it is never behind `cursor`.
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction}, SecretArgumentsSpec{}, {.allow_readonly = true});
 }
 
