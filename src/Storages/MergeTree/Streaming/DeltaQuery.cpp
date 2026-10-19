@@ -114,6 +114,10 @@ struct DeltaQuery::SemiJoinEdge
     String from_column;
     size_t to;
     String to_column;
+    /// The type of `from_column` in the query.
+    String from_type;
+    /// Whether the equality is in the ON of a LEFT, SEMI, ANTI or ASOF join with `from` on the right and `to` on the left.
+    bool to_left_side = false;
 
     bool operator==(const SemiJoinEdge &) const = default;
 };
@@ -708,8 +712,8 @@ std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions
             || !(type->isValueRepresentedByInteger() || isStringOrFixedString(type) || isUUID(type) || isDecimal(type)
                 || isDateTime64(type) || isIPv4(type) || isIPv6(type)))
             continue;
-        edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName()});
-        edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName()});
+        edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName(), a->getColumnType()->getName()});
+        edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName(), b->getColumnType()->getName()});
     }
     return edges;
 }
@@ -1075,8 +1079,10 @@ ASTPtr makeUpdatedRowsIn(const Input & input, const std::map<String, Int64> & lo
 }
 
 /// `(SELECT columns FROM table AS alias WHERE where UNION ALL ...)` over the pairs `sources` of a table of `input` and a
-/// filter. The alias of the input lets the filters qualify its columns like the conjuncts of the query.
-ASTPtr makeSemiJoinSubquery(const Input & input, const Names & columns, const std::vector<std::pair<ASTPtr, ASTPtr>> & sources)
+/// filter. The alias of the input lets the filters qualify its columns like the conjuncts of the query. With a non-empty
+/// `default_type`, the subquery also returns the default of that type.
+ASTPtr makeSemiJoinSubquery(const Input & input, const Names & columns, const std::vector<std::pair<ASTPtr, ASTPtr>> & sources,
+    const String & default_type = {})
 {
     Strings names;
     for (const auto & column : columns)
@@ -1085,6 +1091,8 @@ ASTPtr makeSemiJoinSubquery(const Input & input, const Names & columns, const st
     for (const auto & [table, where] : sources)
         selects.push_back(fmt::format("SELECT {} FROM {} AS {} WHERE {}", fmt::join(names, ", "), table->formatWithSecretsOneLine(),
             backQuote(input.alias), where->formatWithSecretsOneLine()));
+    if (!default_type.empty())
+        selects.push_back(fmt::format("SELECT defaultValueOfTypeName({})", quoteString(default_type)));
     return make_intrusive<ASTSubquery>(parseSelect(fmt::format("{}", fmt::join(selects, " UNION ALL "))));
 }
 
@@ -1927,6 +1935,11 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     {
         return !inputs[edge.to].join_keys.empty() && !std::ranges::contains(keyed_edges, edge);
     });
+    for (auto & edge : semi_join_edges)
+        edge.to_left_side = std::ranges::any_of(keyed_edges, [&](const auto & keyed)
+        {
+            return keyed.from == edge.to && keyed.from_column == edge.to_column && keyed.to == edge.from && keyed.to_column == edge.from_column;
+        });
     query = query_tree->toAST(ast_options);
 
     auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
@@ -2467,15 +2480,20 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         {
             size_t a = queue.front();
             queue.pop_front();
-            for (const auto & [edge_from, x, b, y] : semi_join_edges)
+            for (const auto & edge : semi_join_edges)
             {
-                if (edge_from != a || reached[b])
+                /// A left row without a match joins whatever the rows of the right side. So only the terms of the changes of
+                /// the right side reduce the left side by them. There the left rows without a match in the changes cancel.
+                if (edge.from != a || reached[edge.to] || (edge.to_left_side && a != *from))
                     continue;
-                reached[b] = true;
-                queue.push_back(b);
+                reached[edge.to] = true;
+                queue.push_back(edge.to);
                 auto sources = a == *from && !change.empty() ? get_sources(a, change)
                     : std::vector<std::pair<ASTPtr, ASTPtr>>{{table_at(a, rows[a]), makeConjunction(cloneAll(conjuncts[a]))}};
-                conjuncts[b].push_back(makeASTFunction("in", makeColumn(inputs[b].alias, y), makeSemiJoinSubquery(inputs[a], {x}, sources)));
+                /// The defaults that pad a left row without a match can match rows of the other side of the equality.
+                const bool padded = !inputs[a].join_keys.empty() && !edge.to_left_side;
+                conjuncts[edge.to].push_back(makeASTFunction("in", makeColumn(inputs[edge.to].alias, edge.to_column),
+                    makeSemiJoinSubquery(inputs[a], {edge.from_column}, sources, padded ? edge.from_type : "")));
             }
         }
 
