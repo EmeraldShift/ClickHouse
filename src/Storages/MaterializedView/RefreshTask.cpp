@@ -77,6 +77,7 @@ namespace RefreshSetting
     extern const RefreshSettingsInt64 refresh_retries;
     extern const RefreshSettingsUInt64 refresh_retry_initial_backoff_ms;
     extern const RefreshSettingsUInt64 refresh_retry_max_backoff_ms;
+    extern const RefreshSettingsBool refresh_on_insert;
 }
 
 namespace ErrorCodes
@@ -361,12 +362,14 @@ void RefreshTask::startup()
 {
     ContextMutablePtr context;
     StorageID view_id = StorageID::createEmpty();
+    bool on_insert = false;
     {
         std::lock_guard guard(mutex);
 
         /// shutdown() is allowed to run before or during startup() (see its declaration) and nulls `view`.
         if (!view)
             return;
+        on_insert = isIncremental() && refresh_settings[RefreshSetting::refresh_on_insert];
 
         if (start_paused || view->getContext()->getSettingsRef()[Setting::stop_refreshable_materialized_views_on_startup])
             scheduling.stop_requested = true;
@@ -382,6 +385,19 @@ void RefreshTask::startup()
 
     /// Outside `mutex`: notifying a dependent view locks that view's own task mutex.
     context->getRefreshSet().notifyDependents(view_id);
+
+    /// A view with `refresh_on_insert` subscribes to the inserts into its inputs in each refresh, so it refreshes once at startup.
+    if (on_insert)
+    {
+        try
+        {
+            run();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger(), "Failed to request a refresh at startup");
+        }
+    }
 }
 
 void RefreshTask::finalizeRestoreFromBackup()
@@ -406,6 +422,7 @@ void RefreshTask::shutdown()
 
         scheduling.stop_requested = true;
         interruptExecution();
+        commit_subscriptions.clear();
     }
 
     /// If we're in DatabaseReplicated, interrupt replicated CREATE/EXCHANGE/DROP queries in refresh task.
@@ -1676,6 +1693,43 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     if (!cursor_persisted_by_target)
         if (auto cursor = refresh_context->getStreamingCursor())
             out_cursor = cursor->tree;
+
+    /// An insert after the cursor requests a refresh, like `SYSTEM REFRESH VIEW`. Requests coalesce while one is pending.
+    {
+        bool on_insert;
+        {
+            std::lock_guard guard(mutex);
+            on_insert = refresh_settings[RefreshSetting::refresh_on_insert];
+        }
+        std::vector<StreamSubscriptionPtr> subscriptions;
+        auto cursor = refresh_context->getStreamingCursor();
+        if (on_insert && isIncremental() && cursor)
+        {
+            try
+            {
+                subscriptions = view->subscribeToInputCommits(cursor->tree, refresh_context, [weak_task = weak_from_this()]
+                {
+                    if (auto task = weak_task.lock())
+                    {
+                        try
+                        {
+                            task->run();
+                        }
+                        catch (...)
+                        {
+                            tryLogCurrentException(task->getLogger(), "Failed to request a refresh after an insert");
+                        }
+                    }
+                });
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger(), "Failed to subscribe to the inserts into the inputs");
+            }
+        }
+        std::lock_guard guard(mutex);
+        commit_subscriptions = std::move(subscriptions);
+    }
 
     /// A failure leaves the previous cursor in the file, so the first refresh after a restart repeats the rows since then.
     if (!cursor_path.empty() && out_cursor)

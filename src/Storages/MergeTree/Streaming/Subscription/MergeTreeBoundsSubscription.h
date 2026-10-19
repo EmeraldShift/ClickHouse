@@ -7,6 +7,7 @@
 #include <base/defines.h>
 #include <base/types.h>
 
+#include <functional>
 #include <map>
 #include <set>
 #include <mutex>
@@ -28,6 +29,9 @@ public:
 
     bool update(std::map<std::string, int64_t> promoted_partitions, std::set<std::string> removed_partitions);
     Snapshot snapshot() const;
+
+    /// Runs after each update that changes the bounds. Set it before registering the subscription.
+    void setCallback(std::function<void()> callback_) { callback = std::move(callback_); }
 
     /// Disabled subscription will not be updated anymore.
     void disable();
@@ -52,6 +56,7 @@ private:
 
     /// Changes notification.
     WakeupFd wake;
+    std::function<void()> callback;
 };
 
 using MergeTreeBoundsSubscriptionPtr = std::shared_ptr<MergeTreeBoundsSubscription>;

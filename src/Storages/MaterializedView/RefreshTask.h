@@ -3,6 +3,7 @@
 #include <Storages/MaterializedView/RefreshSet.h>
 #include <Storages/MaterializedView/RefreshSchedule.h>
 #include <Storages/MaterializedView/RefreshSettings.h>
+#include <Storages/Streaming/IStreamSubscription.h>
 #include <Parsers/ASTRefreshStrategy.h>
 #include <Common/ZooKeeper/IKeeper.h>
 #include <Common/StopToken.h>
@@ -368,6 +369,8 @@ private:
 
     RefreshSchedule refresh_schedule;
     RefreshSettings refresh_settings;
+    /// With `refresh_on_insert`, the subscriptions to the commits of the inputs after the cursor of the latest refresh.
+    std::vector<StreamSubscriptionPtr> commit_subscriptions;
     std::vector<StorageID> initial_dependencies;
     const RefreshMode refresh_mode;
     bool isAppend() const { return refresh_mode != RefreshMode::Replace; }

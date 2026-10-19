@@ -32,7 +32,11 @@ bool MergeTreeBoundsSubscription::update(std::map<std::string, int64_t> promited
     }
 
     if (changed)
+    {
         wake.notify();
+        if (callback)
+            callback();
+    }
 
     return changed;
 }

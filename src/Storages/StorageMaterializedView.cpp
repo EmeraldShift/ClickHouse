@@ -696,6 +696,15 @@ ContextMutablePtr StorageMaterializedView::createRefreshContext(const String & l
     return refresh_context;
 }
 
+std::vector<StreamSubscriptionPtr> StorageMaterializedView::subscribeToInputCommits(
+    const CursorTreeNodePtr & cursor, ContextMutablePtr refresh_context, std::function<void()> callback) const
+{
+    auto view_metadata = getInMemoryMetadataPtr(refresh_context, false);
+    auto select_query = view_metadata->getSelectQuery().select_query->clone();
+    InterpreterSetQuery::applySettingsFromQuery(select_query, refresh_context);
+    return DeltaQuery(select_query, refresh_context).subscribeToCommits(cursor, std::move(callback));
+}
+
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
     const CursorTreeNodePtr & stream_cursor) const

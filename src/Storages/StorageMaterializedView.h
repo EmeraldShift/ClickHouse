@@ -140,6 +140,11 @@ public:
     }
 
     bool isRefreshable() const { return refresher.ptr != nullptr; }
+
+    /// Runs `callback` each time an input of the incremental query commits blocks after `cursor`. See
+    /// `DeltaQuery::subscribeToCommits`.
+    std::vector<StreamSubscriptionPtr> subscribeToInputCommits(
+        const CursorTreeNodePtr & cursor, ContextMutablePtr refresh_context, std::function<void()> callback) const;
     bool isAppendRefreshStrategy() const { return isRefreshable() && fixed_uuid; }
 
 private:

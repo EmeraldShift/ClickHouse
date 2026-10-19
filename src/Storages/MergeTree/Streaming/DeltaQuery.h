@@ -5,6 +5,8 @@
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
 #include <Parsers/IAST_fwd.h>
+#include <Storages/Streaming/IStreamSubscription.h>
+#include <functional>
 
 #include <memory>
 #include <optional>
@@ -50,6 +52,10 @@ public:
 
     /// The cursor `from` extended by the blocks that this server has committed since. A null `from` is the empty cursor.
     CursorTreeNodePtr getFrontier(const CursorTreeNodePtr & from) const;
+
+    /// Runs `callback` each time an input commits blocks after `cursor`, on a background thread of the input. Lookup tables
+    /// don't run it, because their new rows don't change the result. Destroying the subscriptions stops the calls.
+    std::vector<StreamSubscriptionPtr> subscribeToCommits(const CursorTreeNodePtr & cursor, std::function<void()> callback) const;
 
     /// The delta between `old_cursor` and `new_cursor`. A null `old_cursor` is the empty cursor. Throws unless
     /// `old_cursor` <= `new_cursor` and this server has committed every block that the delta reads.
