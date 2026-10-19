@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/Names.h>
+#include <Core/NamesAndTypes.h>
 #include <Core/Streaming/CursorTree.h>
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
@@ -136,6 +137,13 @@ private:
     /// fills `split` and returns its core instead, which the caller analyzes.
     ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
 
+    /// The columns of the rows that the deltas insert into a target, see `getQuery`.
+    NamesAndTypesList getResultColumns() const;
+
+    /// `CAST(c, type) AS c, ...` of `columns` of a target, with the types of the rows that the deltas insert. A target can
+    /// declare other types, like UInt64 for a count that the deltas weigh as Int64.
+    String castToResultTypes(const Names & columns) const;
+
     /// The entries of `tree` for the inputs of this query, and its time.
     CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
 
@@ -165,8 +173,8 @@ private:
     /// query with a residual, that is the core.
     String cluster;
     ASTPtr shard_query;
-    /// The context that reads the frontiers of the shards.
-    ContextPtr shard_context;
+    /// The context of the analysis. It also reads the frontiers of the shards and the types of the result columns.
+    ContextPtr analysis_context;
 };
 
 /// Throws `DELTA_QUERY_HISTORY_LOST` unless `parts` of `storage` hold its rows as of `bounds`, the first block number that

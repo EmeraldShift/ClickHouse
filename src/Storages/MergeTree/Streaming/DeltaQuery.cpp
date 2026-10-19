@@ -162,6 +162,8 @@ struct DeltaQuery::Residual
     /// `merge AS __val_j` for each merge.
     Strings values;
     ASTPtr output_query;
+    /// The columns of the rows of `output_query`.
+    NamesAndTypesList output_columns;
 
     /// The rows of `integral` that pass `where` merged per key.
     String buildInput(const String & integral, const String & where) const;
@@ -1587,6 +1589,12 @@ void castColumns(IAST & ast, const std::map<String, String> & types)
     }
 }
 
+/// `CAST(column, type) AS column` with the type of `column` in `types`.
+String castTo(const String & column, const NamesAndTypesList & types)
+{
+    return fmt::format("CAST({0}, {1}) AS {0}", backQuote(column), quoteString(types.tryGetByName(column)->type->getName()));
+}
+
 /// `SELECT columns FROM cluster(cluster, view(query))`. It runs `query` on one replica of each shard, and all shards must
 /// run it. This server runs its own shard over a connection too. Then `shardNum()` in `query` is the number of the shard.
 /// A local read would reuse the table functions of `query` that this server evaluates for the header, with `shardNum()` 0.
@@ -1699,7 +1707,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     checkNoSubqueries(*query_);
     const String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
     shard_query = readLocalTables(query_, context, cluster);
-    shard_context = context;
+    analysis_context = context;
 
     Residual split;
     split.sign_column = sign_column_setting;
@@ -1772,7 +1780,8 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     /// The residual over an empty integral has the types of the rows that the residual deltas insert.
     split.output_query = parseSelect(fmt::format("SELECT *, toInt8(1) AS {} FROM ({})", backQuote(sign_column_setting),
         split.buildResidual(split.buildInput(fmt::format("null({})", quoteString(joinNames(structure))), ""))));
-    for (const auto & column : *InterpreterSelectQueryAnalyzer::getSampleBlock(split.output_query, context))
+    split.output_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(split.output_query, context)->getNamesAndTypesList();
+    for (const auto & column : split.output_columns)
         if (WhichDataType(column.type).isAggregateFunction())
             throwUnsupported(fmt::format("aggregate states like column {} in the results of queries with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates", column.name));
     residual = std::make_shared<const Residual>(std::move(split));
@@ -2028,7 +2037,9 @@ String DeltaQuery::Residual::buildAppendOnlyInput(const String & target, const S
     Strings keys;
     for (size_t i = 0; i < num_keys; ++i)
     {
-        state.push_back(fmt::format("{} AS {}", backQuote(key_outputs.at(i)), backQuote(makeKeyName(i))));
+        /// The target can declare another type than the key, like UInt64 for a key of type Int64.
+        state.push_back(fmt::format("CAST({}, {}) AS {}", backQuote(key_outputs.at(i)), quoteString(key_types.at(i)->getName()),
+            backQuote(makeKeyName(i))));
         keys.push_back(backQuote(makeKeyName(i)));
     }
     /// A row of the target with signs that sum to n stands for n rows, and so does a row of the delta with count n.
@@ -2120,8 +2131,25 @@ ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageI
         ? residual->buildAppendOnlyInput(target.getFullTableName(), target_where, delta.getFullTableName())
         : residual->buildInput(integral.getFullTableName(), where);
     return parseSelect(consolidate(columns, sign, fmt::format(
-        "SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}",
-        columns, sign, residual->buildResidual(input), target.getFullTableName(), target_where)) + (skip ? " WHERE 0" : ""));
+        "SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {5}, -toInt64({1}) AS `__weight` FROM {3}{4}",
+        columns, sign, residual->buildResidual(input), target.getFullTableName(), target_where,
+        castToResultTypes(residual->outputs))) + (skip ? " WHERE 0" : ""));
+}
+
+NamesAndTypesList DeltaQuery::getResultColumns() const
+{
+    if (residual)
+        return residual->output_columns;
+    return InterpreterSelectQueryAnalyzer::getSampleBlock(getQuery(), analysis_context)->getNamesAndTypesList();
+}
+
+String DeltaQuery::castToResultTypes(const Names & columns) const
+{
+    const auto types = getResultColumns();
+    Strings casts;
+    for (const auto & column : columns)
+        casts.push_back(castTo(column, types));
+    return joinNames(casts);
 }
 
 bool DeltaQuery::canCorrect() const
@@ -2145,8 +2173,8 @@ ASTPtr DeltaQuery::buildCorrection(const CursorTreeNodePtr & new_cursor, const S
             columns.push_back(backQuote(column));
         const auto sign = backQuote(sign_column);
         return parseSelect(consolidate(joinNames(columns), sign, fmt::format(
-            "SELECT {0}, toInt64({1}) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}",
-            joinNames(columns), sign, query_rows, target_name)));
+            "SELECT {0}, toInt64({1}) AS `__weight` FROM ({2}) UNION ALL SELECT {4}, -toInt64({1}) AS `__weight` FROM {3}",
+            joinNames(columns), sign, query_rows, target_name, castToResultTypes(consolidated_columns))));
     }
     /// Each group gets one row with the sums of the query minus the sums of the target. A target column can have an unsigned
     /// type that holds negative sums modulo its range. The products with a signed factor have one type in both selects.
@@ -2155,6 +2183,7 @@ ASTPtr DeltaQuery::buildCorrection(const CursorTreeNodePtr & new_cursor, const S
     Strings results;
     Strings keys;
     Strings nonzero;
+    const auto types = getResultColumns();
     for (const auto & [name, is_sum] : summed_columns)
     {
         const auto column = backQuote(name);
@@ -2168,7 +2197,7 @@ ASTPtr DeltaQuery::buildCorrection(const CursorTreeNodePtr & new_cursor, const S
         else
         {
             columns.push_back(column);
-            retracted.push_back(column);
+            retracted.push_back(castTo(name, types));
             results.push_back(column);
             keys.push_back(column);
         }
@@ -2220,7 +2249,7 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
         auto tree = from ? from->clone() : std::make_shared<CursorTreeNode>();
         const auto shard_frontiers = readShards(cluster, "_shard_num, cursor", fmt::format("SELECT cursor FROM deltaQueryFrontier(({}), {})",
             shard_query->formatWithSecretsOneLine(), makeShardCursor(from)));
-        InterpreterSelectQueryAnalyzer interpreter(parseSelect(shard_frontiers), shard_context, SelectQueryOptions());
+        InterpreterSelectQueryAnalyzer interpreter(parseSelect(shard_frontiers), analysis_context, SelectQueryOptions());
         auto io = interpreter.execute();
         PullingPipelineExecutor executor(io.pipeline);
         Block block;
