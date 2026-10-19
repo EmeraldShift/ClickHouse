@@ -266,7 +266,7 @@ public:
     static std::optional<Range> applyMonotonicFunctionsChainToRange(
         Range key_range,
         const MonotonicFunctionsChain & functions,
-        DataTypePtr current_type,
+        const DataTypePtr & key_type,
         bool single_point = false);
 
     /// How many times `applyMonotonicFunctionsChainToRange` answered "unknown" on the current thread because the chain

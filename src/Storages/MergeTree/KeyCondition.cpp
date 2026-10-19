@@ -7137,15 +7137,17 @@ size_t KeyCondition::getNumUnevaluableChainApplications()
 std::optional<Range> KeyCondition::applyMonotonicFunctionsChainToRange(
     Range key_range,
     const MonotonicFunctionsChain & functions,
-    DataTypePtr current_type,
+    const DataTypePtr & key_type,
     bool single_point)
 {
+    /// The index analysis calls this for every atom on every hyperrectangle, from many threads, and most chains are
+    /// empty. Copying `key_type` only for a chain keeps the threads from contending on its reference count.
     if (functions.empty())
         return key_range;
 
     /// The chain was built against a recursively `LowCardinality`-stripped key type, so seed it with the
     /// stripped type here rather than in each caller: several of them pass the key column's raw type.
-    current_type = recursiveRemoveLowCardinality(current_type);
+    DataTypePtr current_type = recursiveRemoveLowCardinality(key_type);
 
     /// The functions are evaluated on the endpoints of a key range, which are values the analysis
     /// substitutes rather than values the query asked about, so they can fail for an endpoint the
