@@ -338,9 +338,10 @@ MergeTreeReadersChain::ReadResult MergeTreeReadersChain::read(
 
         readPatches(first_reader.getReadSampleBlock(), patch_ranges, read_result);
         executeActionsBeforePrewhere(read_result, read_result.columns, first_reader, {}, previous_steps_columns.front(), read_result.num_rows);
+        /// Before the actions, which drop the columns that only PREWHERE reads, like `_block_number` in `PREWHERE _block_number < n`.
+        addPatchVirtuals(read_result, first_reader.getReadSampleBlock());
 
         executePrewhereActions(first_reader, read_result, {}, range_readers.size() == 1);
-        addPatchVirtuals(read_result, first_reader.getSampleBlock());
 
         if (num_attributed_readers != 0)
             read_result.query_condition_cache_attributable_marks = read_result.computeUnmatchedMarkRanges();

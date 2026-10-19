@@ -1,7 +1,37 @@
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
 
+#include <Storages/MergeTree/IMergeTreeDataPart.h>
+#include <Storages/MergeTree/PatchParts/PatchPartIndex.h>
+
+#include <algorithm>
+
 namespace DB
 {
+
+MergeTreePartInfo getBlockRange(const IMergeTreeDataPart & part)
+{
+    if (!part.info.isPatch())
+        return part.info;
+    const auto & index = part.getPatchPartIndex();
+    return MergeTreePartInfo(part.info.getOriginalPartitionId(), static_cast<Int64>(index.getMinDataVersion()),
+        static_cast<Int64>(index.getMaxDataVersion()), 0);
+}
+
+LocalPartsByPartition getLocalParts(const DataPartsVector & parts)
+{
+    LocalPartsByPartition result;
+    for (const auto & part : parts)
+    {
+        auto range = getBlockRange(*part);
+        auto & infos = result[range.getPartitionId()];
+        if (part->info.mutation > range.max_block)
+            infos.emplace_back(range.getPartitionId(), part->info.mutation, part->info.mutation, 0);
+        infos.push_back(std::move(range));
+    }
+    for (auto & [_, infos] : result)
+        std::ranges::stable_sort(infos, {}, &MergeTreePartInfo::min_block);
+    return result;
+}
 
 static bool partitionBelongsToSubscription(const String & partition_id, size_t subscriptions_count, size_t subscription_index)
 {

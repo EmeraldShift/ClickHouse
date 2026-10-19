@@ -442,13 +442,22 @@ void StorageMergeTree::read(
 
 CursorPromotersMap StorageMergeTree::buildPromoters()
 {
-    const auto data_parts = getDataPartsVectorForInternalUsage();
+    /// A lightweight update or a mutation takes its block number before it commits. The block numbers are global, so a
+    /// committing block is in flight to every partition. The committing blocks are taken before the parts, so that a block
+    /// committed in between is in one of them.
+    std::set<Int64> committing;
+    for (const auto & block : getCommittingBlocks())
+        committing.insert(block.number);
+
+    std::map<String, std::set<Int64>> committing_block_numbers;
     std::map<String, PartBlockNumberRanges> partition_ranges;
-
-    for (const auto & part : data_parts)
-        partition_ranges[part->info.getPartitionId()].addPart(part->info.min_block, part->info.max_block);
-
-    return constructPromoters(/*committing_block_numbers=*/{}, std::move(partition_ranges));
+    for (const auto & [partition_id, parts] : getLocalParts(getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch})))
+    {
+        committing_block_numbers[partition_id] = committing;
+        for (const auto & part : parts)
+            partition_ranges[partition_id].addPart(part.min_block, part.max_block);
+    }
+    return constructPromoters(std::move(committing_block_numbers), std::move(partition_ranges));
 }
 
 std::optional<UInt64> StorageMergeTree::totalRows(ContextPtr local_context) const

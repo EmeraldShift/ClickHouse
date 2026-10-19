@@ -6,12 +6,9 @@ CREATE TABLE t (k UInt64, v Int64) ENGINE = MergeTree ORDER BY k SETTINGS enable
 CREATE TABLE u (k UInt64, w Int64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
 CREATE TABLE no_block_number (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 0;
 CREATE TABLE replacing (k UInt64) ENGINE = ReplacingMergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
-CREATE TABLE mutated (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
 CREATE TABLE memory (k UInt64) ENGINE = Memory;
 CREATE TABLE sampled (k UInt64) ENGINE = MergeTree ORDER BY k SAMPLE BY k SETTINGS enable_block_number_column = 1;
 CREATE TABLE shadowing (k UInt64, _part String) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
-INSERT INTO mutated VALUES (1), (2);
-ALTER TABLE mutated DELETE WHERE k = 1 SETTINGS mutations_sync = 2;
 
 SELECT * FROM deltaQueryFrontier((SELECT k FROM t UNION ALL SELECT k FROM u)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT DISTINCT t.k FROM t JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
@@ -40,7 +37,6 @@ SELECT * FROM deltaQueryFrontier((SELECT k FROM sampled SAMPLE 1 / 2)); -- { ser
 SELECT * FROM deltaQueryFrontier((SELECT k FROM memory)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM replacing)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM no_block_number)); -- { serverError BAD_ARGUMENTS }
-SELECT * FROM deltaQueryFrontier((SELECT k FROM mutated)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM shadowing)); -- { serverError NOT_IMPLEMENTED }
 
 -- Accepted result columns of joins.

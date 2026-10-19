@@ -8,6 +8,7 @@
 #include <Storages/Streaming/IStreamSubscription.h>
 #include <functional>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -15,6 +16,11 @@
 
 namespace DB
 {
+
+class MergeTreeData;
+class IMergeTreeDataPart;
+using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
+using DataPartsVector = std::vector<DataPartPtr>;
 
 /// Evaluates a SELECT over MergeTree tables on the rows inserted between two cursors. The delta of a query over one table
 /// is the query over the new rows of the table. The delta of a query that reads several tables has one term per table
@@ -47,6 +53,11 @@ namespace DB
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
 /// table as of a cursor is the rows with `_block_number` below the value, and a missing partition or table has no rows.
 /// The cursor of a query that calls now() also has the key `now`, the time of the snapshot in seconds.
+///
+/// A lightweight update of a `MergeTree` table takes a block number too, and the table as of a cursor has the updates
+/// below it. The delta reads the rows that the updates in between change as of both cursors, see `buildDelta`. Merges
+/// that write later updates into older rows lose the rows as of a cursor, and the delta then throws
+/// `DELTA_QUERY_HISTORY_LOST`, see `checkReadableAsOf`.
 ///
 /// `deltaQuery` and incremental refreshable materialized views use this class.
 class DeltaQuery
@@ -125,5 +136,16 @@ private:
     /// the signs of equal rows.
     Names consolidated_columns;
 };
+
+/// Throws `DELTA_QUERY_HISTORY_LOST` unless `parts` of `storage` hold its rows as of `bounds`, the first block number that
+/// each partition excludes. The table as of a bound has the rows below the bound with the lightweight updates below it.
+/// A part that holds a mutation or an update at or above a bound, and rows below it, has lost the rows as of the bound.
+/// So has a patch part whose updates span the bound, because a merge of patch parts keeps only the latest value of a row.
+/// Throws `NOT_IMPLEMENTED` for the patch parts of a replicated table.
+void checkReadableAsOf(const MergeTreeData & storage, const DataPartsVector & parts, const std::map<String, Int64> & bounds);
+
+/// The patch parts of the lightweight updates of `storage` with versions from `lower` up to `upper`. Throws unless the
+/// patch parts hold the updates as of both, see `checkReadableAsOf`.
+DataPartsVector getPatchParts(const MergeTreeData & storage, const std::map<String, Int64> & lower, const std::map<String, Int64> & upper);
 
 }
