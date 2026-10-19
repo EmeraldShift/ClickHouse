@@ -11,6 +11,8 @@
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTRefreshStrategy.h>
+#include <Parsers/ParserSelectWithUnionQuery.h>
+#include <Parsers/parseQuery.h>
 #include <Parsers/queryNormalization.h>
 
 #include <Access/Common/AccessFlags.h>
@@ -713,7 +715,16 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
         DeltaQuery delta_query(select_query, refresh_context);
         auto new_cursor = delta_query.getFrontier(stream_cursor);
         select_query = delta_query.buildDelta(stream_cursor, new_cursor);
-        if (delta_query.hasResidual())
+        /// If no input has new rows and the time of the snapshot is the same, the residual equals the target. The refresh then
+        /// inserts nothing and skips the hidden tables.
+        const bool unchanged = stream_cursor && cursorTreeToMap(stream_cursor) == cursorTreeToMap(new_cursor);
+        if (delta_query.hasResidual() && unchanged)
+        {
+            ParserSelectWithUnionQuery parser;
+            select_query = parseQuery(parser, fmt::format("SELECT * FROM {} WHERE 0", inner_table_id.getFullTableName()), 0,
+                DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        }
+        else if (delta_query.hasResidual())
         {
             /// The integral absorbs the delta of the core, and the refresh inserts the rows that make the target equal to
             /// the residual over the integral. A failure after the integral absorbs the delta and before the cursor persists

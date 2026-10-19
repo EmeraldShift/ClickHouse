@@ -99,6 +99,8 @@ struct DeltaQuery::SemiJoinEdge
     String from_column;
     size_t to;
     String to_column;
+
+    bool operator==(const SemiJoinEdge &) const = default;
 };
 
 /// The residual of a query and how to evaluate it over the integral of the core. The integral has a column `__key_i` per
@@ -1453,13 +1455,19 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
 
     /// A SEMI or ANTI join returns each left row at most once, whatever the signs of its matches.
     std::unordered_set<size_t> existence_joins;
+    /// The equalities of the ON of each such join, toward its right table.
+    std::vector<SemiJoinEdge> keyed_edges;
     for (const auto & node : keyed_joins)
     {
         const auto & join = node->as<JoinNode &>();
         const size_t right = input_indexes.at(join.getRightTableExpressionNode().get());
         for (const auto & edge : collectSemiJoinEdges({join.getJoinExpression()}, input_indexes))
+        {
+            if (edge.to == right)
+                keyed_edges.push_back(edge);
             if (edge.from == right && std::ranges::find(inputs[right].join_keys, edge.from_column) == inputs[right].join_keys.end())
                 inputs[right].join_keys.push_back(edge.from_column);
+        }
         if (inputs[right].join_keys.empty())
             throwUnsupported("LEFT, SEMI, ANTI or ASOF joins without an equality of join keys of both sides in ON");
         if (join.getStrictness() == JoinStrictness::Semi || join.getStrictness() == JoinStrictness::Anti)
@@ -1512,6 +1520,12 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     if (query_node->hasWhere())
         conditions.push_back(query_node->getWhere());
     semi_join_edges = collectSemiJoinEdges(conditions, input_indexes);
+    /// A reduction of the right table of a LEFT, SEMI, ANTI or ASOF join by an equality outside its ON could remove the match
+    /// of a left row, which would then join with default values instead.
+    std::erase_if(semi_join_edges, [&](const auto & edge)
+    {
+        return !inputs[edge.to].join_keys.empty() && !std::ranges::contains(keyed_edges, edge);
+    });
     query = query_tree->toAST(ast_options);
 
     auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();

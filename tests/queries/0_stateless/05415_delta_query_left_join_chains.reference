@@ -1,0 +1,16 @@
+round 1	chain	1	0	
+round 1	chain	2	0	
+round 1	chain_nulls	1	\N	\N
+round 1	chain_nulls	2	\N	\N
+round 2	chain	1	10	
+round 2	chain	2	0	
+round 2	chain_nulls	1	10	\N
+round 2	chain_nulls	2	\N	\N
+round 2	filtered	2	0	1
+round 3	chain	1	10	x	2
+round 3	chain	2	0		1
+round 3	chain_nulls	1	10	x	2
+round 3	chain_nulls	2	\N	\N	1
+round 3	filtered	1	5	1
+round 3	filtered	2	0	1
+chain mismatches	0
