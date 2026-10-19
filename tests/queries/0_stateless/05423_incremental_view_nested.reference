@@ -1,8 +1,14 @@
 r1	histogram	[(1,1),(2,1)]
 r1	vip	[(1,1,1),(1,2,1)]
+r1	vip_counts	[(1,2,2)]
 r1 expected	histogram	[(1,1),(2,1)]
 r1 expected	vip	[(1,1,1),(1,2,1)]
+r1 expected	vip_counts	[(1,2,2)]
 r2	histogram	[(1,2),(3,1)]
 r2	vip	[(1,1,1),(1,2,1),(1,6,1),(3,5,1)]
+r2	vip_counts	[(1,3,2),(3,1,1)]
 r2 expected	histogram	[(1,2),(3,1)]
 r2 expected	vip	[(1,1,1),(1,2,1),(1,6,1),(3,5,1)]
+r2 expected	vip_counts	[(1,3,2),(3,1,1)]
+stage tables	2
+hidden tables after drop	1

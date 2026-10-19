@@ -223,7 +223,7 @@ namespace
 ASTPtr getInsertedQuery(const ASTCreateQuery & create, const ContextPtr & context)
 {
     if (create.refresh_strategy && create.refresh_strategy->isIncremental())
-        return DeltaQuery(create.select->clone(), context).getQuery()->clone();
+        return DeltaQuery(create.select->clone(), context, StorageID(create.getDatabase(), create.getTable(), create.uuid)).getQuery()->clone();
     return create.select->clone();
 }
 

@@ -8,6 +8,7 @@
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/QueryNode.h>
+#include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/WindowFunctionsUtils.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
@@ -90,7 +91,11 @@ struct DeltaQuery::Input
     String alias;
     /// The key of the table in cursors: its UUID.
     String key;
+    StorageID table_id = StorageID::createEmpty();
+    /// Null for a stage table until `bindStageTables`.
     std::shared_ptr<MergeTreeData> storage;
+    /// Whether the input is the table of a stage, see `DeltaQuery::Stage`.
+    bool stage = false;
     /// Whether `delta_query_lookup_tables` names the table. Its new rows then have no term, and the other terms read its
     /// rows below the new cursor.
     bool lookup = false;
@@ -324,7 +329,9 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
 {
     switch (node->getNodeType())
     {
+        /// A table function stands for the table of a stage, see `DeltaQuery::DeltaQuery`.
         case QueryTreeNodeType::TABLE:
+        case QueryTreeNodeType::TABLE_FUNCTION:
             tables.push_back(node);
             return;
         case QueryTreeNodeType::ARRAY_JOIN:
@@ -353,7 +360,8 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
                 throwUnsupported("joins other than INNER ALL, LEFT ALL, LEFT SEMI, LEFT ANTI, ASOF, CROSS and comma joins");
             if (join.getLocality() == JoinLocality::Global)
                 throwUnsupported("GLOBAL joins");
-            if (is_keyed && (join.getRightTableExpressionNode()->getNodeType() != QueryTreeNodeType::TABLE || !join.isOnJoinExpression()))
+            const auto right_type = join.getRightTableExpressionNode()->getNodeType();
+            if (is_keyed && ((right_type != QueryTreeNodeType::TABLE && right_type != QueryTreeNodeType::TABLE_FUNCTION) || !join.isOnJoinExpression()))
                 throwUnsupported("LEFT, SEMI, ANTI or ASOF joins whose right side isn't a table joined by ON");
             collectJoinTree(join.getLeftTableExpressionNode(), tables, join_conditions, keyed_joins);
             collectJoinTree(join.getRightTableExpressionNode(), tables, join_conditions, keyed_joins);
@@ -396,7 +404,36 @@ Input makeInput(const TableNode & table)
                 table_id.getNameForLogs(), virtual_column);
 
     const bool updatable = !storage->supportsReplication() && storage->supportsLightweightUpdate().has_value();
-    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage), .updatable = updatable};
+    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .table_id = table_id, .storage = std::move(storage),
+        .updatable = updatable};
+}
+
+/// Calls `f` for each table expression in FROM of `select` that is a subquery, with its 1-based index among them.
+void forEachSubqueryInFrom(const ASTSelectQuery & select, const std::function<void(ASTTableExpression &, size_t)> & f)
+{
+    if (!select.tables())
+        return;
+    size_t index = 0;
+    for (const auto & element : select.tables()->children)
+        if (const auto & table_expression = element->as<ASTTablesInSelectQueryElement &>().table_expression)
+        {
+            auto & expression = table_expression->as<ASTTableExpression &>();
+            if (expression.table_function)
+                throwUnsupported("table functions in FROM");
+            if (expression.subquery)
+                f(expression, ++index);
+        }
+}
+
+/// The stage table of the stage of path `path` of `view`, see `DeltaQuery::Stage`. Its UUID follows from the UUID of the
+/// view, like the UUID of the integral of the view.
+StorageID makeStageTableId(const StorageID & view, const String & path)
+{
+    SipHash hash;
+    hash.update(view.uuid);
+    hash.update("stage");
+    hash.update(path);
+    return StorageID(view.database_name, fmt::format(".inner_stage.{}.{}", toString(view.uuid), path), UUID(hash.get128()));
 }
 
 /// Rejects subqueries, which could read tables that the cursors do not cover. Resolution replaces scalar subqueries by
@@ -1058,7 +1095,7 @@ ASTPtr makeBoundsMap(const std::map<String, Int64> & bounds)
 /// or the table itself if it can't have updates.
 ASTPtr makeSnapshot(const Input & input, const std::map<String, Int64> & bounds)
 {
-    const auto table_id = input.storage->getStorageID();
+    const auto & table_id = input.table_id;
     if (!input.updatable)
         return make_intrusive<ASTTableIdentifier>(table_id);
     return makeASTFunction("deltaQuerySnapshot", make_intrusive<ASTLiteral>(Field(table_id.database_name)),
@@ -1659,7 +1696,8 @@ DataPartsVector getPatchParts(const MergeTreeData & storage, const std::map<Stri
     return patches;
 }
 
-DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
+DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path)
+    : is_stage(!stage_path.empty())
 {
     /// The query can set `delta_query_sign_column` in its SETTINGS, as the query of a view does.
     auto context = Context::createCopy(context_);
@@ -1712,14 +1750,39 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
         recursion = std::move(split);
         return;
     }
-    checkNoSubqueries(*query_);
     const String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
-    shard_query = readLocalTables(query_, context, cluster);
+    /// Each subquery in FROM becomes a stage. The analysis reads `null` with the columns of the stage table instead, so it
+    /// doesn't need the stage table. The deltas read the stage table, see `makeSnapshot`.
+    auto rewritten = query_->clone();
+    for (const auto & child : rewritten->as<ASTSelectWithUnionQuery &>().list_of_selects->children)
+        if (const auto * select = child->as<ASTSelectQuery>())
+            forEachSubqueryInFrom(*select, [&](ASTTableExpression & expression, size_t index)
+            {
+                if (view.table_name.empty())
+                    throwUnsupported("subqueries in FROM outside incremental refreshable materialized views");
+                if (sign_column_setting.empty())
+                    throwUnsupported("subqueries in FROM without delta_query_sign_column");
+                const auto path = is_stage ? fmt::format("{}.{}", stage_path, index) : toString(index);
+                auto & stage = stages.emplace_back(Stage{.path = path, .table = makeStageTableId(view, path),
+                    .query = std::make_unique<DeltaQuery>(expression.subquery->children.at(0), context, view, path)});
+                if (stage.query->recursion)
+                    throwUnsupported("WITH RECURSIVE in subqueries in FROM");
+                Strings structure;
+                for (const auto & column : stage.query->getResultColumns())
+                    structure.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
+                auto table = makeASTFunction("null", make_intrusive<ASTLiteral>(Field(joinNames(structure))));
+                table->setAlias(expression.subquery->tryGetAlias());
+                setTable(expression, std::move(table));
+            });
+    checkNoSubqueries(*rewritten);
+    shard_query = readLocalTables(rewritten, context, cluster);
+    if (!cluster.empty() && !stages.empty())
+        throwUnsupported("subqueries in FROM of queries over Distributed tables");
     analysis_context = context;
 
     Residual split;
     split.sign_column = sign_column_setting;
-    auto core = analyze(shard_query ? shard_query : query_, context, sign_column_setting, sign_column_setting.empty() ? nullptr : &split);
+    auto core = analyze(shard_query ? shard_query : rewritten, context, sign_column_setting, sign_column_setting.empty() ? nullptr : &split);
     if (!core)
         return;
     if (shard_query)
@@ -1841,11 +1904,22 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
             lookup_tables.insert(name);
     }
     std::set<String> found_lookup_tables;
+    size_t num_stage_inputs = 0;
     for (const auto & table : tables)
     {
         input_indexes.emplace(table.get(), inputs.size());
+        /// The table functions stand for the stages in the order of FROM.
+        if (const auto * function = table->as<TableFunctionNode>())
+        {
+            if (num_stage_inputs == stages.size())
+                throwUnsupported("table functions in FROM");
+            const auto & stage = stages[num_stage_inputs++];
+            inputs.push_back({.alias = function->getAlias(), .key = toString(stage.table.uuid), .table_id = stage.table,
+                .storage = nullptr, .stage = true});
+            continue;
+        }
         inputs.push_back(makeInput(table->as<TableNode &>()));
-        const auto table_id = inputs.back().storage->getStorageID();
+        const auto & table_id = inputs.back().table_id;
         for (const auto & name : {table_id.table_name, table_id.getFullNameNotQuoted()})
             if (lookup_tables.contains(name))
             {
@@ -1896,7 +1970,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     std::unordered_set<const IQueryTreeNode *> signed_tables;
     for (size_t i = 0; i < tables.size() && !sign_column.empty(); ++i)
     {
-        if (!hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
+        if (!inputs[i].stage && !hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
             continue;
         inputs[i].is_signed = true;
         signed_tables.insert(tables[i].get());
@@ -1912,7 +1986,10 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     if (retracts)
         signs.push_back(make_intrusive<ASTIdentifier>(term_sign_name));
     checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
-    const bool has_residual = split && needsResidual(*query_node, !signs.empty());
+    /// The residual of a stage with aggregates makes each refresh replace the rows of the groups that it changes.
+    const bool has_aggregates = query_node->hasGroupBy()
+        || std::ranges::any_of(query_node->getProjection().getNodes(), hasAggregateFunctionNodes);
+    const bool has_residual = split && (needsResidual(*query_node, !signs.empty()) || (is_stage && has_aggregates));
     checkExpressions(*query_tree, input_indexes, is_linear && !has_residual);
     if (has_residual)
     {
@@ -2008,6 +2085,46 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
 }
 
 DeltaQuery::~DeltaQuery() = default;
+
+std::vector<StorageID> DeltaQuery::getStageTables(const ASTPtr & query, const StorageID & view)
+{
+    std::vector<StorageID> tables;
+    std::function<void(const ASTPtr &, const String &)> collect = [&](const ASTPtr & select_with_union, const String & prefix)
+    {
+        for (const auto & child : select_with_union->as<ASTSelectWithUnionQuery &>().list_of_selects->children)
+            if (const auto * select = child->as<ASTSelectQuery>())
+                forEachSubqueryInFrom(*select, [&](ASTTableExpression & expression, size_t index)
+                {
+                    const auto path = prefix.empty() ? toString(index) : fmt::format("{}.{}", prefix, index);
+                    tables.push_back(makeStageTableId(view, path));
+                    collect(expression.subquery->children.at(0), path);
+                });
+    };
+    collect(query, "");
+    return tables;
+}
+
+String DeltaQuery::getStageCreateQuery(const StorageID & table) const
+{
+    Strings columns;
+    for (const auto & column : getResultColumns())
+        columns.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
+    /// The residual reads the rows of the stage table of the touched values of its partition keys.
+    Strings order;
+    if (residual)
+        for (const auto & output : residual->partition_outputs)
+            order.push_back(backQuote(output));
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = MergeTree ORDER BY {} "
+        "SETTINGS enable_block_number_column = 1, allow_nullable_key = 1", table.getFullTableName(), quoteString(toString(table.uuid)),
+        joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
+}
+
+void DeltaQuery::bindStageTables(const ContextPtr & context)
+{
+    for (auto & input : inputs)
+        if (input.stage)
+            input.storage = castStorage<MergeTreeData>(DatabaseCatalog::instance().getTable(input.table_id, context), DeferredTable::Load);
+}
 
 ASTPtr DeltaQuery::getQuery() const
 {
@@ -2301,11 +2418,21 @@ std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTr
     }
     if (!cluster.empty())
         return {};
-    const auto tables = snapshotTables(inputs);
-    const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
+    /// The stages subscribe to the commits of their inputs. A stage table commits only when a refresh runs the stage.
     std::vector<StreamSubscriptionPtr> subscriptions;
+    for (const auto & stage : stages)
+        std::ranges::move(stage.query->subscribeToCommits(cursor && cursor->hasSubtree(stage.getCursorKey())
+            ? cursor->getSubtree(stage.getCursorKey()) : nullptr, callback), std::back_inserter(subscriptions));
+    std::vector<Input> tables_inputs;
+    std::ranges::copy_if(inputs, std::back_inserter(tables_inputs), [](const auto & input) { return !input.stage; });
+    CursorTreeNodePtr tables_cursor = cursor && !stages.empty() ? std::make_shared<CursorTreeNode>() : cursor;
+    for (const auto & input : tables_inputs)
+        if (tables_cursor != cursor && cursor->hasSubtree(input.key))
+            tables_cursor->setSubtree(input.key, cursor->getSubtree(input.key));
+    const auto tables = snapshotTables(tables_inputs);
+    const auto bounds = parseCursor(tables_cursor, tables_inputs, tables, "cursor");
     std::set<String> keys;
-    for (const auto & input : inputs)
+    for (const auto & input : tables_inputs)
     {
         if (input.lookup || !keys.insert(input.key).second)
             continue;
