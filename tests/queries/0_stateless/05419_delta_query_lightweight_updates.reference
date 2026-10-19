@@ -15,5 +15,7 @@ round 4	0	0	0	0
 unsigned	6	6
 signed	6	6	-1
 signed	6	7	1
+held	6	6	-1
+held	6	7	1
 after merge	8	8	1
 mutated	2

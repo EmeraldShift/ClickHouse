@@ -10,6 +10,7 @@
 #include <Core/BackgroundSchedulePoolTaskHolder.h>
 #include <Core/UUID.h>
 #include <IO/Progress.h>
+#include <base/scope_guard.h>
 
 #include <map>
 #include <random>
@@ -371,6 +372,8 @@ private:
     RefreshSettings refresh_settings;
     /// With `refresh_on_insert`, the subscriptions to the commits of the inputs after the cursor of the latest refresh.
     std::vector<StreamSubscriptionPtr> commit_subscriptions;
+    /// The guards that keep merges from losing the inputs as of the cursor of the latest incremental refresh.
+    std::vector<scope_guard> cursor_holds;
     std::vector<StorageID> initial_dependencies;
     const RefreshMode refresh_mode;
     bool isAppend() const { return refresh_mode != RefreshMode::Replace; }

@@ -153,6 +153,21 @@ MergeTreeMergePredicate::canMergeParts(const PartProperties & left, const PartPr
                     right.name,
                     *spanned_version,
                     original_partition_id));
+
+        /// The merged patch part keeps only the latest update of a row, so it would lose the rows as of a bound in between.
+        if (auto held = storage.delta_query_bounds.find(original_partition_id); held != storage.delta_query_bounds.end())
+        {
+            const Int64 min_version = std::min(left.info.getDataVersion(), right.info.getDataVersion());
+            const Int64 max_version = std::max(left.info.getDataVersion(), right.info.getDataVersion());
+            if (auto bound = held->second.upper_bound(min_version); bound != held->second.end() && *bound <= max_version)
+                return std::unexpected(
+                    PreformattedMessage::create(
+                        "Merge of patch parts {} and {} would span bound {} of a delta query in partition {}",
+                        left.name,
+                        right.name,
+                        *bound,
+                        original_partition_id));
+        }
     }
 
     {
@@ -216,7 +231,13 @@ PartsRange MergeTreeMergePredicate::getPatchesToApplyOnMerge(const PartsRange & 
         return {};
 
     Int64 next_version = storage.getNextMutationVersion(first_part.getDataVersion(), merge_mutate_lock);
-    return DB::getPatchesToApplyOnMerge(it->second, range, next_version);
+
+    /// The merged part would lose its rows as of a bound above its first block if it got the updates at or above the bound.
+    auto patches = it->second;
+    if (auto held = storage.delta_query_bounds.find(partition_id); held != storage.delta_query_bounds.end())
+        if (auto bound = held->second.upper_bound(first_part.min_block); bound != held->second.end())
+            std::erase_if(patches, [&](const auto & patch) { return patch.getDataVersion() >= *bound; });
+    return DB::getPatchesToApplyOnMerge(patches, range, next_version);
 }
 
 }

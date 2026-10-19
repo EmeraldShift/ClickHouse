@@ -6,6 +6,7 @@
 #include <Interpreters/StorageID.h>
 #include <Parsers/IAST_fwd.h>
 #include <Storages/Streaming/IStreamSubscription.h>
+#include <base/scope_guard.h>
 #include <functional>
 
 #include <map>
@@ -73,6 +74,11 @@ public:
     /// Runs `callback` each time an input commits blocks after `cursor`, on a background thread of the input. Lookup tables
     /// don't run it, because their new rows don't change the result. Destroying the subscriptions stops the calls.
     std::vector<StreamSubscriptionPtr> subscribeToCommits(const CursorTreeNodePtr & cursor, std::function<void()> callback) const;
+
+    /// Keeps the merges of the inputs from losing their rows as of `cursor` while the guards live, so that the delta from
+    /// `cursor` can read them, see `StorageMergeTree::holdDeltaQueryBounds`. The delta reads lookup tables only as of its new
+    /// cursor, so they have no guards.
+    std::vector<scope_guard> holdCursor(const CursorTreeNodePtr & cursor) const;
 
     /// The delta between `old_cursor` and `new_cursor`. A null `old_cursor` is the empty cursor. Throws unless
     /// `old_cursor` <= `new_cursor` and this server has committed every block that the delta reads.

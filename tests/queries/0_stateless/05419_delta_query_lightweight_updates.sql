@@ -106,9 +106,17 @@ SELECT * FROM deltaQuery((SELECT k, v FROM t), (SELECT cursor FROM cursors WHERE
 SELECT 'signed', * FROM deltaQuery((SELECT k, v FROM t SETTINGS delta_query_sign_column = 'sign'),
     (SELECT cursor FROM cursors WHERE round = 1), (SELECT cursor FROM cursors WHERE round = 2)) ORDER BY ALL;
 
--- A merge that writes the update into the rows below the cursor of round 1 loses the table as of that cursor. The table
--- as of the cursor of round 2 remains.
+-- The views keep merges from writing the updates after their cursors into older rows. Their cursors precede round 1, so
+-- the table as of the cursor of round 1 remains. Without the views, a merge writes the update into the rows below that cursor, and loses the table as
+-- of it. The table as of the cursor of round 2 remains.
 SYSTEM START MERGES t;
+OPTIMIZE TABLE t FINAL;
+SELECT 'held', * FROM deltaQuery((SELECT k, v FROM t SETTINGS delta_query_sign_column = 'sign'),
+    (SELECT cursor FROM cursors WHERE round = 1), (SELECT cursor FROM cursors WHERE round = 2)) ORDER BY ALL;
+DROP VIEW single;
+DROP VIEW joined;
+DROP VIEW keyed;
+DROP VIEW totals;
 OPTIMIZE TABLE t FINAL;
 SELECT * FROM deltaQuery((SELECT k, v FROM t SETTINGS delta_query_sign_column = 'sign'),
     (SELECT cursor FROM cursors WHERE round = 1), (SELECT cursor FROM cursors WHERE round = 2)); -- { serverError DELTA_QUERY_HISTORY_LOST }

@@ -423,6 +423,7 @@ void RefreshTask::shutdown()
         scheduling.stop_requested = true;
         interruptExecution();
         commit_subscriptions.clear();
+        cursor_holds.clear();
     }
 
     /// If we're in DatabaseReplicated, interrupt replicated CREATE/EXCHANGE/DROP queries in refresh task.
@@ -1482,6 +1483,8 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     /// Set for a transactional target (e.g. Iceberg) that commits the cursor with its data; the refresh
     /// then resumes from that cursor and does not also persist it in the Keeper znode.
     bool cursor_persisted_by_target = false;
+    /// Keep merges from losing the inputs as of the new cursor from when the refresh picks it.
+    std::vector<scope_guard> new_cursor_holds;
 
     try
     {
@@ -1525,7 +1528,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             query_for_logging = "(create target table)";
             normalized_query_hash = normalizedQueryHash(query_for_logging, false);
             QueryScope query_scope;
-            std::tie(refresh_query, query_scope) = view->prepareRefresh(refresh_mode, refresh_context, table_to_drop, stream_cursor);
+            std::tie(refresh_query, query_scope) = view->prepareRefresh(refresh_mode, refresh_context, table_to_drop, stream_cursor, new_cursor_holds);
             new_table_id = refresh_query->table_id;
 
             /// Add the query to system.processes and allow it to be killed with KILL QUERY.
@@ -1729,6 +1732,8 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
         }
         std::lock_guard guard(mutex);
         commit_subscriptions = std::move(subscriptions);
+        /// The previous guards go out of scope after the lock.
+        std::swap(cursor_holds, new_cursor_holds);
     }
 
     /// A failure leaves the previous cursor in the file, so the first refresh after a restart repeats the rows since then.

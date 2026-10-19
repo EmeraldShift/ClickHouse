@@ -41,6 +41,7 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/MergeTree/Streaming/Subscription/MergeTreeBoundsSubscription.h>
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
+#include <Storages/StorageMergeTree.h>
 #include <Storages/StorageProxy.h>
 
 #include <base/find_symbols.h>
@@ -2103,6 +2104,25 @@ std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTr
         subscriptions.push_back(std::move(subscription));
     }
     return subscriptions;
+}
+
+std::vector<scope_guard> DeltaQuery::holdCursor(const CursorTreeNodePtr & cursor) const
+{
+    if (recursion)
+    {
+        auto guards = recursion->base->holdCursor(recursion->base->restrictCursor(cursor));
+        for (const auto & step : recursion->steps)
+            std::ranges::move(step->holdCursor(step->restrictCursor(cursor)), std::back_inserter(guards));
+        return guards;
+    }
+    const auto tables = snapshotTables(inputs);
+    const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
+    std::vector<scope_guard> guards;
+    std::set<String> keys;
+    for (const auto & input : inputs)
+        if (auto storage = std::dynamic_pointer_cast<StorageMergeTree>(input.storage); storage && !input.lookup && keys.insert(input.key).second)
+            guards.push_back(storage->holdDeltaQueryBounds(bounds.at(input.key)));
+    return guards;
 }
 
 /// The UNION ALL over i of Q, where input i reads its changes between old and new, inputs before it read the table as of

@@ -712,7 +712,7 @@ std::vector<StreamSubscriptionPtr> StorageMaterializedView::subscribeToInputComm
 
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
-    const CursorTreeNodePtr & stream_cursor) const
+    const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds) const
 {
     const bool append = mode != RefreshMode::Replace;
     const bool incremental = mode == RefreshMode::AppendIncremental;
@@ -728,6 +728,7 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
     {
         DeltaQuery delta_query(select_query, refresh_context);
         auto new_cursor = delta_query.getFrontier(stream_cursor);
+        out_cursor_holds = delta_query.holdCursor(new_cursor);
         select_query = delta_query.buildDelta(stream_cursor, new_cursor);
         /// If no input has new rows and the time of the snapshot is the same, the residual equals the target. The refresh then
         /// inserts nothing and skips the hidden tables.

@@ -210,12 +210,12 @@ protected:
 };
 
 /// A `MergeTree` table with the lightweight updates below `bounds`. It reads all the rows of the table, and the filters
-/// of the delta query keep the rows below the bounds.
+/// of the delta query keep the rows below the bounds. It keeps merges from losing those rows while it lives.
 class StorageDeltaQuerySnapshot final : public IStorage
 {
 public:
     StorageDeltaQuerySnapshot(const StorageID & table_id_, std::shared_ptr<StorageMergeTree> table_, std::map<String, Int64> bounds_)
-        : IStorage(table_id_), table(std::move(table_)), bounds(std::move(bounds_))
+        : IStorage(table_id_), table(std::move(table_)), bounds(std::move(bounds_)), hold(table->holdDeltaQueryBounds(bounds))
     {
     }
 
@@ -270,6 +270,7 @@ public:
 private:
     std::shared_ptr<StorageMergeTree> table;
     std::map<String, Int64> bounds;
+    scope_guard hold;
 };
 
 class TableFunctionDeltaQuerySnapshot : public TableFunctionDeltaQueryTable
