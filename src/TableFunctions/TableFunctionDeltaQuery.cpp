@@ -184,6 +184,12 @@ over one table then follows the rules of a query that joins tables.
 `deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows, expressions over aggregates or other aggregates with the
 setting. Incremental refreshable materialized views support them.
 
+A query can be `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r` without aggregates, where each step reads `r` once in
+`FROM` through inner joins. The setting `delta_query_recursion_table` names the table that holds `r` as of `old_cursor`. The delta joins
+the new rows of the inputs with the rows of that table, and then repeats the steps over the rows it found until a step returns no rows.
+An incremental refreshable materialized view over such a query keeps `r` in its target, so the target must be a `MergeTree` with
+`enable_block_number_column = 1`, with the sign column if the query sets `delta_query_sign_column`. A second view can read the target to aggregate `r`.
+
 Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
 the tables of `query`.
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction}, SecretArgumentsSpec{}, {.allow_readonly = true});

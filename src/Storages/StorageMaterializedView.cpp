@@ -215,7 +215,10 @@ StorageMaterializedView::StorageMaterializedView(
         if (query.create_or_replace || query.replace_view)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "CREATE OR REPLACE and REPLACE are not supported for incremental refreshable materialized views");
-        DeltaQuery delta_query(select.select_query, mv_db_context);
+        auto delta_context = Context::createCopy(mv_db_context);
+        if (!to_table_id.empty())
+            delta_context->setSetting("delta_query_recursion_table", mv_db_context->resolveStorageID(to_table_id).getFullTableName());
+        DeltaQuery delta_query(select.select_query, delta_context);
         if (delta_query.hasResidual())
         {
             /// The integral is a local table named by the UUID of the view.
@@ -686,6 +689,8 @@ ContextMutablePtr StorageMaterializedView::createRefreshContext(const String & l
     refresh_context->setClientInfo(client_info);
     refresh_context->setSetting("database_replicated_allow_replicated_engine_arguments", 3);
     refresh_context->setSetting("log_comment", log_comment);
+    /// The target of an incremental view over WITH RECURSIVE holds the result of the CTE. The deltas of the steps read it.
+    refresh_context->setSetting("delta_query_recursion_table", getTargetTableId().getFullTableName());
     refresh_context->setQueryKind(ClientInfo::QueryKind::INITIAL_QUERY);
     /// The client info is inherited from the table's (global) context and has no client version.
     refresh_context->setInitiatorVersionIfUnset();

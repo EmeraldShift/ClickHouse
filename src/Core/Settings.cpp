@@ -10798,6 +10798,10 @@ In an incremental refreshable materialized view whose residual compares rows onl
 A comma-separated list of input tables of `deltaQuery` and of incremental refreshable materialized views whose new rows don't change earlier results. Each name is a table name or `database.table`. A delta joins the new rows of the other inputs with the latest rows of a lookup table, and the new rows of a lookup table join with nothing. So each result row stays as it was when its other rows arrived, like a lookup join, and the delta skips the term of the lookup table, which is usually its most expensive one. A query needs an input that isn't a lookup table.
 )", EXPERIMENTAL, \
         {"26.11", "", "", "New setting for delta queries whose inputs include lookup tables."}) \
+    DECLARE(String, delta_query_recursion_table, "", R"(
+The table that holds the result of a `deltaQuery` over `WITH RECURSIVE r AS (...) SELECT * FROM r` at the old cursor. The delta of such a query joins the new rows of the inputs with the rows of `r` in this table, and then repeats the recursive step over the rows it found. An incremental refreshable materialized view sets it to its target.
+)", EXPERIMENTAL, \
+        {"26.11", "", "", "New setting for delta queries over recursive CTEs."}) \
     DECLARE(Bool, allow_experimental_database_materialized_postgresql, false, R"(
 Allow to create database with Engine=MaterializedPostgreSQL(...).
 )", EXPERIMENTAL) \

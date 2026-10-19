@@ -37,6 +37,12 @@ namespace DB
 /// the integral whose keys the delta touched, and diffs the result with the rows that the target has for those keys. The
 /// rows of the diff have the sign column, so the target can be a `CollapsingMergeTree`.
 ///
+/// A query can also be `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r`, where each step reads `r` once in
+/// FROM through inner joins. The steps are linear in `r`, so the delta of `r` is the least fixed point of `d = d_0 + step(d)`.
+/// Here `d_0` is the delta of the base plus the delta of each step over the rows of `r` at the old cursor, and `step(d)` reads
+/// the inputs at the new cursor. The rows of `r` at the old cursor come from `delta_query_recursion_table`, which an
+/// incremental refreshable materialized view sets to its target. The weights of the rows make this hold for retractions too.
+///
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
 /// table as of a cursor is the rows with `_block_number` below the value, and a missing partition or table has no rows.
@@ -89,17 +95,28 @@ public:
     struct Input;
     struct SemiJoinEdge;
     struct Residual;
+    struct Recursion;
 
 private:
     /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
     /// fills `split` and returns its core instead, which the caller analyzes.
     ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
 
+    /// The entries of `tree` for the inputs of this query, and its time.
+    CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
+
+    /// The delta of a recursive query, see `Recursion`.
+    ASTPtr buildRecursiveDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
+
+    /// The query of a step of a recursive query at `new_cursor`, which reads CTE `cte` instead of the input of key `key`.
+    ASTPtr buildRecursiveTerm(const CursorTreeNodePtr & new_cursor, const String & key, const String & cte) const;
+
     /// The resolved query, whose tables have unique aliases. For a query with a residual, its core.
     ASTPtr query;
     std::vector<Input> inputs;
     std::vector<SemiJoinEdge> semi_join_edges;
     std::shared_ptr<const Residual> residual;
+    std::shared_ptr<const Recursion> recursion;
     String sign_column;
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;
