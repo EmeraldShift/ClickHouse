@@ -169,6 +169,20 @@ MergeTreeMergePredicate::canMergeParts(const PartProperties & left, const PartPr
                         original_partition_id));
         }
     }
+    else if (storage.merging_params.mode != MergeTreeData::MergingParams::Ordinary)
+    {
+        /// The merged part would combine the rows of blocks on both sides of a bound, so it would lose the rows as of the bound.
+        const auto & partition_id = left.info.getPartitionId();
+        if (auto held = storage.delta_query_bounds.find(partition_id); held != storage.delta_query_bounds.end())
+            if (auto bound = held->second.upper_bound(left.info.min_block); bound != held->second.end() && *bound <= right.info.max_block)
+                return std::unexpected(
+                    PreformattedMessage::create(
+                        "Merge of parts {} and {} would span bound {} of a delta query in partition {}",
+                        left.name,
+                        right.name,
+                        *bound,
+                        partition_id));
+    }
 
     {
         auto [max_possible_level, max_possible_mutation] = storage.getMaxLevelMutationInBetween(left, right);

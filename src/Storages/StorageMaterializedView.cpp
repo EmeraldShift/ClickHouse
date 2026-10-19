@@ -153,18 +153,28 @@ namespace
     /// follow from `owner`, which is the view or the stage table.
     ASTPtr buildIncrementalRefresh(DeltaQuery & delta_query, const StorageID & owner, const StorageID & target,
         const CursorTreeNodePtr & old_cursor, CursorTreeNodePtr & new_cursor, bool recompute, const ContextMutablePtr & refresh_context,
-        RefreshSnapshot & snapshot, std::optional<StorageID> & out_temp_table_id, std::vector<scope_guard> & out_cursor_holds)
+        RefreshSnapshot & snapshot, std::optional<StorageID> & out_temp_table_id, std::vector<scope_guard> & out_cursor_holds,
+        std::vector<scope_guard> & out_refresh_holds)
     {
         std::map<String, CursorTreeNodePtr> stage_cursors;
         std::set<String> stage_keys;
+        for (const auto & stage : delta_query.getStages())
+        {
+            executeRefreshStep(stage.query->getStageCreateQuery(stage.table), refresh_context);
+            stage_keys.insert(toString(stage.table.uuid));
+        }
+        delta_query.bindStageTables(refresh_context);
+        const auto own_cursor = stage_keys.empty() ? old_cursor : delta_query.restrictCursor(old_cursor);
+        /// The merges of the stage tables keep the rows as of the old cursor after the stages insert their rows. The guards
+        /// of the previous refresh hold the old cursor too, but only until a restart.
+        std::ranges::move(delta_query.holdCursor(own_cursor), std::back_inserter(out_refresh_holds));
         for (auto & stage : delta_query.getStages())
         {
             const auto key = stage.getCursorKey();
-            executeRefreshStep(stage.query->getStageCreateQuery(stage.table), refresh_context);
             std::optional<StorageID> stage_delta;
             auto rows = buildIncrementalRefresh(*stage.query, stage.table, stage.table,
                 old_cursor && old_cursor->hasSubtree(key) ? old_cursor->getSubtree(key) : nullptr, stage_cursors[key], recompute,
-                refresh_context, snapshot, stage_delta, out_cursor_holds);
+                refresh_context, snapshot, stage_delta, out_cursor_holds, out_refresh_holds);
             Strings columns;
             for (const auto & column : stage.query->getResultColumns())
                 columns.push_back(backQuote(column.name));
@@ -172,10 +182,7 @@ namespace
                 fmt::join(columns, ", "), rows->formatWithSecretsOneLine()), refresh_context);
             if (stage_delta)
                 executeRefreshStep(fmt::format("DROP TABLE IF EXISTS {}", stage_delta->getFullTableName()), refresh_context);
-            stage_keys.insert(toString(stage.table.uuid));
         }
-        delta_query.bindStageTables(refresh_context);
-        const auto own_cursor = stage_keys.empty() ? old_cursor : delta_query.restrictCursor(old_cursor);
 
         new_cursor = delta_query.getFrontier(own_cursor);
         for (auto & [key, value] : *new_cursor)
@@ -836,7 +843,8 @@ std::vector<StreamSubscriptionPtr> StorageMaterializedView::subscribeToInputComm
 
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
-    const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, bool recompute) const
+    const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds,
+    bool recompute) const
 {
     const bool append = mode != RefreshMode::Replace;
     const bool incremental = mode == RefreshMode::AppendIncremental;
@@ -858,7 +866,7 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
         CursorTreeNodePtr new_cursor;
         RefreshSnapshot snapshot;
         select_query = buildIncrementalRefresh(delta_query, getStorageID(), inner_table_id, stream_cursor, new_cursor, recompute,
-            refresh_context, snapshot, out_temp_table_id, out_cursor_holds);
+            refresh_context, snapshot, out_temp_table_id, out_cursor_holds, out_refresh_holds);
         {
             /// `RefreshTask` persists this cursor after the refresh succeeds. A transactional target commits it with the data.
             auto holder = refresh_context->getStreamingCursor();

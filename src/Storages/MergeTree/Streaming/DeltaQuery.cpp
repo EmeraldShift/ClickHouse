@@ -15,8 +15,11 @@
 #include <Core/Joins.h>
 #include <Common/quoteString.h>
 #include <Core/Settings.h>
+#include <DataTypes/DataTypeCustomSimpleAggregateFunction.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/TypeTree.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -1673,8 +1676,11 @@ void checkReadableAsOf(const MergeTreeData & storage, const DataPartsVector & pa
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support replicated table {}, which has lightweight updates",
                 storage.getStorageID().getNameForLogs());
         const auto range = getBlockRange(*part);
-        /// The last update or mutation that the part holds.
-        const Int64 last = part->info.isPatch() ? range.max_block : part->info.mutation;
+        /// The last update or mutation that the part holds. A merged part of a table whose merges rewrite rows, like a stage
+        /// table, combines the rows of all its blocks.
+        Int64 last = part->info.isPatch() ? range.max_block : part->info.mutation;
+        if (!part->info.isPatch() && storage.merging_params.mode != MergeTreeData::MergingParams::Ordinary)
+            last = std::max(last, range.max_block);
         const Int64 bound = getBound(bounds, range.getPartitionId());
         if (range.min_block < bound && bound <= last)
             throw Exception(ErrorCodes::DELTA_QUERY_HISTORY_LOST,
@@ -1768,7 +1774,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
                 if (stage.query->recursion)
                     throwUnsupported("WITH RECURSIVE in subqueries in FROM");
                 Strings structure;
-                for (const auto & column : stage.query->getResultColumns())
+                for (const auto & column : stage.query->getStageColumns())
                     structure.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
                 auto table = makeASTFunction("null", make_intrusive<ASTLiteral>(Field(joinNames(structure))));
                 table->setAlias(expression.subquery->tryGetAlias());
@@ -2104,19 +2110,58 @@ std::vector<StorageID> DeltaQuery::getStageTables(const ASTPtr & query, const St
     return tables;
 }
 
+namespace
+{
+
+/// Whether a sorting key of MergeTree can have a column of `type`, see `KeyDescription::getSortingKeyFromAST`.
+bool canBeInSortingKey(const IDataType & type)
+{
+    bool allowed = type.isComparable() && !dynamic_cast<const DataTypeCustomSimpleAggregateFunction *>(type.getCustomName());
+    forEachInTypeTree(type, [&](const IDataType & element) { allowed = allowed && !isDynamic(element) && !isVariant(element) && !isObject(element); });
+    return allowed;
+}
+
+}
+
+NamesAndTypesList DeltaQuery::getStageColumns() const
+{
+    auto columns = getResultColumns();
+    for (auto & column : columns)
+        if (column.name == sign_column)
+            column.type = std::make_shared<DataTypeInt64>();
+    return columns;
+}
+
 String DeltaQuery::getStageCreateQuery(const StorageID & table) const
 {
-    Strings columns;
-    for (const auto & column : getResultColumns())
-        columns.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
+    const auto columns = getStageColumns();
+    Strings definitions;
+    for (const auto & column : columns)
+        definitions.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
     /// The residual reads the rows of the stage table of the touched values of its partition keys.
-    Strings order;
+    Names primary_key;
     if (residual)
-        for (const auto & output : residual->partition_outputs)
-            order.push_back(backQuote(output));
-    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = MergeTree ORDER BY {} "
+        primary_key = residual->partition_outputs;
+    /// The merges of a SummingMergeTree sum the signs of the rows that are equal in the other columns. They drop the rows of
+    /// sign 0. The merges then keep the net rows below each bound that a delta query holds, see `checkReadableAsOf`.
+    const bool consolidates = std::ranges::any_of(columns, [&](const auto & column) { return column.name == sign_column; })
+        && std::ranges::all_of(columns, [&](const auto & column) { return column.name == sign_column || canBeInSortingKey(*column.type); });
+    Names order = primary_key;
+    if (consolidates)
+        for (const auto & column : columns)
+            if (column.name != sign_column && std::ranges::find(primary_key, column.name) == primary_key.end())
+                order.push_back(column.name);
+    auto key = [](const Names & names)
+    {
+        Strings quoted;
+        for (const auto & name : names)
+            quoted.push_back(backQuote(name));
+        return names.empty() ? String("tuple()") : "(" + joinNames(quoted) + ")";
+    };
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = {} ORDER BY {}{} "
         "SETTINGS enable_block_number_column = 1, allow_nullable_key = 1", table.getFullTableName(), quoteString(toString(table.uuid)),
-        joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
+        joinNames(definitions), consolidates ? "SummingMergeTree(" + backQuote(sign_column) + ")" : "MergeTree", key(order),
+        consolidates && !primary_key.empty() ? " PRIMARY KEY " + key(primary_key) : "");
 }
 
 void DeltaQuery::bindStageTables(const ContextPtr & context)

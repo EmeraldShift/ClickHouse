@@ -99,7 +99,8 @@ public:
     /// The stage tables of the subqueries of `query` of `view` and of their subqueries. Doesn't analyze `query`.
     static std::vector<StorageID> getStageTables(const ASTPtr & query, const StorageID & view);
 
-    /// `CREATE TABLE IF NOT EXISTS` of the stage table `table` of this stage.
+    /// `CREATE TABLE IF NOT EXISTS` of the stage table `table` of this stage. The stage table weighs its rows by an Int64
+    /// sign. Its merges sum the signs of equal rows unless a column can't be in a sorting key.
     String getStageCreateQuery(const StorageID & table) const;
 
     /// Makes the inputs of the stages read the stage tables, which must exist. The frontier and the delta need them.
@@ -160,6 +161,9 @@ public:
 
     /// The columns of the rows that the deltas insert into a target, see `getQuery`.
     NamesAndTypesList getResultColumns() const;
+
+    /// The columns of the stage table of this stage, see `getStageCreateQuery`.
+    NamesAndTypesList getStageColumns() const;
 
     /// The entries of `tree` for the inputs of this query, and its time.
     CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
