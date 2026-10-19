@@ -1631,7 +1631,14 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     if (!core)
         return;
     analyze(core, context, sign_column_setting, nullptr);
-    auto core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
+    /// The deltas of the core bind the sign of each term. The sign doesn't change the types.
+    auto get_core_columns = [&]
+    {
+        auto term = query->clone();
+        bindTerm(*term, Int64{1}, {});
+        return InterpreterSelectQueryAnalyzer::getSampleBlock(term, context)->getNamesAndTypesList();
+    };
+    auto core_columns = get_core_columns();
 
     /// A sum of Nullable values is NULL over rows whose values are all NULL, but the merged sum of the rows and their
     /// retractions is 0. So the merge returns NULL where the count of non-NULL values is 0.
@@ -1655,7 +1662,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     if (added_counts)
     {
         analyze(core, context, sign_column_setting, nullptr);
-        core_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(query, context)->getNamesAndTypesList();
+        core_columns = get_core_columns();
     }
 
     /// The integral has the columns of the deltas of the core, and merges the aggregate columns.
@@ -1699,6 +1706,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     clock_input.reset();
     clock_conjuncts.clear();
     consolidated_columns.clear();
+    summed_columns.clear();
     sign_column = sign_column_;
 
     /// A filter by now() changes its result as time passes, see `buildDelta`. Elsewhere now() would change rows that no
@@ -1849,10 +1857,29 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
                 if (column != sign_column)
                     input.columns.push_back(column);
 
-    /// The pairs of terms of a query without aggregates return most rows twice with opposite signs.
-    if (retracts && select.select()->children.back()->tryGetAlias() == sign_column)
+    /// A signed query without aggregates returns the sign column. The pairs of terms of its delta return most rows twice with
+    /// opposite signs.
+    if (!signs.empty() && select.select()->children.back()->tryGetAlias() == sign_column)
+    {
         for (const auto & column : query_node->getProjectionColumns())
             consolidated_columns.push_back(column.name);
+    }
+    else if (!signs.empty())
+    {
+        const auto & nodes = query_node->getProjection().getNodes();
+        const auto projection_columns = query_node->getProjectionColumns();
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            const auto * function = nodes[i]->as<FunctionNode>();
+            const bool is_aggregate = function && function->isAggregateFunction();
+            if (is_aggregate && !std::ranges::contains(std::array{"sum", "count"}, splitCombinators(function->getFunctionName()).first))
+            {
+                summed_columns.clear();
+                break;
+            }
+            summed_columns.emplace_back(projection_columns[i].name, is_aggregate);
+        }
+    }
 
     if (has_clock)
     {
@@ -2017,6 +2044,60 @@ ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageI
     return parseSelect(consolidate(columns, sign, fmt::format(
         "SELECT {0}, toInt64(1) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}{4}",
         columns, sign, residual->buildResidual(input), target.getFullTableName(), target_where)) + (skip ? " WHERE 0" : ""));
+}
+
+bool DeltaQuery::canCorrect() const
+{
+    if (recursion)
+        return false;
+    if (residual)
+        return !residual->append_only;
+    return !consolidated_columns.empty() || !summed_columns.empty();
+}
+
+ASTPtr DeltaQuery::buildCorrection(const CursorTreeNodePtr & new_cursor, const StorageID & target) const
+{
+    chassert(canCorrect() && !residual);
+    const auto query_rows = buildDelta(nullptr, new_cursor)->formatWithSecretsOneLine();
+    const auto target_name = target.getFullTableName();
+    if (!consolidated_columns.empty())
+    {
+        Strings columns;
+        for (const auto & column : consolidated_columns)
+            columns.push_back(backQuote(column));
+        const auto sign = backQuote(sign_column);
+        return parseSelect(consolidate(joinNames(columns), sign, fmt::format(
+            "SELECT {0}, toInt64({1}) AS `__weight` FROM ({2}) UNION ALL SELECT {0}, -toInt64({1}) AS `__weight` FROM {3}",
+            joinNames(columns), sign, query_rows, target_name)));
+    }
+    /// Each group gets one row with the sums of the query minus the sums of the target. A target column can have an unsigned
+    /// type that holds negative sums modulo its range. The products with a signed factor have one type in both selects.
+    Strings columns;
+    Strings retracted;
+    Strings results;
+    Strings keys;
+    Strings nonzero;
+    for (const auto & [name, is_sum] : summed_columns)
+    {
+        const auto column = backQuote(name);
+        if (is_sum)
+        {
+            columns.push_back(fmt::format("{0} * toInt8(1) AS {0}", column));
+            retracted.push_back(fmt::format("{} * toInt8(-1)", column));
+            results.push_back(fmt::format("sum({0}) AS {0}", column));
+            nonzero.push_back(fmt::format("{} != 0", column));
+        }
+        else
+        {
+            columns.push_back(column);
+            retracted.push_back(column);
+            results.push_back(column);
+            keys.push_back(column);
+        }
+    }
+    return parseSelect(fmt::format("SELECT {} FROM (SELECT {} FROM ({}) UNION ALL SELECT {} FROM {}){} HAVING {}",
+        joinNames(results), joinNames(columns), query_rows, joinNames(retracted), target_name,
+        keys.empty() ? "" : " GROUP BY " + joinNames(keys), fmt::join(nonzero, " OR ")));
 }
 
 bool DeltaQuery::hasPartitionedResidual() const

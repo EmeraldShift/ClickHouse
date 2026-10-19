@@ -109,6 +109,16 @@ public:
     ASTPtr buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target,
         bool all_keys = false) const;
 
+    /// Whether rows can make a target that holds the deltas of the query equal to the query as of a cursor. A signed query
+    /// allows that. A recursive query doesn't, nor does a query with an append-only residual or with aggregates that aren't
+    /// all sums. For a query with a residual, `buildResidualDelta` over all keys returns those rows after the integral absorbs
+    /// the delta from the empty cursor. For the others, `buildCorrection` returns them.
+    bool canCorrect() const;
+
+    /// The rows that make `target` equal to the query as of `new_cursor`, for a query without a residual. They retract the
+    /// rows of `target` and add the rows of the query. Rows that cancel each other are left out.
+    ASTPtr buildCorrection(const CursorTreeNodePtr & new_cursor, const StorageID & target) const;
+
     struct Input;
     struct SemiJoinEdge;
     struct Residual;
@@ -138,9 +148,12 @@ private:
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;
     ASTs clock_conjuncts;
-    /// The result columns of a query without aggregates whose delta retracts rows, without the sign column. The delta sums
+    /// The result columns of a signed query without aggregates, without the sign column. A delta with pairs of terms sums
     /// the signs of equal rows.
     Names consolidated_columns;
+    /// The result columns of a query with aggregates over signed inputs that are all sums, like `count` and `sum`. The flag
+    /// marks the aggregates. The rows of a target with equal other columns add up.
+    std::vector<std::pair<String, bool>> summed_columns;
 };
 
 /// Throws `DELTA_QUERY_HISTORY_LOST` unless `parts` of `storage` hold its rows as of `bounds`, the first block number that
