@@ -1031,10 +1031,23 @@ void setSetting(ASTSelectQuery & select, std::string_view name, const Field & va
     select.setExpression(ASTSelectQuery::Expression::SETTINGS, std::move(settings));
 }
 
+/// How a query without aggregates or GROUP BY returns the weights of its rows as `sign_column`.
+enum class RowWeights : uint8_t
+{
+    /// No sign column if no input has one, and the weight as Int8 otherwise.
+    Omitted,
+    /// The weight as Int8, for inputs whose weights are 1 or -1.
+    Signs,
+    /// As many rows as the absolute weight, of sign 1 or -1.
+    Expanded,
+    /// The weight as Int64, for the table of a stage.
+    Weights,
+};
+
 /// Rewrites the resolved `select` of `query` to carry the weights of its rows, the product of the signs of the signed
-/// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, unless it has no signs and
-/// not `unit_sign`. A query with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
-void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & signs, const String & sign_column, bool unit_sign)
+/// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, see `RowWeights`. A query
+/// with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
+void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & signs, const String & sign_column, RowWeights row_weights)
 {
     const auto & nodes = query.getProjection().getNodes();
     const auto & columns = query.getProjectionColumns();
@@ -1049,9 +1062,16 @@ void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & s
     {
         if (std::ranges::any_of(columns, [&](const auto & column) { return column.name == sign_column; }))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The delta query returns column {}, which delta_query_sign_column names", sign_column);
-        if (signs.empty() && !unit_sign)
+        if (signs.empty() && row_weights == RowWeights::Omitted)
             return;
-        auto sign = makeASTFunction("toInt8", weight);
+        ASTPtr sign;
+        if (row_weights == RowWeights::Weights)
+            sign = makeASTFunction("toInt64", weight);
+        else if (row_weights == RowWeights::Expanded)
+            sign = makeASTFunction("arrayJoin", makeASTFunction("arrayWithConstant",
+                makeASTFunction("toUInt64", makeASTFunction("abs", weight->clone())), makeASTFunction("toInt8", makeASTFunction("sign", weight))));
+        else
+            sign = makeASTFunction("toInt8", weight);
         sign->setAlias(sign_column);
         projection.push_back(std::move(sign));
         return;
@@ -2049,8 +2069,16 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     /// Without GROUP BY, a delta that reads no rows still returns one row by default, with 0 for `min` and `max`.
     if (!select.groupBy())
         setSetting(select, "empty_result_for_aggregation_by_empty_set", true);
-    /// The rows of a stage and the rows for a target with a sign column have a sign even if no input has one.
-    addWeights(select, *query_node, signs, sign_column, is_stage || sign_column != internal_sign_column);
+    /// The rows of a stage and the rows for a target with a sign column have a sign even if no input has one. The rows of a
+    /// stage that retracts rows sum their weights. A weight can then exceed 1.
+    auto row_weights = RowWeights::Omitted;
+    if (is_stage)
+        row_weights = RowWeights::Weights;
+    else if (std::ranges::any_of(inputs, [](const auto & input) { return input.stage && input.is_signed; }))
+        row_weights = RowWeights::Expanded;
+    else if (sign_column != internal_sign_column)
+        row_weights = RowWeights::Signs;
+    addWeights(select, *query_node, signs, sign_column, row_weights);
 
     std::map<String, std::set<String>> columns;
     collectColumns(select, columns);
