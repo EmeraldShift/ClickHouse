@@ -38,16 +38,22 @@ CREATE MATERIALIZED VIEW joined REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE 
 -- HAVING needs a residual.
 CREATE MATERIALIZED VIEW tops REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
     SELECT k % 2 AS g, sum(v) AS m FROM dl GROUP BY g HAVING m > 5 SETTINGS delta_query_sign_column = 'sign';
+-- A stage over Distributed tables runs on the shards, and its rows go to the stage table on this server.
+CREATE MATERIALIZED VIEW nested REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = SummingMergeTree ORDER BY n EMPTY AS
+    SELECT n, count() AS keys FROM (SELECT k, count() AS n FROM dl GROUP BY k) GROUP BY n;
 
 CREATE VIEW contents AS
     SELECT 'joined', toString(groupArray((k, s, n))) FROM (SELECT k, sum(s) AS s, sum(n) AS n FROM joined GROUP BY k HAVING n != 0 ORDER BY k)
-    UNION ALL SELECT 'tops', toString(groupArray((g, m, n))) FROM (SELECT g, m, sum(sign) AS n FROM tops GROUP BY g, m HAVING n != 0 ORDER BY ALL);
+    UNION ALL SELECT 'tops', toString(groupArray((g, m, n))) FROM (SELECT g, m, sum(sign) AS n FROM tops GROUP BY g, m HAVING n != 0 ORDER BY ALL)
+    UNION ALL SELECT 'nested', toString(groupArray((n, keys))) FROM (SELECT n, sum(keys) AS keys FROM nested GROUP BY n HAVING keys != 0 ORDER BY n);
 CREATE VIEW expected AS
     SELECT 'joined', toString(groupArray((k, s, n))) FROM (SELECT dl.k AS k, sum(v * w) AS s, count() AS n FROM dl JOIN dr ON dl.k = dr.k GROUP BY k ORDER BY k)
-    UNION ALL SELECT 'tops', toString(groupArray((g, m, 1))) FROM (SELECT k % 2 AS g, sum(v) AS m FROM dl GROUP BY g HAVING m > 5 ORDER BY g);
+    UNION ALL SELECT 'tops', toString(groupArray((g, m, 1))) FROM (SELECT k % 2 AS g, sum(v) AS m FROM dl GROUP BY g HAVING m > 5 ORDER BY g)
+    UNION ALL SELECT 'nested', toString(groupArray((n, keys))) FROM (SELECT n, count() AS keys FROM (SELECT k, count() AS n FROM dl GROUP BY k) GROUP BY n ORDER BY n);
 
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
 SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
+SYSTEM REFRESH VIEW nested; SYSTEM WAIT VIEW nested;
 SELECT 'initial', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
 
@@ -56,6 +62,7 @@ INSERT INTO r VALUES (4, 40);
 UPDATE l SET v = 5 WHERE k = 2;
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
 SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
+SYSTEM REFRESH VIEW nested; SYSTEM WAIT VIEW nested;
 SELECT 'incremental', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
 
@@ -65,13 +72,16 @@ ALTER TABLE l UPDATE v = v * 100 WHERE k = 3 SETTINGS mutations_sync = 2;
 INSERT INTO l VALUES (5, 5);
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined; -- { serverError REFRESH_FAILED }
 SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops; -- { serverError REFRESH_FAILED }
+SYSTEM REFRESH VIEW nested; SYSTEM WAIT VIEW nested; -- { serverError REFRESH_FAILED }
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
 SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
+SYSTEM REFRESH VIEW nested; SYSTEM WAIT VIEW nested;
 SELECT 'corrected', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
 
 UPDATE l SET v = 6 WHERE k = 1;
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
 SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
+SYSTEM REFRESH VIEW nested; SYSTEM WAIT VIEW nested;
 SELECT 'after', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
