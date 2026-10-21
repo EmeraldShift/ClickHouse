@@ -57,8 +57,15 @@ SELECT 'hidden tables after drop', count() FROM system.tables WHERE database = c
 CREATE TABLE plain (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE MATERIALIZED VIEW plain_mv REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
     SELECT k FROM (SELECT k FROM plain WHERE k > 0);
+-- A CTE in FROM is a stage too.
+CREATE MATERIALIZED VIEW cte_mv REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = SummingMergeTree ORDER BY n EMPTY AS
+    WITH counts AS (SELECT k, count() AS c FROM plain GROUP BY k) SELECT c AS n, count() AS keys FROM counts GROUP BY n;
 INSERT INTO plain VALUES (1), (1), (0);
 SYSTEM REFRESH VIEW plain_mv; SYSTEM WAIT VIEW plain_mv;
+SYSTEM REFRESH VIEW cte_mv; SYSTEM WAIT VIEW cte_mv;
 INSERT INTO plain VALUES (1), (2);
 SYSTEM REFRESH VIEW plain_mv; SYSTEM WAIT VIEW plain_mv;
+SYSTEM REFRESH VIEW cte_mv; SYSTEM WAIT VIEW cte_mv;
 SELECT 'plain', groupArray(k) FROM (SELECT k FROM plain_mv ORDER BY k);
+SELECT 'cte', groupArray((n, keys)) FROM (SELECT n, sum(keys) AS keys FROM cte_mv GROUP BY n HAVING keys != 0 ORDER BY n);
+SELECT 'cte expected', groupArray((n, keys)) FROM (SELECT c AS n, count() AS keys FROM (SELECT k, count() AS c FROM plain GROUP BY k) GROUP BY n ORDER BY n);

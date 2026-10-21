@@ -188,8 +188,8 @@ struct DeltaQuery::Residual
 };
 
 /// The base and the steps of a query `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r`. Each step reads the
-/// table of `delta_query_recursion_table` instead of `r`, as a lookup table. Its delta then joins the new rows of its other
-/// inputs with the rows of `r` at the old cursor.
+/// table of `delta_query_recursion_table` instead of `r`, as a lookup table. A step of a recursive stage reads the stage
+/// table instead. Its delta then joins the new rows of its other inputs with the rows of `r` at the old cursor.
 struct DeltaQuery::Recursion
 {
     std::unique_ptr<DeltaQuery> base;
@@ -594,10 +594,12 @@ std::optional<RecursiveCTE> getRecursiveCTE(const IAST & query)
     const bool reads_cte = cte && from
         && ((from->database_and_table_name && isTableNamed(cte->name)(*from->database_and_table_name))
             || (from->subquery && from->subquery->as<ASTSubquery &>().cte_name == cte->name));
-    if (!cte || cte->aliases || !selects_all || !reads_cte || select->distinct || select->where() || select->prewhere()
-        || select->groupBy() || select->having() || select->orderBy() || select->limitBy() || select->limitLength()
-        || select->limitOffset() || select->window() || select->qualify())
-        throwUnsupported("WITH RECURSIVE except as WITH RECURSIVE r AS (...) SELECT * FROM r");
+    if (!cte || cte->aliases)
+        throwUnsupported("WITH RECURSIVE with several CTEs or with column names");
+    /// Any other query over `r` reads it as a subquery in FROM, see `inlineCTEs`.
+    if (!selects_all || !reads_cte || select->distinct || select->where() || select->prewhere() || select->groupBy() || select->having()
+        || select->orderBy() || select->limitBy() || select->limitLength() || select->limitOffset() || select->window() || select->qualify())
+        return {};
 
     const auto & body = cte->subquery->children.at(0)->as<ASTSelectWithUnionQuery &>();
     const auto & modes = body.list_of_modes;
@@ -1649,6 +1651,66 @@ ASTPtr parseSelect(const String & sql)
     return ast;
 }
 
+/// Replaces each table in FROM of `query` that names a CTE in `scope` or in WITH by a subquery of the CTE, and so in the
+/// subqueries in FROM. A recursive CTE `r` becomes `(WITH RECURSIVE r AS (...) SELECT * FROM r)`. Then removes the CTEs
+/// that no clause other than FROM reads. So each CTE in FROM becomes a stage, see `DeltaQuery::Stage`.
+void inlineCTEs(IAST & query, std::map<String, std::pair<ASTPtr, bool>> scope)
+{
+    for (const auto & child : query.as<ASTSelectWithUnionQuery &>().list_of_selects->children)
+    {
+        auto * select = child->as<ASTSelectQuery>();
+        if (!select)
+            continue;
+        if (select->with())
+            for (const auto & element : select->with()->children)
+                if (const auto * cte = element->as<ASTWithElement>())
+                    scope[cte->name] = {cte->subquery, select->recursive_with};
+        if (select->tables())
+            for (const auto & element : select->tables()->children)
+            {
+                const auto & table_expression = element->as<ASTTablesInSelectQueryElement &>().table_expression;
+                if (!table_expression)
+                    continue;
+                auto & expression = table_expression->as<ASTTableExpression &>();
+                String name;
+                if (const auto * identifier = expression.database_and_table_name ? expression.database_and_table_name->as<ASTTableIdentifier>() : nullptr)
+                    name = identifier->name();
+                else if (expression.subquery)
+                    name = expression.subquery->as<ASTSubquery &>().cte_name;
+                /// The body of a CTE reads a table of the name of the CTE, not the CTE.
+                auto inner_scope = scope;
+                if (auto cte = scope.find(name); !name.empty() && cte != scope.end())
+                {
+                    inner_scope.erase(name);
+                    const auto alias = getTable(expression)->tryGetAlias();
+                    const auto & [subquery, recursive] = cte->second;
+                    auto replacement = recursive ? make_intrusive<ASTSubquery>(parseSelect(fmt::format("WITH RECURSIVE {0} AS {1} SELECT * FROM {0}",
+                        backQuote(name), subquery->formatWithSecretsOneLine()))) : subquery->clone();
+                    replacement->setAlias(alias.empty() ? name : alias);
+                    setTable(expression, std::move(replacement));
+                }
+                if (expression.subquery && !getRecursiveCTE(*expression.subquery->children.at(0)))
+                    inlineCTEs(*expression.subquery->children.at(0), inner_scope);
+            }
+        if (!select->with())
+            continue;
+        auto & elements = select->with()->children;
+        elements.erase(std::remove_if(elements.begin(), elements.end(), [&](const ASTPtr & element)
+        {
+            const auto * cte = element->as<ASTWithElement>();
+            return cte && std::ranges::all_of(select->children, [&](const auto & clause)
+            {
+                return clause == select->with() || clause == select->tables() || countTableReferences(*clause, cte->name) == 0;
+            });
+        }), elements.end());
+        if (select->with()->children.empty())
+        {
+            select->setExpression(ASTSelectQuery::Expression::WITH, nullptr);
+            select->recursive_with = false;
+        }
+    }
+}
+
 /// Replaces the identifiers of the columns in `types` within `ast` by casts to their types.
 void castColumns(IAST & ast, const std::map<String, String> & types)
 {
@@ -1728,6 +1790,12 @@ DataPartsVector getPatchParts(const MergeTreeData & storage, const std::map<Stri
 }
 
 DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path)
+    : DeltaQuery(query_, context_, view, stage_path, nullptr)
+{
+}
+
+DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path,
+    const RecursionTable * recursion_table_)
     : is_stage(!stage_path.empty())
 {
     /// The query can set `delta_query_sign_column` in its SETTINGS, as the query of a view does.
@@ -1752,12 +1820,25 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
             if (!part.cluster.empty())
                 throwUnsupported("recursive CTEs over Distributed tables");
         };
-        split->base = std::make_unique<DeltaQuery>(makeSelectWithUnion(parts[0]), context);
+        /// The parts of a recursive stage weigh their rows like a stage.
+        split->base = std::make_unique<DeltaQuery>(makeSelectWithUnion(parts[0]), context, StorageID::createEmpty(), stage_path);
         check_part(*split->base);
 
-        const String & table_name = context->getSettingsRef()[Setting::delta_query_recursion_table];
+        /// A recursive stage reads its own stage table. The table holds `r` at the old cursor.
+        String table_name = context->getSettingsRef()[Setting::delta_query_recursion_table];
+        std::optional<RecursionTable> stage_table;
         ASTPtr table;
-        if (!table_name.empty())
+        if (is_stage)
+        {
+            Strings structure;
+            for (const auto & column : split->base->getStageColumns())
+                structure.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
+            stage_table = RecursionTable{.cte = cte->name, .table = makeStageTableId(view, stage_path), .structure = joinNames(structure)};
+            table_name = stage_table->table.getFullTableName();
+            split->key = toString(stage_table->table.uuid);
+            table = make_intrusive<ASTTableIdentifier>(cte->name);
+        }
+        else if (!table_name.empty())
         {
             ParserCompoundIdentifier parser(/*table_name_with_optional_uuid=*/true);
             table = parseQuery(parser, table_name, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
@@ -1773,7 +1854,8 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
             replacement->setAlias(alias.empty() ? cte->name : alias);
             setTable(expression, std::move(replacement));
 
-            auto & part = *split->steps.emplace_back(std::make_unique<DeltaQuery>(makeSelectWithUnion(std::move(step)), context));
+            auto & part = *split->steps.emplace_back(std::unique_ptr<DeltaQuery>(new DeltaQuery(makeSelectWithUnion(std::move(step)), context,
+                StorageID::createEmpty(), stage_path, stage_table ? &*stage_table : nullptr)));
             check_part(part);
             auto reads_table = [&](const Input & input) { return input.key == split->key; };
             auto input = std::ranges::find_if(part.inputs, reads_table);
@@ -1792,6 +1874,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
     /// Each subquery in FROM becomes a stage. The analysis reads `null` with the columns of the stage table instead, so it
     /// doesn't need the stage table. The deltas read the stage table, see `makeSnapshot`.
     auto rewritten = query_->clone();
+    inlineCTEs(*rewritten, {});
     for (const auto & child : rewritten->as<ASTSelectWithUnionQuery &>().list_of_selects->children)
         if (const auto * select = child->as<ASTSelectQuery>())
             forEachSubqueryInFrom(*select, [&](ASTTableExpression & expression, size_t index)
@@ -1801,8 +1884,6 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
                 const auto path = is_stage ? fmt::format("{}.{}", stage_path, index) : toString(index);
                 auto & stage = stages.emplace_back(Stage{.path = path, .table = makeStageTableId(view, path),
                     .query = std::make_unique<DeltaQuery>(expression.subquery->children.at(0), context, view, path)});
-                if (stage.query->recursion)
-                    throwUnsupported("WITH RECURSIVE in subqueries in FROM");
                 Strings structure;
                 for (const auto & column : stage.query->getStageColumns())
                     structure.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
@@ -1810,6 +1891,16 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
                 table->setAlias(expression.subquery->tryGetAlias());
                 setTable(expression, std::move(table));
             });
+    /// A step of a recursive stage reads the stage table as `null` with its columns, like a query that reads a stage.
+    if (recursion_table_)
+    {
+        auto & select = rewritten->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
+        auto & expression = *findTable(select, isTableNamed(recursion_table_->cte));
+        auto table = makeASTFunction("null", make_intrusive<ASTLiteral>(Field(recursion_table_->structure)));
+        table->setAlias(expression.database_and_table_name->tryGetAlias());
+        setTable(expression, std::move(table));
+        recursion_table = recursion_table_->table;
+    }
     checkNoSubqueries(*rewritten);
     shard_query = readLocalTables(rewritten, context, cluster);
     if (!cluster.empty() && !stages.empty())
@@ -1963,6 +2054,12 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
         /// The table functions stand for the stages in the order of FROM.
         if (const auto * function = table->as<TableFunctionNode>())
         {
+            if (num_stage_inputs == stages.size() && recursion_table)
+            {
+                inputs.push_back({.alias = function->getAlias(), .key = toString(recursion_table->uuid), .table_id = *recursion_table,
+                    .storage = nullptr, .stage = true, .is_signed = true});
+                continue;
+            }
             if (num_stage_inputs == stages.size())
                 throwUnsupported("table functions in FROM");
             const auto & stage = stages[num_stage_inputs++];
@@ -2140,9 +2237,13 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
 
 DeltaQuery::~DeltaQuery() = default;
 
-std::vector<StorageID> DeltaQuery::getStageTables(const ASTPtr & query, const StorageID & view)
+std::vector<StorageID> DeltaQuery::getStageTables(const ASTPtr & query_, const StorageID & view)
 {
     std::vector<StorageID> tables;
+    if (getRecursiveCTE(*query_))
+        return tables;
+    auto query = query_->clone();
+    inlineCTEs(*query, {});
     std::function<void(const ASTPtr &, const String &)> collect = [&](const ASTPtr & select_with_union, const String & prefix)
     {
         for (const auto & child : select_with_union->as<ASTSelectWithUnionQuery &>().list_of_selects->children)
@@ -2151,7 +2252,8 @@ std::vector<StorageID> DeltaQuery::getStageTables(const ASTPtr & query, const St
                 {
                     const auto path = prefix.empty() ? toString(index) : fmt::format("{}.{}", prefix, index);
                     tables.push_back(makeStageTableId(view, path));
-                    collect(expression.subquery->children.at(0), path);
+                    if (!getRecursiveCTE(*expression.subquery->children.at(0)))
+                        collect(expression.subquery->children.at(0), path);
                 });
     };
     collect(query, "");
@@ -2214,6 +2316,12 @@ String DeltaQuery::getStageCreateQuery(const StorageID & table) const
 
 void DeltaQuery::bindStageTables(const ContextPtr & context)
 {
+    if (recursion)
+    {
+        recursion->base->bindStageTables(context);
+        for (const auto & step : recursion->steps)
+            step->bindStageTables(context);
+    }
     for (auto & input : inputs)
         if (input.stage)
             input.storage = castStorage<MergeTreeData>(DatabaseCatalog::instance().getTable(input.table_id, context), DeferredTable::Load);
@@ -2361,6 +2469,8 @@ ASTPtr DeltaQuery::buildResidualDelta(const StorageID & integral, const StorageI
 
 NamesAndTypesList DeltaQuery::getResultColumns() const
 {
+    if (recursion)
+        return recursion->base->getResultColumns();
     if (residual)
         return residual->output_columns;
     return InterpreterSelectQueryAnalyzer::getSampleBlock(getQuery(), analysis_context)->getNamesAndTypesList();

@@ -50,6 +50,7 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// Here `d_0` is the delta of the base plus the delta of each step over the rows of `r` at the old cursor, and `step(d)` reads
 /// the inputs at the new cursor. The rows of `r` at the old cursor come from `delta_query_recursion_table`, which an
 /// incremental refreshable materialized view sets to its target. The weights of the rows make this hold for retractions too.
+/// Any other query over `r` reads `r` as a stage. The stage table then holds `r`.
 ///
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
@@ -66,7 +67,8 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// that write later updates into older rows lose the rows as of a cursor, and the delta then throws
 /// `DELTA_QUERY_HISTORY_LOST`, see `checkReadableAsOf`.
 ///
-/// The query of an incremental refreshable materialized view can also read subqueries in FROM. Each subquery is a stage.
+/// The query of an incremental refreshable materialized view can also read subqueries and CTEs in FROM. Each subquery and
+/// each CTE in FROM is a stage.
 /// A stage is a delta query of its own, and its deltas go to a hidden stage table of the view. The query reads the stage
 /// table as a signed input. A stage with aggregates has a residual even if its aggregates are sums. So a refresh retracts
 /// the old row of each group that it changes and inserts the new row. The stage table then holds the rows of the subquery
@@ -182,6 +184,17 @@ public:
     struct Recursion;
 
 private:
+    /// The stage table that a step of a recursive stage reads instead of the CTE, see `Recursion`.
+    struct RecursionTable
+    {
+        String cte;
+        StorageID table;
+        /// The columns of `table`. The table may not exist yet.
+        String structure;
+    };
+    DeltaQuery(const ASTPtr & query, const ContextPtr & context, const StorageID & view, const String & stage_path,
+        const RecursionTable * recursion_table);
+
     /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
     /// fills `split` and returns its core instead, which the caller analyzes.
     ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
@@ -203,6 +216,8 @@ private:
     std::shared_ptr<const Residual> residual;
     std::shared_ptr<const Recursion> recursion;
     std::vector<Stage> stages;
+    /// The stage table that the table function in FROM stands for, in a step of a recursive stage.
+    std::optional<StorageID> recursion_table;
     /// Whether this query is a stage, see `Stage`.
     bool is_stage = false;
     /// Whether the rows of the deltas have a sign other than 1, see `retractsRows`.
