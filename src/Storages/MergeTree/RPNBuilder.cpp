@@ -436,6 +436,51 @@ const ActionsDAG::Node * unwrapLosslessConversion(const ActionsDAG::Node * node,
     return unwrapLosslessConversion(node_without_alias->children.front(), allow_drop_nullable);
 }
 
+namespace
+{
+
+/// Whether two deterministic nodes compute the same value. Copies of one subtree, like the conjuncts that the inversion
+/// push-down of `KeyCondition` clones from one shared node, are equal.
+bool isSameExpression(const ActionsDAG::Node * a, const ActionsDAG::Node * b)
+{
+    if (a == b)
+        return true;
+    if (a->type != b->type || a->result_name != b->result_name || !a->result_type->equals(*b->result_type)
+        || a->children.size() != b->children.size())
+        return false;
+    switch (a->type)
+    {
+        case ActionsDAG::ActionType::INPUT:
+            return true;
+        case ActionsDAG::ActionType::COLUMN:
+        {
+            if (a->column.get() == b->column.get())
+                return true;
+            const auto * a_set = typeid_cast<const ColumnSet *>(&a->column->getDataColumn());
+            const auto * b_set = typeid_cast<const ColumnSet *>(&b->column->getDataColumn());
+            if (a_set || b_set)
+                return a_set && b_set && a_set->getData() == b_set->getData();
+            const auto & a_data = a->column->getDataColumn();
+            return !a_data.isDummy() && a_data.getDataType() != TypeIndex::Function && a->column->compareAt(0, 0, *b->column, 1) == 0;
+        }
+        case ActionsDAG::ActionType::FUNCTION:
+            if (!a->function_base || !b->function_base || a->function_base->getName() != b->function_base->getName()
+                || !a->isDeterministic())
+                return false;
+            break;
+        case ActionsDAG::ActionType::ALIAS:
+            break;
+        default:
+            return false;
+    }
+    for (size_t i = 0; i < a->children.size(); ++i)
+        if (!isSameExpression(a->children[i], b->children[i]))
+            return false;
+    return true;
+}
+
+}
+
 template <typename RPNElement>
 RPNBuilder<RPNElement>::RPNBuilder(
     const ActionsDAG::Node * filter_actions_dag_node,
@@ -460,7 +505,8 @@ RPNBuilder<RPNElement>::RPNElements && RPNBuilder<RPNElement>::extractRPN() &&
 }
 
 template <typename RPNElement>
-void RPNBuilder<RPNElement>::traverseTree(const RPNBuilderTreeNode & node)
+bool RPNBuilder<RPNElement>::traverseTree(const RPNBuilderTreeNode & node, std::optional<decltype(RPNElement::function)> parent_operator,
+    std::vector<const ActionsDAG::Node *> * parent_operands)
 {
     RPNElement element;
 
@@ -474,23 +520,38 @@ void RPNBuilder<RPNElement>::traverseTree(const RPNBuilderTreeNode & node)
             {
                 element.function = RPNElement::ALWAYS_TRUE;
                 rpn_elements.emplace_back(std::move(element));
-                return;
+                return true;
             }
         }
 
         if (extractLogicalOperatorFromTree(function_node, element))
         {
             size_t arguments_size = function_node.getArgumentsSize();
+            /// `and` and `or` are idempotent, so an operand equal to an earlier operand of the same nested operator adds
+            /// nothing. Filters pushed down through joins by equivalent columns often repeat a conjunct.
+            const auto function = element.function;
+            const bool idempotent = function != RPNElement::FUNCTION_NOT;
+            std::vector<const ActionsDAG::Node *> own_operands;
+            auto * operands = !idempotent ? nullptr : parent_operator == function ? parent_operands : &own_operands;
+            size_t traversed = 0;
 
             for (size_t argument_index = 0; argument_index < arguments_size; ++argument_index)
             {
                 auto function_node_argument = function_node.getArgumentAt(argument_index);
-                traverseTree(function_node_argument);
+                if (const auto * dag_node = function_node_argument.getDAGNode(); dag_node && operands)
+                {
+                    if (std::ranges::any_of(*operands, [&](const auto * operand) { return isSameExpression(operand, dag_node); }))
+                        continue;
+                    operands->push_back(dag_node);
+                }
+                if (!traverseTree(function_node_argument, function, operands))
+                    continue;
+                ++traversed;
 
                 /** The first part of the condition is for the correct support of `and` and `or` functions of arbitrary arity
                       * - in this case `n - 1` elements are added (where `n` is the number of arguments).
                       */
-                if (argument_index != 0 || element.function == RPNElement::FUNCTION_NOT)
+                if (traversed > 1 || function == RPNElement::FUNCTION_NOT)
                     rpn_elements.emplace_back(std::move(element)); /// NOLINT(bugprone-use-after-move,hicpp-invalid-access-moved)
             }
 
@@ -498,9 +559,10 @@ void RPNBuilder<RPNElement>::traverseTree(const RPNBuilderTreeNode & node)
             {
                 element.function = RPNElement::ALWAYS_TRUE;
                 rpn_elements.emplace_back(std::move(element));
+                return true;
             }
 
-            return;
+            return traversed > 0;
         }
     }
 
@@ -508,6 +570,7 @@ void RPNBuilder<RPNElement>::traverseTree(const RPNBuilderTreeNode & node)
         element.function = RPNElement::FUNCTION_UNKNOWN;
 
     rpn_elements.emplace_back(std::move(element));
+    return true;
 }
 
 template <typename RPNElement>

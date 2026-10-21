@@ -168,7 +168,10 @@ public:
     RPNElements && extractRPN() &&;
 
 private:
-    void traverseTree(const RPNBuilderTreeNode & node);
+    /// Appends the elements of `node` and returns whether it appended any. The operands of a nested `and` or `or` under the
+    /// same operator join `parent_operands`, the operands of the outermost one.
+    bool traverseTree(const RPNBuilderTreeNode & node, std::optional<decltype(RPNElement::function)> parent_operator = {},
+        std::vector<const ActionsDAG::Node *> * parent_operands = nullptr);
     bool extractLogicalOperatorFromTree(const RPNBuilderFunctionTreeNode & function_node, RPNElement & out);
     const ExtractAtomFromTreeFunction & extract_atom_from_tree_function;
     RPNElements rpn_elements;
