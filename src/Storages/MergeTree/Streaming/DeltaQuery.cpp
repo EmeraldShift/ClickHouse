@@ -1000,7 +1000,11 @@ void bindTerm(IAST & ast, std::optional<Int64> sign, std::optional<Int64> time)
         const auto * identifier = child->as<ASTIdentifier>();
         const auto * function = child->as<ASTFunction>();
         if (sign && identifier && identifier->name() == term_sign_name)
-            child = make_intrusive<ASTLiteral>(Field(*sign));
+        {
+            auto literal = make_intrusive<ASTLiteral>(Field(*sign));
+            literal->setAlias(identifier->tryGetAlias());
+            child = std::move(literal);
+        }
         else if (time && function && function->name == "now")
             child = makeASTFunction("toDateTime", make_intrusive<ASTLiteral>(Field(static_cast<UInt64>(*time))));
         else
@@ -2752,6 +2756,55 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
     auto terms = make_intrusive<ASTExpressionList>();
     bool has_pairs = false;
 
+    /// The delta of a query with aggregates is the sum of the aggregates over the rows of all its terms. So each term returns
+    /// the identifiers that the aggregates and the keys read, and one aggregation over the union of the terms computes the
+    /// delta. Planning then builds the aggregates once instead of once per term.
+    ASTPtr outer;
+    ASTs term_columns;
+    if (select.groupBy() || std::ranges::any_of(select.select()->children, [](const auto & column) { return isAggregate(*column); }))
+    {
+        outer = select.clone();
+        auto & outer_select = outer->as<ASTSelectQuery &>();
+        outer_select.setExpression(ASTSelectQuery::Expression::WHERE, nullptr);
+        outer_select.setExpression(ASTSelectQuery::Expression::PREWHERE, nullptr);
+        std::map<String, String> names;
+        auto rename = [&](const ASTPtr & node) -> ASTPtr
+        {
+            if (node->as<ASTSubquery>())
+                return node->clone();
+            const auto * identifier = node->as<ASTIdentifier>();
+            if (!identifier)
+                return nullptr;
+            auto [it, inserted] = names.try_emplace(identifier->name(), fmt::format("__delta_column_{}", names.size()));
+            if (inserted)
+            {
+                auto column = node->clone();
+                column->setAlias(it->second);
+                term_columns.push_back(std::move(column));
+            }
+            auto renamed = make_intrusive<ASTIdentifier>(it->second);
+            renamed->setAlias(node->tryGetAlias());
+            return renamed;
+        };
+        std::multiset<String> lambda_parameters;
+        for (const auto & list : {outer_select.select(), outer_select.groupBy()})
+            if (list)
+                for (auto & child : list->children)
+                    visitExpression(child, *list, rename, lambda_parameters);
+    }
+    /// Makes `term` return the columns that the aggregation reads.
+    auto set_term_columns = [&](ASTSelectQuery & term)
+    {
+        if (!outer)
+            return;
+        auto columns = make_intrusive<ASTExpressionList>();
+        columns->children = cloneAll(term_columns);
+        if (columns->children.empty())
+            columns->children.push_back(make_intrusive<ASTLiteral>(Field(UInt8{1})));
+        term.setExpression(ASTSelectQuery::Expression::SELECT, std::move(columns));
+        term.setExpression(ASTSelectQuery::Expression::GROUP_BY, nullptr);
+    };
+
     /// The rows of an input that a term reads: the rows below old as of old, below new as of new, in [old, new) as of new, and
     /// below old as of new.
     enum class Rows : uint8_t { Old, New, Delta, Prior };
@@ -2836,6 +2889,7 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         for (size_t j = 0; j < inputs.size(); ++j)
             setInput(term_select, inputs[j], table_at(j, rows[j]), std::move(conjuncts[j]), where, sign_column);
         term_select.setExpression(ASTSelectQuery::Expression::WHERE, makeConjunction(std::move(where)));
+        set_term_columns(term_select);
         bindTerm(*term, sign, time);
         terms->children.push_back(std::move(term));
     };
@@ -2914,6 +2968,7 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
     {
         auto term = select.clone();
         term->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::WHERE, make_intrusive<ASTLiteral>(Field(UInt8{0})));
+        set_term_columns(term->as<ASTSelectQuery &>());
         bindTerm(*term, 1, new_time);
         terms->children.push_back(std::move(term));
     }
@@ -2923,6 +2978,13 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
     result->is_normalized = true;
     result->list_of_selects = terms;
     result->children.push_back(terms);
+    if (outer)
+    {
+        auto from = parseSelect(fmt::format("SELECT * FROM ({})", result->formatWithSecretsOneLine()));
+        outer->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::TABLES,
+            from->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>().tables()->clone());
+        return makeSelectWithUnion(std::move(outer));
+    }
     if (!has_pairs || consolidated_columns.empty())
         return result;
     Strings columns;
