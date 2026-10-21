@@ -285,24 +285,25 @@ std::optional<AggregationAnalysisResult> analyzeAggregation(
         }
     }
 
-    /// Add expressions from aggregate functions arguments
+    /// Add expressions from aggregate functions arguments. Each visit indexes every node of the DAG, so one visit of all the
+    /// arguments keeps the cost linear in the number of aggregates.
 
+    auto aggregate_function_arguments = std::make_shared<ListNode>();
     for (auto & aggregate_function_node : aggregate_function_nodes)
     {
         auto & aggregate_function_node_typed = aggregate_function_node->as<FunctionNode &>();
         for (const auto & aggregate_function_node_argument : aggregate_function_node_typed.getArguments().getNodes())
-        {
-            auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_aggregation_actions->dag, aggregate_function_node_argument);
-            correlated_subtrees.assertEmpty("in aggregate function argument");
-            for (auto & expression_dag_node : expression_dag_nodes)
-            {
-                if (before_aggregation_actions_output_node_names.contains(expression_dag_node->result_name))
-                    continue;
+            aggregate_function_arguments->getNodes().push_back(aggregate_function_node_argument);
+    }
+    auto [expression_dag_nodes, correlated_subtrees] = actions_visitor.visit(before_aggregation_actions->dag, aggregate_function_arguments);
+    correlated_subtrees.assertEmpty("in aggregate function argument");
+    for (auto & expression_dag_node : expression_dag_nodes)
+    {
+        if (before_aggregation_actions_output_node_names.contains(expression_dag_node->result_name))
+            continue;
 
-                before_aggregation_actions->dag.getOutputs().push_back(expression_dag_node);
-                before_aggregation_actions_output_node_names.insert(expression_dag_node->result_name);
-            }
-        }
+        before_aggregation_actions->dag.getOutputs().push_back(expression_dag_node);
+        before_aggregation_actions_output_node_names.insert(expression_dag_node->result_name);
     }
 
     if (aggregation_keys.empty() && aggregates_descriptions.empty() && grouping_sets_parameters_list.empty())
