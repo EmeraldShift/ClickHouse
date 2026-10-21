@@ -2889,6 +2889,10 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         for (size_t j = 0; j < inputs.size(); ++j)
             setInput(term_select, inputs[j], table_at(j, rows[j]), std::move(conjuncts[j]), where, sign_column);
         term_select.setExpression(ASTSelectQuery::Expression::WHERE, makeConjunction(std::move(where)));
+        /// The reduction already filters each input by the keys that can join. A runtime filter of a join would probe every
+        /// row read a second time.
+        if (from)
+            setSetting(term_select, "enable_join_runtime_filters", false);
         set_term_columns(term_select);
         bindTerm(*term, sign, time);
         terms->children.push_back(std::move(term));

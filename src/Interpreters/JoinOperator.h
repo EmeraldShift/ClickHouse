@@ -130,6 +130,8 @@ struct JoinSettings
     bool enable_join_fixed_hash_table_conversion;
     bool enable_join_key_only_hash_tables;
     bool join_runtime_filter_from_fixed_hash_table;
+    /// The setting of the query that plans the join. A subquery can set it in its own SETTINGS.
+    bool enable_join_runtime_filters;
 
     /// Which statistics the join must collect for EXPLAIN ANALYZE
     JoinAnalyzeMode join_analyze_mode = JoinAnalyzeMode::None;

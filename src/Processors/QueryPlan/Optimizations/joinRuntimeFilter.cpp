@@ -311,6 +311,8 @@ bool tryAddJoinRuntimeFilter(QueryPlan::Node & node, QueryPlan::Nodes & nodes, c
     /// Check if join can do runtime filtering on left table
     const auto & join_operator = join_step->getJoinOperator();
     auto & join_settings = join_step->getJoinSettings();
+    if (!join_settings.enable_join_runtime_filters)
+        return false;
     auto & join_algorithms = join_settings.join_algorithms;
     /// Decided on the list as the user gave it, before it is cut down below.
     const bool can_run_grace_hash = join_settings.canRunGraceHash();
