@@ -203,6 +203,7 @@ namespace Setting
     extern const SettingsOverflowMode join_overflow_mode;
     extern const SettingsString log_comment;
     extern const SettingsBool log_formatted_queries;
+    extern const SettingsBool log_processors_profiles;
     extern const SettingsBool log_profile_events;
     extern const SettingsUInt64 log_queries_cut_to_length;
     extern const SettingsBool log_queries;
@@ -754,7 +755,8 @@ static ResultProgress flushQueryProgress(const QueryPipeline & pipeline, bool pu
     return res;
 }
 
-static QueryPipelineFinalizedInfo finalizeQueryPipelineBeforeLogging(QueryPipeline && query_pipeline, QueryResultCacheUsage /*query_result_cache_usage*/, bool pulling_pipeline)
+static QueryPipelineFinalizedInfo finalizeQueryPipelineBeforeLogging(
+    QueryPipeline && query_pipeline, QueryResultCacheUsage /*query_result_cache_usage*/, bool pulling_pipeline, bool log_processors_profiles)
 {
     /// Trigger the actual write of the buffered query result into the query result cache. This is done explicitly to
     /// prevent partial/garbage results in case of exceptions during query execution.
@@ -762,12 +764,18 @@ static QueryPipelineFinalizedInfo finalizeQueryPipelineBeforeLogging(QueryPipeli
     /// opted in to caching via explicit SETTINGS use_query_cache = true even when the outer query doesn't use the cache.
     query_pipeline.finalizeWriteInQueryResultCache();
 
-    VectorWithMemoryTracking<ProcessorsProfileLogInfo> processors_profile_infos = getProcessorsProfileLogInfo(query_pipeline.getProcessors());
-
+    /// The profiles and the dump of the pipeline take time in proportion to the processors. Only the processors profile log
+    /// reads the profiles, and only its test logging reads the dump.
+    VectorWithMemoryTracking<ProcessorsProfileLogInfo> processors_profile_infos;
     String pipeline_dump;
+    if (log_processors_profiles)
     {
-        WriteBufferFromString out(pipeline_dump);
-        printPipeline(query_pipeline.getProcessors(), out, true);
+        processors_profile_infos = getProcessorsProfileLogInfo(query_pipeline.getProcessors());
+        if (getLogger("ProcessorProfileLog")->is(Poco::Message::PRIO_TEST))
+        {
+            WriteBufferFromString out(pipeline_dump);
+            printPipeline(query_pipeline.getProcessors(), out, true);
+        }
     }
 
     std::optional<ResultProgress> result_progress;
@@ -926,7 +934,8 @@ void logQueryFinish(
     bool log_as_internal)
 {
     const auto time_now = std::chrono::system_clock::now();
-    auto query_pipeline_finalized_info = finalizeQueryPipelineBeforeLogging(std::move(query_pipeline), query_result_cache_usage, pulling_pipeline);
+    auto query_pipeline_finalized_info = finalizeQueryPipelineBeforeLogging(std::move(query_pipeline), query_result_cache_usage, pulling_pipeline,
+        context->getSettingsRef()[Setting::log_processors_profiles]);
     logQueryFinishImpl(elem, context, query_ast, query_pipeline_finalized_info, pulling_pipeline, query_span, query_result_cache_usage, internal, log_as_internal, time_now);
 }
 
@@ -3501,9 +3510,12 @@ static BlockIO executeQueryImpl(
             auto finish_callback_finalize_pipeline = [
                                      query_result_cache_usage,
                                      // Need to be cached, since will be changed after complete()
-                                     pulling_pipeline = pipeline.pulling()](QueryPipeline && query_pipeline) mutable -> QueryPipelineFinalizedInfo
+                                     pulling_pipeline = pipeline.pulling(),
+                                     log_processors_profiles = context->getSettingsRef()[Setting::log_processors_profiles].value](
+                                     QueryPipeline && query_pipeline) mutable -> QueryPipelineFinalizedInfo
             {
-                return finalizeQueryPipelineBeforeLogging(std::move(query_pipeline), query_result_cache_usage, pulling_pipeline);
+                return finalizeQueryPipelineBeforeLogging(std::move(query_pipeline), query_result_cache_usage, pulling_pipeline,
+                    log_processors_profiles);
             };
 
             /// The finish callback logs the query result
