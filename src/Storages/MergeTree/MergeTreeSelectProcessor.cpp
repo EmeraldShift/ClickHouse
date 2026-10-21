@@ -215,13 +215,14 @@ MergeTreeSelectProcessor::MergeTreeSelectProcessor(
     const MergeTreeReaderSettings & reader_settings_,
     MergeTreeIndexBuildContextPtr merge_tree_index_build_context_,
     LazyMaterializingRowsPtr lazy_materializing_rows_,
-    const ColumnsDescription * columns_)
+    const ColumnsDescription * columns_,
+    std::optional<PrewhereExprInfo> prewhere_actions_)
     : pool(std::move(pool_))
     , algorithm(std::move(algorithm_))
     , row_level_filter(row_level_filter_)
     , prewhere_info(prewhere_info_)
     , actions_settings(actions_settings_)
-    , prewhere_actions(getPrewhereActions(
+    , prewhere_actions(prewhere_actions_ ? std::move(*prewhere_actions_) : getPrewhereActions(
           row_level_filter,
           prewhere_info,
           index_read_tasks_,

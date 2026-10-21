@@ -128,7 +128,9 @@ public:
         const MergeTreeReaderSettings & reader_settings_,
         MergeTreeIndexBuildContextPtr merge_tree_index_build_context_ = {},
         LazyMaterializingRowsPtr lazy_materializing_rows_ = {},
-        const ColumnsDescription * columns_ = nullptr);
+        const ColumnsDescription * columns_ = nullptr,
+        /// The result of getPrewhereActions for these arguments, if the caller has it.
+        std::optional<PrewhereExprInfo> prewhere_actions_ = {});
 
     String getName() const;
     std::span<ISpillable * const> getSpillables() const { return set_spillables.get(); }

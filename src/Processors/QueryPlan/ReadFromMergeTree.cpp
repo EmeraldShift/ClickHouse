@@ -654,6 +654,19 @@ static MergeTreeReadRangesRefinerPtr createIndexReadRangesRefiner(
     return std::make_shared<IndexReadRangesRefiner>(index_build_context, metadata_snapshot);
 }
 
+PrewhereExprInfo ReadFromMergeTree::getPrewhereActions() const
+{
+    return MergeTreeSelectProcessor::getPrewhereActions(
+        query_info.row_level_filter,
+        query_info.prewhere_info,
+        index_read_tasks,
+        actions_settings,
+        reader_settings.enable_multiple_prewhere_read_steps,
+        reader_settings.force_short_circuit_execution,
+        reader_settings.read_ahead_prewhere_columns,
+        &storage_snapshot->metadata->getColumns());
+}
+
 Pipe ReadFromMergeTree::readFromPoolParallelReplicas(
     RangesInDataParts parts_with_range,
     const MergeTreeIndexBuildContextPtr & index_build_context,
@@ -706,6 +719,7 @@ Pipe ReadFromMergeTree::readFromPoolParallelReplicas(
         pool->getMarkSegmentSize(),
         pool->getMinMarksPerRequest());
 
+    const auto prewhere_actions = getPrewhereActions();
     Pipes pipes;
 
     for (size_t i = 0; i < pool_settings.threads; ++i)
@@ -722,7 +736,8 @@ Pipe ReadFromMergeTree::readFromPoolParallelReplicas(
             reader_settings,
             index_build_context,
             lazy_materializing_rows,
-            &storage_snapshot->metadata->getColumns());
+            &storage_snapshot->metadata->getColumns(),
+            prewhere_actions);
 
         auto source = std::make_shared<MergeTreeSource>(std::move(processor), data.getLogName());
 
@@ -842,6 +857,7 @@ Pipe ReadFromMergeTree::readFromPool(
     /// so nothing is read until the build side of the JOIN completes its runtime filter.
     /// One seal is copied to every stream; the copy input is registered on the pipe as
     /// pending and is connected by the join pipeline wiring.
+    const auto prewhere_actions = getPrewhereActions();
     if (seal_gate_refiner)
     {
         auto seal_header = std::make_shared<const Block>(Block{});
@@ -863,7 +879,8 @@ Pipe ReadFromMergeTree::readFromPool(
                 reader_settings,
                 index_build_context,
                 lazy_materializing_rows,
-                &storage_snapshot->metadata->getColumns());
+                &storage_snapshot->metadata->getColumns(),
+                prewhere_actions);
 
             auto header = std::make_shared<const Block>(processor->getHeader());
             auto transform = std::make_shared<SealGatedReadTransform>(header, std::move(processor), seal_gate_refiner, data.getLogName());
@@ -899,7 +916,8 @@ Pipe ReadFromMergeTree::readFromPool(
             reader_settings,
             index_build_context,
             lazy_materializing_rows,
-            &storage_snapshot->metadata->getColumns());
+            &storage_snapshot->metadata->getColumns(),
+            prewhere_actions);
 
         auto source = std::make_shared<MergeTreeSource>(std::move(processor), data.getLogName());
 
@@ -1039,6 +1057,7 @@ Pipe ReadFromMergeTree::readInOrder(
     const UInt64 in_order_limit = query_info.input_order_info ? query_info.input_order_info->limit : 0;
     const bool set_total_rows_approx = !is_parallel_reading_from_replicas || isParallelReplicasLocalPlanForInitiator();
 
+    const auto prewhere_actions = getPrewhereActions();
     Pipes pipes;
     for (size_t i = 0; i < parts_with_ranges.size(); ++i)
     {
@@ -1085,7 +1104,8 @@ Pipe ReadFromMergeTree::readInOrder(
             reader_settings,
             index_build_context,
             lazy_materializing_rows,
-            &storage_snapshot->metadata->getColumns());
+            &storage_snapshot->metadata->getColumns(),
+            prewhere_actions);
 
         processor->addPartLevelToChunk(isQueryWithFinal());
 

@@ -123,6 +123,7 @@ bool dependsOnItsBlock(const ActionsDAG & actions);
 }
 
 struct LazyMaterializingRows;
+struct PrewhereExprInfo;
 using LazyMaterializingRowsPtr = std::shared_ptr<LazyMaterializingRows>;
 
 /// `DistributedReadBucket` and `buildDistributedFinalPipe` live in `MergeTreeFinalMerge.h`.
@@ -818,6 +819,9 @@ private:
         size_t max_streams,
         size_t min_marks_for_concurrent_read,
         bool use_uncompressed_cache);
+
+    /// The PREWHERE steps that the processors of one read share.
+    PrewhereExprInfo getPrewhereActions() const;
 
     Pipe readFromPool(
         RangesInDataParts parts_with_range,
