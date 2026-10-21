@@ -171,9 +171,7 @@ public:
 
     static FunctionPtr create(ContextPtr) { return std::make_shared<FunctionMergeTreePartInfo>(); }
 
-    /// A filter by the part of a row reads `_part` as a LowCardinality column with one value per part, so parsing the
-    /// dictionary instead of every row parses each part name once.
-    bool useDefaultImplementationForConstants() const override { return true; }
+    bool useDefaultImplementationForLowCardinalityColumns() const override { return false; }
     bool useDefaultImplementationForSparseColumns() const override { return false; }
     bool isSuitableForShortCircuitArgumentsExecution(const DataTypesWithConstInfo &) const override { return false; }
     size_t getNumberOfArguments() const override { return 1; }

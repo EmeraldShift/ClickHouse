@@ -951,8 +951,8 @@ ASTPtr makeBound(const String & qualifier, const std::map<String, Int64> & parti
 }
 
 /// Conjuncts that keep the rows of an input with `lower` <= `_block_number` < `upper`, where a null `lower` keeps every row
-/// below `upper`. The conjuncts on `mergeTreePartInfo(_part)` depend only on the part, so they skip the parts outside the
-/// bounds before reading them.
+/// below `upper`. The `indexHint` on `mergeTreePartInfo(_part)` skips the parts outside the bounds before reading them.
+/// Rows don't evaluate it.
 void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
     const std::map<String, Int64> & upper)
 {
@@ -961,13 +961,14 @@ void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String
         return makeASTFunction("tupleElement",
             makeASTFunction("mergeTreePartInfo", makeColumn(qualifier, "_part")), make_intrusive<ASTLiteral>(field));
     };
+    ASTs part_bounds{makeASTFunction("less", part_block("min_block"), makeBound(qualifier, upper))};
     conjuncts.push_back(makeASTFunction("less", makeColumn(qualifier, "_block_number"), makeBound(qualifier, upper)));
-    conjuncts.push_back(makeASTFunction("less", part_block("min_block"), makeBound(qualifier, upper)));
     if (lower)
     {
         conjuncts.push_back(makeASTFunction("greaterOrEquals", makeColumn(qualifier, "_block_number"), makeBound(qualifier, *lower)));
-        conjuncts.push_back(makeASTFunction("greaterOrEquals", part_block("max_block"), makeBound(qualifier, *lower)));
+        part_bounds.push_back(makeASTFunction("greaterOrEquals", part_block("max_block"), makeBound(qualifier, *lower)));
     }
+    conjuncts.push_back(makeASTFunction("indexHint", std::move(part_bounds)));
 }
 
 /// `c_1 AND ...`, or `1` without conjuncts.
