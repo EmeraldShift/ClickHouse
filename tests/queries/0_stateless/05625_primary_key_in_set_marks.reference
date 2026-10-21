@@ -1,0 +1,20 @@
+k IN values	10	207
+k IN values	10	207
+k IN subquery	15	645
+k IN subquery	15	645
+(k, x) IN	3	54
+(k, x) IN	3	54
+AND	6	318
+AND	6	318
+OR	7	303
+OR	7	303
+NOT	94	4746
+NOT	94	4746
+Parts: 1 | Granules: 5
+Granules: 5/25
+Parts: 1 | Granules: 6
+Granules: 6/25
+Parts: 1 | Granules: 3
+Granules: 3/25
+Parts: 1 | Granules: 25
+Granules: 25/25

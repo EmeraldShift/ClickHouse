@@ -7568,6 +7568,42 @@ bool KeyCondition::extractPlainRanges(Ranges & ranges) const
 ///
 /// We return `Ranges` (a union of intervals), because bounds may be disjoint:
 /// `x != 5` => (-Inf, 4] OR [6, +Inf). See `KeyCondition::extractBounds()` docs in `KeyCondition.h` for examples.
+ColumnPtr KeyCondition::getFirstKeyColumnSetValues() const
+{
+    /// The values that the subexpression of each element of the stack implies.
+    std::vector<ColumnPtr> stack;
+    for (const auto & element : rpn)
+    {
+        if (element.function == RPNElement::FUNCTION_AND)
+        {
+            auto right = std::move(stack.back());
+            stack.pop_back();
+            if (!stack.back())
+                stack.back() = std::move(right);
+        }
+        else if (element.function == RPNElement::FUNCTION_OR)
+        {
+            stack.pop_back();
+            stack.back() = nullptr;
+        }
+        else if (element.function == RPNElement::FUNCTION_NOT)
+            stack.back() = nullptr;
+        else
+        {
+            ColumnPtr values;
+            if (element.function == RPNElement::FUNCTION_IN_SET && element.set_index)
+            {
+                const auto & mapping = element.set_index->getIndexesMapping();
+                /// The set is sorted by the key columns in the order of the mapping.
+                if (!mapping.empty() && mapping[0].key_index == 0 && mapping[0].functions.empty())
+                    values = element.set_index->getOrderedSet()[0];
+            }
+            stack.push_back(std::move(values));
+        }
+    }
+    return stack.size() == 1 ? stack[0] : nullptr;
+}
+
 Ranges KeyCondition::extractBounds() const
 {
     /// We only support single column

@@ -217,6 +217,65 @@ size_t MergeTreeDataSelectExecutor::getApproximateTotalRowsToRead(
 
 using RelativeSize = boost::rational<ASTSampleRatio::BigNum>;
 
+/// The marks of `part_ranges` whose keys can include one of `values`, given the first key column `index` of the primary
+/// index, with one row per mark. Mark m holds the keys from index[m] to index[m + 1], and the last mark the keys from its
+/// row on. Both columns are sorted.
+static MarkRanges marksWithFirstKeyColumnValues(const IColumn & index, const IColumn & values, const MarkRanges & part_ranges)
+{
+    const size_t marks_count = index.size();
+    MarkRanges marks;
+    /// The bounds only grow from one value to the next. So each search gallops from the previous bound, and the searches
+    /// cost O(n log(marks / n)) comparisons for n values.
+    size_t first_not_below = 0;
+    size_t end = 0;
+    for (size_t i = 0; i < values.size(); ++i)
+    {
+        /// The first mark from `from` on whose row isn't `below` the value.
+        auto bound = [&](size_t from, auto below)
+        {
+            auto is_below = [&](size_t mark) { return below(index.compareAt(mark, i, values, 1)); };
+            if (from == marks_count || !is_below(from))
+                return from;
+            size_t low = from + 1;
+            size_t high = from + 1;
+            for (size_t step = 1; high < marks_count && is_below(high); step *= 2)
+            {
+                low = high + 1;
+                high = std::min(marks_count, from + 2 * step);
+            }
+            while (low < high)
+            {
+                size_t mark = low + (high - low) / 2;
+                if (is_below(mark))
+                    low = mark + 1;
+                else
+                    high = mark;
+            }
+            return low;
+        };
+        first_not_below = bound(first_not_below, [](int cmp) { return cmp < 0; });
+        end = bound(std::max(end, first_not_below), [](int cmp) { return cmp <= 0; });
+        const size_t begin = first_not_below == 0 ? 0 : first_not_below - 1;
+        if (begin >= end)
+            continue;
+        if (!marks.empty() && begin <= marks.back().end)
+            marks.back().end = std::max(marks.back().end, end);
+        else
+            marks.emplace_back(begin, end);
+    }
+
+    MarkRanges result;
+    auto it = marks.begin();
+    for (const auto & range : part_ranges)
+    {
+        while (it != marks.end() && it->end <= range.begin)
+            ++it;
+        for (auto jt = it; jt != marks.end() && jt->begin < range.end; ++jt)
+            result.emplace_back(std::max(jt->begin, range.begin), std::min(jt->end, range.end));
+    }
+    return result;
+}
+
 static std::string toString(const RelativeSize & x)
 {
     return ASTSampleRatio::toString(x.numerator()) + "/" + ASTSampleRatio::toString(x.denominator());
@@ -2730,10 +2789,24 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
         GenericExclusionSearchResult search_result;
         std::list<KeyCondition> substituted_conditions;
 
+        /// If the condition requires the first key column to be in a set, then the search starts from the marks that can
+        /// hold an element of the set. A binary search per element finds them, which costs much less than checking the
+        /// set against every range that the search would split.
+        MarkRanges set_marks;
+        const MarkRanges * initial_ranges = &part_ranges;
+        if (key_condition_useful && !index->empty() && (*index)[0]->size() == marks_count && !key_order.isReversed(0))
+        {
+            if (auto values = key_condition.getFirstKeyColumnSetValues(); values && (*index)[0]->structureEquals(*values))
+            {
+                set_marks = marksWithFirstKeyColumnValues(*(*index)[0], *values, part_ranges);
+                initial_ranges = &set_marks;
+            }
+        }
+
         if (exact_ranges)
         {
             search_result = genericExclusionSearch(
-                part_ranges,
+                *initial_ranges,
                 [&](const MarkRange & mark_range) { return check_in_range(mark_range, BoolMask()); },
                 search_settings,
                 /*collect_exact_ranges=*/ true);
@@ -2763,7 +2836,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
             }
 
             search_result = genericExclusionSearch(
-                part_ranges,
+                *initial_ranges,
                 [&](const MarkRange & mark_range) { return check_in_range(mark_range, BoolMask()); },
                 search_settings,
                 /*collect_exact_ranges=*/ false);

@@ -318,6 +318,10 @@ public:
     ///  - `(x < 10 AND x % 2 = 0) OR (x < 20 AND x % 3 = 0)` -> { "(-Inf, +Inf)" } (no partial extraction across OR branches)
     Ranges extractBounds() const;
 
+    /// The sorted values of the first key column in the set of a top-level conjunct `k IN set`, where k is the first key
+    /// column without functions, or nullptr. Every row that satisfies the condition has its first key column in them.
+    ColumnPtr getFirstKeyColumnSetValues() const;
+
     /// The expression is stored as Reverse Polish Notation.
     struct RPNElement
     {
