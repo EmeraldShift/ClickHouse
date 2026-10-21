@@ -24,20 +24,20 @@ class IMergeTreeDataPart;
 using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 using DataPartsVector = std::vector<DataPartPtr>;
 
-/// Evaluates a SELECT over MergeTree tables on the rows inserted between two cursors. The delta of a query over one table
-/// is the query over the new rows of the table. The delta of a query that reads several tables has one term per table
-/// occurrence, which joins the new rows of that occurrence with the rows of the others. Such a query must be linear, so
-/// that merging the deltas over a chain of cursors gives the query evaluated at the last cursor.
+/// Evaluates a SELECT over MergeTree tables on the rows inserted between two cursors. The delta of a query has one term per
+/// table occurrence. The term joins the new rows of that occurrence with the rows of the others. The query must be linear.
+/// Then merging the deltas over a chain of cursors gives the query evaluated at the last cursor.
 ///
-/// With `delta_query_sign_column`, each input that has that column is signed. A row of a signed input with sign 1 inserts
-/// the row, and a row with sign -1 retracts an earlier row with the same values. The weight of a joined row is the product
-/// of the signs of its signed inputs. A query without aggregates returns the weight of each row as that column. A query
-/// with aggregates weighs its rows in its aggregates. The deltas merge like the deltas of a join.
+/// The deltas weigh their rows by a sign. With `delta_query_sign_column`, each input that has that column is signed. A row
+/// of a signed input with sign 1 inserts the row, and a row with sign -1 retracts an earlier row with the same values. The
+/// weight of a joined row is the product of the signs of its signed inputs. A query without aggregates returns the weight
+/// of each row as that column. A query with aggregates weighs its rows in its aggregates. Without the setting, the sign
+/// column has an internal name. A query whose rows then have a sign can't have a target, see `checkResultSign`.
 ///
 /// A query can also have LEFT, SEMI, ANTI and ASOF joins of a table, and filters by now() in WHERE. Their deltas retract
-/// rows, so they need `delta_query_sign_column`. See `buildDelta`.
+/// rows. See `buildDelta`.
 ///
-/// With `delta_query_sign_column`, a query can also have a residual: the clauses whose result over the union of the deltas
+/// A query can also have a residual: the clauses whose result over the union of the deltas
 /// differs from the union of their results, like HAVING, ORDER BY with LIMIT, LIMIT BY, DISTINCT, window functions,
 /// expressions over aggregates and aggregates like `uniq`. The query then splits into a linear core and the residual. The
 /// core groups the rows by keys, which are the GROUP BY keys or else the columns that the residual reads, and its deltas
@@ -162,8 +162,16 @@ public:
     /// The columns of the rows that the deltas insert into a target, see `getQuery`.
     NamesAndTypesList getResultColumns() const;
 
+    /// Throws if the rows of the query have a sign without `delta_query_sign_column`. Without the setting, the deltas weigh
+    /// their rows by a sign column of an internal name, and a target can't have that column.
+    void checkResultSign() const;
+
     /// The columns of the stage table of this stage, see `getStageCreateQuery`.
     NamesAndTypesList getStageColumns() const;
+
+    /// Whether a row of the deltas can have a sign other than 1. A residual retracts rows, and so do signed inputs, LEFT,
+    /// SEMI and ANTI joins, filters by now() and lightweight updates.
+    bool retractsRows() const { return residual || recursion || has_signs; }
 
     /// The entries of `tree` for the inputs of this query, and its time.
     CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
@@ -197,6 +205,8 @@ private:
     std::vector<Stage> stages;
     /// Whether this query is a stage, see `Stage`.
     bool is_stage = false;
+    /// Whether the rows of the deltas have a sign other than 1, see `retractsRows`.
+    bool has_signs = false;
     String sign_column;
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;

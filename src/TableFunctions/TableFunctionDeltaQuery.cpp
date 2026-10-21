@@ -95,8 +95,9 @@ void checkNoResidual(const DeltaQuery & query)
 {
     if (query.hasResidual())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "Table function deltaQuery does not support HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates "
-            "with delta_query_sign_column. Incremental refreshable materialized views support them");
+            "Table function deltaQuery does not support HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates. "
+            "Incremental refreshable materialized views support them");
+    query.checkResultSign();
 }
 
 class TableFunctionDeltaQuery : public TableFunctionDeltaQueryBase
@@ -365,19 +366,18 @@ void registerTableFunctionDeltaQuery(TableFunctionFactory & factory)
     factory.registerFunction<TableFunctionDeltaQuery>({.description = R"DOCS_MD(
 Returns the rows that a query gains from the blocks inserted between two cursors.
 
-`deltaQuery(query, old_cursor, new_cursor)` runs `query` over the rows with `_block_number` from `old_cursor` up to `new_cursor`. A query
-over one table runs over the new rows of the table. A query that joins tables runs once per table occurrence, over the new rows of that
-occurrence joined with the rows of the occurrences before it as of `old_cursor` and of the occurrences after it as of `new_cursor`.
-Merging the results of a join query over a chain of cursors gives the query evaluated at the last cursor. Its aggregates are partial and
-merge like `SummingMergeTree` or `AggregatingMergeTree`.
+`deltaQuery(query, old_cursor, new_cursor)` runs `query` over the rows with `_block_number` from `old_cursor` up to `new_cursor`. The
+query runs once per table occurrence, over the new rows of that occurrence joined with the rows of the occurrences before it as of
+`old_cursor` and of the occurrences after it as of `new_cursor`. Merging the results over a chain of cursors gives the query evaluated
+at the last cursor. Its aggregates are partial and merge like `SummingMergeTree` or `AggregatingMergeTree`.
 
 A cursor has type `Map(String, Int64)`. Each key is a path `table_uuid.partition_id.block_number`, and its value is the first block number
 of the partition that the cursor excludes. An empty map is the cursor before any insert. Get the current cursor with `deltaQueryFrontier`.
 
-The tables must be `MergeTree` or `ReplicatedMergeTree` tables of Atomic databases with `enable_block_number_column = 1`. A query that joins tables may use filters, `INNER` and `CROSS` joins, and `GROUP BY`. With `delta_query_sign_column`
-it may also use `LEFT`, `SEMI`, `ANTI` and `ASOF` joins of a table by `ON` with an equality of columns, and filters by `now()` in `WHERE`
-over the columns of one table. Their deltas retract rows. The cursors of a query with `now()` have the key `now`, the time of the
-snapshot.
+The tables must be `MergeTree` or `ReplicatedMergeTree` tables of Atomic databases with `enable_block_number_column = 1`. A query may use
+filters, `INNER` and `CROSS` joins, `GROUP BY`, `LEFT`, `SEMI`, `ANTI` and `ASOF` joins of a table by `ON` with an equality of
+columns, and filters by `now()` in `WHERE` over the columns of one table. Their deltas retract rows. The cursors of a query
+with `now()` have the key `now`, the time of the snapshot.
 
 The delta of a join reads each input other than the new rows by its join key, with `key IN (subquery)`. That read takes a range of
 the primary key if the sorting key of the input starts with the join key, or if the input has a commit-order projection like
@@ -395,15 +395,14 @@ of sign -1 retracts an earlier row with the same values. A query without aggrega
 as a column of that name, for a `CollapsingMergeTree` target. A query with aggregates over signed tables supports only `count`, `sum`, their
 `-If` forms and `exponentialMovingAverageState`. The moving average of a group is as of the latest time of any of its rows,
 including retracted rows. The deltas sum to the result over the rows that remain, for a `SummingMergeTree`
-target. A query
-over one table then follows the rules of a query that joins tables.
-`deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows, expressions over aggregates or other aggregates with the
-setting. Incremental refreshable materialized views support them.
+target. Without the setting, the delta of a query whose rows retract throws `BAD_ARGUMENTS`, because its rows have no sign column.
+`deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows or expressions over aggregates. Over
+rows that retract, it supports only the aggregates above. Incremental refreshable materialized views support them.
 
 A lightweight update of a `MergeTree` table takes a block number, and the table as of a cursor has the updates below the cursor. A query
-with `delta_query_sign_column` reads the lightweight updates of the tables with `enable_block_offset_column = 1`, and of lightweight
+reads the lightweight updates of the tables with `enable_block_offset_column = 1`, and of lightweight
 deletes with `lightweight_delete_mode = 'lightweight_update'`. The delta retracts each row that the updates between the cursors change,
-as of `old_cursor`, and inserts it as of `new_cursor`. A query without the setting throws `NOT_IMPLEMENTED` for such updates. The
+as of `old_cursor`, and inserts it as of `new_cursor`. The
 tables of `ReplicatedMergeTree` don't support them. A merge that writes later updates into the rows below a cursor, or a mutation above
 the cursor, loses the table as of the cursor, and the delta throws `DELTA_QUERY_HISTORY_LOST`. The delta throws `UNFINISHED` until
 the mutations below its cursors are done.

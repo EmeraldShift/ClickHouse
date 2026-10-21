@@ -11,11 +11,11 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 $CLICKHOUSE_CLIENT -q "
     CREATE TABLE orders (id UInt64, product String, qty Int64, note Nullable(String), sign Int8)
-        ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE quotes (order_id UInt64, price Int64, t UInt32, sign Int8)
-        ENGINE = MergeTree ORDER BY order_id SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY order_id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE products (product String, category String)
-        ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 
     CREATE TABLE cursors (query UInt8, round UInt8, cursor Map(String, Int64)) ENGINE = MergeTree ORDER BY (query, round);
     CREATE TABLE revenue (category String, revenue Int64, n Int64, noted Int64, expensive Int64, expensive_qty Int64)
@@ -126,7 +126,7 @@ $CLICKHOUSE_CLIENT -q "$(q3 "$NET_ORDERS")"
 # A weighted sum of UInt64 values is an Int128, which holds sums above the maximum Int64.
 echo "Sum of UInt64"
 $CLICKHOUSE_CLIENT -q "
-    CREATE TABLE big (u UInt64, sign Int8) ENGINE = MergeTree ORDER BY u SETTINGS enable_block_number_column = 1;
+    CREATE TABLE big (u UInt64, sign Int8) ENGINE = MergeTree ORDER BY u SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     INSERT INTO big VALUES (9223372036854775808, 1), (1, 1), (5, 1), (5, -1);
     SELECT s, toTypeName(s) FROM deltaQuery((SELECT sum(u) AS s FROM big $S), map(),
         (SELECT cursor FROM deltaQueryFrontier((SELECT sum(u) FROM big $S))));"
@@ -136,7 +136,7 @@ $CLICKHOUSE_CLIENT -q "
 # recomputed one.
 echo "Maintained and recomputed moving averages"
 $CLICKHOUSE_CLIENT -q "
-    CREATE TABLE samples (g UInt8, v Float64, t UInt32, sign Int8) ENGINE = MergeTree ORDER BY g SETTINGS enable_block_number_column = 1;
+    CREATE TABLE samples (g UInt8, v Float64, t UInt32, sign Int8) ENGINE = MergeTree ORDER BY g SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE emas (g UInt8, ema AggregateFunction(exponentialMovingAverage(10), Float64, UInt32)) ENGINE = AggregatingMergeTree ORDER BY g;
     INSERT INTO samples VALUES (1, 10, 1, 1), (1, 20, 11, 1), (2, 5, 1, 1), (2, 7, 2, 1);
     INSERT INTO cursors SELECT 4, 1, cursor FROM deltaQueryFrontier((SELECT g, exponentialMovingAverageState(10)(v, t) FROM samples GROUP BY g $S));

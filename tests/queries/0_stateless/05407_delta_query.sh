@@ -10,11 +10,11 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 $CLICKHOUSE_CLIENT -q "
     CREATE TABLE orders (id UInt64, day Date, product String, qty Int64)
-        ENGINE = MergeTree PARTITION BY day ORDER BY id SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree PARTITION BY day ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE quotes (order_id UInt64, version UInt8, price Int64)
-        ENGINE = MergeTree ORDER BY order_id SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY order_id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE products (product String, category String)
-        ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 
     CREATE TABLE cursors (query UInt8, round UInt8, cursor Map(String, Int64)) ENGINE = MergeTree ORDER BY (query, round);
     CREATE TABLE revenue (category String, product String, revenue SimpleAggregateFunction(sum, Int64), n SimpleAggregateFunction(sum, UInt64),

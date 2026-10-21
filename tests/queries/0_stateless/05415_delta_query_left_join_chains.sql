@@ -5,11 +5,11 @@
 -- its own changes reduce the left side of its ON by it.
 -- The targets keep every delta row, so the sum of the signs of a row is its multiplicity.
 
-CREATE TABLE a (k UInt64, w UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
-CREATE TABLE b (k UInt64, j UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
-CREATE TABLE c (j UInt64, name String) ENGINE = MergeTree ORDER BY j SETTINGS enable_block_number_column = 1;
-CREATE TABLE d (w UInt64, v UInt64) ENGINE = MergeTree ORDER BY w SETTINGS enable_block_number_column = 1;
-CREATE TABLE e (k UInt64, v UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+CREATE TABLE a (k UInt64, w UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE b (k UInt64, j UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE c (j UInt64, name String) ENGINE = MergeTree ORDER BY j SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE d (w UInt64, v UInt64) ENGINE = MergeTree ORDER BY w SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE e (k UInt64, v UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 
 CREATE MATERIALIZED VIEW chain REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
     SELECT a.k AS k, b.j AS j, c.name AS name FROM a LEFT JOIN b ON b.k = a.k LEFT JOIN c ON c.j = b.j

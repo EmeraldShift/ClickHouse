@@ -20,11 +20,12 @@ SELECT arraySort(arrayMap((key, value) -> concat(replaceRegexpOne(key, '[0-9a-f-
     mapKeys(cursor), mapValues(cursor)))
 FROM deltaQueryFrontier((SELECT dl.k, v, w FROM dl JOIN dr ON dl.k = dr.k));
 
-SELECT 'join', * FROM deltaQuery((SELECT dl.k AS k, v, w FROM dl JOIN dr ON dl.k = dr.k), map(),
+-- The tables can have lightweight updates, so the rows of the deltas have a sign.
+SELECT 'join', * FROM deltaQuery((SELECT dl.k AS k, v, w FROM dl JOIN dr ON dl.k = dr.k SETTINGS delta_query_sign_column = 'sign'), map(),
     (SELECT cursor FROM deltaQueryFrontier((SELECT dl.k AS k, v, w FROM dl JOIN dr ON dl.k = dr.k)))) ORDER BY ALL;
 
 -- Each shard reads its own cursor. With shard 1 one block behind, only shard 1 returns that block.
-SELECT 'shard 1 behind', * FROM deltaQuery((SELECT k, v FROM dl),
+SELECT 'shard 1 behind', * FROM deltaQuery((SELECT k, v FROM dl SETTINGS delta_query_sign_column = 'sign'),
     mapApply((key, value) -> (key, if(startsWith(key, '1.'), value - 1, value)), (SELECT cursor FROM deltaQueryFrontier((SELECT k, v FROM dl)))),
     (SELECT cursor FROM deltaQueryFrontier((SELECT k, v FROM dl)))) ORDER BY ALL;
 

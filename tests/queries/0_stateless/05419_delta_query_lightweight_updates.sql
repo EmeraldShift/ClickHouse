@@ -1,5 +1,5 @@
 -- Tags: atomic-database
--- Delta queries with delta_query_sign_column read the lightweight updates and deletes of MergeTree tables. The delta
+-- Delta queries read the lightweight updates and deletes of MergeTree tables. The delta
 -- retracts each row that the updates between the cursors change, as of the old cursor, and inserts it as of the new one.
 -- The targets keep every delta row, so the sum of the signs of a row is its multiplicity.
 
@@ -94,15 +94,16 @@ SYSTEM REFRESH VIEW keyed; SYSTEM WAIT VIEW keyed;
 SYSTEM REFRESH VIEW totals; SYSTEM WAIT VIEW totals;
 SELECT 'round 4', * FROM mismatches;
 
--- Without delta_query_sign_column, a delta reads the inserts but not the updates.
+-- Without delta_query_sign_column, a delta of rows that the updates retract has no sign column to return them. A delta of
+-- aggregates weighs the retractions in its aggregates.
 CREATE TABLE cursors (round UInt8, cursor Map(String, Int64)) ENGINE = Memory;
 INSERT INTO cursors SELECT 0, cursor FROM deltaQueryFrontier((SELECT k, v FROM t));
 INSERT INTO t VALUES (6, 6);
 INSERT INTO cursors SELECT 1, cursor FROM deltaQueryFrontier((SELECT k, v FROM t));
 UPDATE t SET v = 7 WHERE k = 6;
 INSERT INTO cursors SELECT 2, cursor FROM deltaQueryFrontier((SELECT k, v FROM t));
-SELECT 'unsigned', * FROM deltaQuery((SELECT k, v FROM t), (SELECT cursor FROM cursors WHERE round = 0), (SELECT cursor FROM cursors WHERE round = 1));
-SELECT * FROM deltaQuery((SELECT k, v FROM t), (SELECT cursor FROM cursors WHERE round = 1), (SELECT cursor FROM cursors WHERE round = 2)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQuery((SELECT k, v FROM t), (SELECT cursor FROM cursors WHERE round = 0), (SELECT cursor FROM cursors WHERE round = 1)); -- { serverError BAD_ARGUMENTS }
+SELECT 'unsigned', * FROM deltaQuery((SELECT k, sum(v) FROM t GROUP BY k), (SELECT cursor FROM cursors WHERE round = 0), (SELECT cursor FROM cursors WHERE round = 2));
 SELECT 'signed', * FROM deltaQuery((SELECT k, v FROM t SETTINGS delta_query_sign_column = 'sign'),
     (SELECT cursor FROM cursors WHERE round = 1), (SELECT cursor FROM cursors WHERE round = 2)) ORDER BY ALL;
 
@@ -125,7 +126,7 @@ SELECT 'after merge', * FROM deltaQuery((SELECT k, v FROM t SETTINGS delta_query
     (SELECT cursor FROM cursors WHERE round = 2), (SELECT cursor FROM deltaQueryFrontier((SELECT k, v FROM t)))) ORDER BY ALL;
 
 -- So does a mutation, also of a table without lightweight updates. The query from the empty cursor reads the mutated rows.
-CREATE TABLE plain (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+CREATE TABLE plain (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 INSERT INTO plain VALUES (1), (2);
 INSERT INTO cursors SELECT 3, cursor FROM deltaQueryFrontier((SELECT k FROM plain));
 ALTER TABLE plain DELETE WHERE k = 1 SETTINGS mutations_sync = 2;

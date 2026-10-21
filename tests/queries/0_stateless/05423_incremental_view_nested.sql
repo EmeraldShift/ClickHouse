@@ -6,7 +6,7 @@
 SET enable_lightweight_update = 1;
 CREATE TABLE events (user UInt64, x Int64) ENGINE = MergeTree ORDER BY user
     SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1;
-CREATE TABLE vip (id UInt64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+CREATE TABLE vip (id UInt64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 
 -- The number of users per count of events, and the counts of VIP users.
 CREATE TABLE histogram (n UInt64, users Int64) ENGINE = SummingMergeTree ORDER BY n;
@@ -52,3 +52,13 @@ SELECT 'stage tables', count() FROM system.tables WHERE database = currentDataba
 DROP VIEW histogram_mv;
 DROP VIEW vip_counts_mv;
 SELECT 'hidden tables after drop', count() FROM system.tables WHERE database = currentDatabase() AND name LIKE '.inner%';
+
+-- A view without delta_query_sign_column reads a stage whose rows never retract. The stage keeps duplicate rows.
+CREATE TABLE plain (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE MATERIALIZED VIEW plain_mv REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
+    SELECT k FROM (SELECT k FROM plain WHERE k > 0);
+INSERT INTO plain VALUES (1), (1), (0);
+SYSTEM REFRESH VIEW plain_mv; SYSTEM WAIT VIEW plain_mv;
+INSERT INTO plain VALUES (1), (2);
+SYSTEM REFRESH VIEW plain_mv; SYSTEM WAIT VIEW plain_mv;
+SELECT 'plain', groupArray(k) FROM (SELECT k FROM plain_mv ORDER BY k);

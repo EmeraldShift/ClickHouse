@@ -2,9 +2,9 @@
 -- An incremental view over WITH RECURSIVE keeps the CTE in its target. Each refresh joins the new rows of the inputs with
 -- the paths in the target, and repeats the step over the paths it found. Retracting an edge retracts the paths through it.
 
-CREATE TABLE roots (node UInt64) ENGINE = MergeTree ORDER BY node SETTINGS enable_block_number_column = 1;
-CREATE TABLE edges (src UInt64, dst UInt64, sign Int8) ENGINE = MergeTree ORDER BY src SETTINGS enable_block_number_column = 1;
-CREATE TABLE paths (node UInt64, depth UInt32, sign Int8) ENGINE = MergeTree ORDER BY node SETTINGS enable_block_number_column = 1;
+CREATE TABLE roots (node UInt64) ENGINE = MergeTree ORDER BY node SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE edges (src UInt64, dst UInt64, sign Int8) ENGINE = MergeTree ORDER BY src SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE paths (node UInt64, depth UInt32, sign Int8) ENGINE = MergeTree ORDER BY node SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 
 CREATE MATERIALIZED VIEW paths_mv REFRESH EVERY 10 YEAR APPEND INCREMENTAL TO paths EMPTY AS
     WITH RECURSIVE r AS (

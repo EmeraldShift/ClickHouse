@@ -3,10 +3,10 @@
 -- reads past a gap that a fetch fills later.
 
 CREATE TABLE r1 (k UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/05411_r', 'r1') ORDER BY k
-    SETTINGS enable_block_number_column = 1;
+    SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE TABLE r2 (k UInt64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/05411_r', 'r2') ORDER BY k
-    SETTINGS enable_block_number_column = 1;
-CREATE TABLE names (k UInt64, name String) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+    SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE names (k UInt64, name String) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE TABLE joined (k UInt64, name String) ENGINE = MergeTree ORDER BY k;
 CREATE MATERIALIZED VIEW joined_view REFRESH EVERY 10 YEAR APPEND INCREMENTAL TO joined EMPTY
     AS SELECT r2.k AS k, names.name AS name FROM r2 INNER JOIN names ON r2.k = names.k;

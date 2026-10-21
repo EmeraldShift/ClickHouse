@@ -9,8 +9,8 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # An insert into a lookup table doesn't refresh it. An insert into an input of a subquery in FROM refreshes the view.
 
 $CLICKHOUSE_CLIENT -q "
-    CREATE TABLE facts (id UInt64, dim_id UInt64, v Int64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
-    CREATE TABLE dims (id UInt64, name String) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+    CREATE TABLE facts (id UInt64, dim_id UInt64, v Int64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+    CREATE TABLE dims (id UInt64, name String) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     INSERT INTO dims VALUES (1, 'a');
     CREATE MATERIALIZED VIEW v REFRESH EVERY 1 YEAR SETTINGS refresh_on_insert = 1 APPEND INCREMENTAL
         ENGINE = SummingMergeTree ORDER BY name AS

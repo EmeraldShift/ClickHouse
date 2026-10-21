@@ -9,7 +9,7 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # holds one row per user, although each refresh retracted the old count of each user. The view stays equal to its query.
 
 $CLICKHOUSE_CLIENT -q "
-    CREATE TABLE events (user UInt64) ENGINE = MergeTree ORDER BY user SETTINGS enable_block_number_column = 1;
+    CREATE TABLE events (user UInt64) ENGINE = MergeTree ORDER BY user SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE MATERIALIZED VIEW histogram REFRESH EVERY 10 YEAR APPEND INCREMENTAL ENGINE = SummingMergeTree ORDER BY n EMPTY AS
         SELECT n, count() AS users FROM (SELECT user, count() AS n FROM events GROUP BY user) GROUP BY n
         SETTINGS delta_query_sign_column = 'sign';"

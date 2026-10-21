@@ -2,10 +2,10 @@
 -- An incremental view can read the target of another incremental view. The target is a MergeTree with block numbers that
 -- keeps every delta row with its sign, so the second view reads it as a signed input.
 
-CREATE TABLE orders (id UInt64, cust UInt64, amount Int64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
-CREATE TABLE customers (id UInt64, region String) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+CREATE TABLE orders (id UInt64, cust UInt64, amount Int64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE customers (id UInt64, region String) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE TABLE enriched (id UInt64, region String, amount Int64, sign Int8) ENGINE = MergeTree ORDER BY id
-    SETTINGS enable_block_number_column = 1;
+    SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE TABLE totals (region String, amount Int64) ENGINE = SummingMergeTree ORDER BY region;
 
 CREATE MATERIALIZED VIEW enriched_mv REFRESH EVERY 10 YEAR APPEND INCREMENTAL TO enriched EMPTY AS

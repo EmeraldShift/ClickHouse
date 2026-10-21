@@ -343,6 +343,7 @@ StorageMaterializedView::StorageMaterializedView(
         if (!to_table_id.empty())
             delta_context->setSetting("delta_query_recursion_table", mv_db_context->resolveStorageID(to_table_id).getFullTableName());
         DeltaQuery delta_query(select.select_query, delta_context, table_id_);
+        delta_query.checkResultSign();
         if (delta_query.hasResidual() || !delta_query.getStages().empty())
         {
             /// The integral and the stage tables are local tables named by the UUID of the view.

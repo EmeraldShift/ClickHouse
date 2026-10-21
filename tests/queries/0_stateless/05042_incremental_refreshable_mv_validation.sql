@@ -15,12 +15,10 @@ CREATE TABLE val_src (k UInt64, v UInt64)
 ENGINE = MergeTree ORDER BY k
 SETTINGS
     enable_block_number_column = 1,
-    enable_block_offset_column = 1,
-    add_minmax_index_for_block_number_column = 1,
-    add_minmax_index_for_block_offset_column = 1,
-    part_minmax_index_columns = 'with_block_number_offset';
+    enable_block_offset_column = 0,
+    add_minmax_index_for_block_number_column = 1;
 
-CREATE TABLE val_dim (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+CREATE TABLE val_dim (k UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE TABLE val_mem (k UInt64, v UInt64) ENGINE = Memory;
 CREATE TABLE val_tgt (k UInt64, v UInt64) ENGINE = MergeTree ORDER BY k;
 
@@ -38,11 +36,12 @@ CREATE MATERIALIZED VIEW val_mv_join
     AS SELECT s.k, s.v FROM val_src s JOIN val_dim d ON s.k = d.k;
 SELECT 'join_created', count() FROM system.tables WHERE database = currentDatabase() AND name = 'val_mv_join';
 
--- A LEFT JOIN is rejected: a new row of the right side would change rows the view already appended.
+-- Without delta_query_sign_column, a LEFT JOIN is rejected: a new row of the right side would retract rows that the view
+-- already appended, and the target has no sign column.
 CREATE MATERIALIZED VIEW val_mv_left_join
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL
     TO val_tgt EMPTY
-    AS SELECT s.k, s.v FROM val_src s LEFT JOIN val_dim d ON s.k = d.k; -- { serverError NOT_IMPLEMENTED }
+    AS SELECT s.k, s.v FROM val_src s LEFT JOIN val_dim d ON s.k = d.k; -- { serverError BAD_ARGUMENTS }
 
 -- An unspecified strictness that `join_default_strictness` makes ANY is rejected too.
 CREATE MATERIALIZED VIEW val_mv_any_join
@@ -55,12 +54,6 @@ CREATE MATERIALIZED VIEW val_mv_subquery
     REFRESH EVERY 10 YEAR APPEND INCREMENTAL
     TO val_tgt EMPTY
     AS SELECT k, v FROM val_src WHERE k IN (SELECT k FROM val_dim); -- { serverError NOT_IMPLEMENTED }
-
--- A subquery source (not a plain table) is rejected.
-CREATE MATERIALIZED VIEW val_mv_subquery_src
-    REFRESH EVERY 10 YEAR APPEND INCREMENTAL
-    TO val_tgt EMPTY
-    AS SELECT k, v FROM (SELECT k, v FROM val_src); -- { serverError NOT_IMPLEMENTED }
 
 -- A source engine other than MergeTree (Memory) is rejected.
 CREATE MATERIALIZED VIEW val_mv_mem

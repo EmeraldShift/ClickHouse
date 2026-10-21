@@ -2,8 +2,8 @@
 -- With delta_query_lookup_tables, new rows of a lookup table join only with rows of the other inputs that arrive after
 -- them. A fact whose dimension row arrives later joins in the view without the setting, and not in the view with it.
 
-CREATE TABLE facts (id UInt64, dim_id UInt64, v Int64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
-CREATE TABLE dims (id UInt64, name String) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+CREATE TABLE facts (id UInt64, dim_id UInt64, v Int64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE TABLE dims (id UInt64, name String) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 CREATE TABLE joined (name String, v Int64) ENGINE = SummingMergeTree ORDER BY name;
 CREATE TABLE looked_up (name String, v Int64) ENGINE = SummingMergeTree ORDER BY name;
 

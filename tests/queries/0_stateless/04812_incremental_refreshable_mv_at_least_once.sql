@@ -12,10 +12,8 @@ CREATE TABLE alo_src (k UInt64)
 ENGINE = MergeTree ORDER BY k
 SETTINGS
     enable_block_number_column = 1,
-    enable_block_offset_column = 1,
-    add_minmax_index_for_block_number_column = 1,
-    add_minmax_index_for_block_offset_column = 1,
-    part_minmax_index_columns = 'with_block_number_offset';
+    enable_block_offset_column = 0,
+    add_minmax_index_for_block_number_column = 1;
 
 CREATE TABLE alo_tgt (k UInt64) ENGINE = MergeTree ORDER BY k;
 

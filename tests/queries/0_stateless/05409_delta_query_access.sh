@@ -12,7 +12,7 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 USER="u_${CLICKHOUSE_TEST_UNIQUE_NAME}_$$"
 
 $CLICKHOUSE_CLIENT -q "
-    CREATE TABLE t (k UInt64, secret UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+    CREATE TABLE t (k UInt64, secret UInt64) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     INSERT INTO t VALUES (1, 2);
     DROP USER IF EXISTS ${USER};
     CREATE USER ${USER};"

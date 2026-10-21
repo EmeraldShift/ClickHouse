@@ -14,14 +14,14 @@ CURDIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 $CLICKHOUSE_CLIENT -q "
     CREATE TABLE orders (id UInt64, product String, qty Int64, sign Int8)
-        ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE quotes (order_id UInt64, price Int64, sign Int8)
-        ENGINE = MergeTree ORDER BY order_id SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY order_id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE products (product String, category String)
-        ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1;
-    CREATE TABLE events (k UInt8, v UInt32) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY product SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+    CREATE TABLE events (k UInt8, v UInt32) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
     CREATE TABLE readings (k UInt8, v Nullable(Int64), sign Int8)
-        ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1;
+        ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 "
 
 # Each query reads the tables \$1, \$2 and \$3 in place of orders, quotes and readings.
