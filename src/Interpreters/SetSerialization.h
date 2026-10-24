@@ -21,6 +21,9 @@ struct SerializedSetsRegistry
     /// `ActionsDAG::serialize` (skips variable-size constant values), that one drives the step's own
     /// `serialize`. Set both or neither.
     bool for_cache_key = false;
+
+    /// Query-plan serialization version of the stream, which `ActionsDAG::serialize` reads. Zero outside of a query plan.
+    UInt64 version = 0;
 };
 
 class ColumnSet;

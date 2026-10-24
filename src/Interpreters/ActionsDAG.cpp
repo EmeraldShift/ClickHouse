@@ -16,6 +16,7 @@
 #include <Columns/ColumnSet.h>
 #include <Columns/validateColumnType.h>
 #include <Functions/IFunction.h>
+#include <Core/ProtocolDefines.h>
 #include <Functions/IFunctionAdaptors.h>
 #include <Functions/materialize.h>
 #include <Functions/FunctionsMiscellaneous.h>
@@ -2962,6 +2963,34 @@ void ActionsDAG::mergeInplace(ActionsDAG && second, std::unordered_map<const Nod
 
     /// Will store merged result in `first`.
 
+    /// The condition of an `indexHint` in `second` reads the inputs of `second` by name. After the merge it reads the
+    /// outputs of `first`, so the condition gets the actions of `first`. Without this, index analysis of a plan whose reads
+    /// return the names of the storage misses the condition, because the planner's map from column identifiers to those
+    /// names is gone after a plan is deserialized.
+    for (auto & node : second.nodes)
+    {
+        if (node.type != ActionType::FUNCTION || node.function_base->getName() != FunctionIndexHint::name)
+            continue;
+        const auto * adaptor = typeid_cast<const FunctionToFunctionBaseAdaptor *>(node.function_base.get());
+        const auto * index_hint = adaptor ? typeid_cast<const FunctionIndexHint *>(adaptor->getFunction().get()) : nullptr;
+        if (!index_hint)
+            continue;
+        auto condition = first.clone();
+        auto hint_actions = index_hint->getActions().clone();
+        const size_t num_conditions = hint_actions.getOutputs().size();
+        condition.mergeInplace(std::move(hint_actions));
+        /// The outputs of the merge start with the outputs of the second DAG.
+        condition.outputs.resize(num_conditions);
+        condition.removeUnusedActions(/*allow_remove_inputs=*/ true);
+        auto rebased = std::make_shared<FunctionIndexHint>();
+        rebased->setActions(std::move(condition));
+        ColumnsWithTypeAndName arguments;
+        for (const auto * child : node.children)
+            arguments.emplace_back(child->column, child->result_type, child->result_name);
+        node.function_base = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(rebased))->build(arguments);
+        node.function = node.function_base->prepare(arguments);
+    }
+
     /// This map contains nodes which should be removed from `first` outputs, cause they are used as inputs for `second`.
     /// The second element is the number of removes (cause one node may be repeated several times in result).
     std::unordered_map<const Node *, size_t> removed_first_result;
@@ -5386,6 +5415,14 @@ void ActionsDAG::serialize(WriteBuffer & out, SerializedSetsRegistry & registry,
         if (function_capture)
             column_flags |= 4;
 
+        /// The condition of `indexHint` is a DAG of its own, which the function holds instead of children.
+        const FunctionIndexHint * index_hint = nullptr;
+        if (const auto * adaptor = typeid_cast<const FunctionToFunctionBaseAdaptor *>(node.function_base.get());
+            adaptor && registry.version >= DBMS_MIN_QUERY_PLAN_SERIALIZATION_VERSION_WITH_INDEX_HINT_CONDITION)
+            index_hint = typeid_cast<const FunctionIndexHint *>(adaptor->getFunction().get());
+        if (index_hint)
+            column_flags |= 8;
+
         writeIntBinary(column_flags, out);
 
         /// A cache key (`registry.for_cache_key`) leaves out a constant's value when it has no fixed
@@ -5427,6 +5464,8 @@ void ActionsDAG::serialize(WriteBuffer & out, SerializedSetsRegistry & registry,
                 serializeCapture(function_capture->getCapture(), out, registry.for_cache_key, input_header);
                 function_capture->getAcionsDAG().serialize(out, registry, input_header);
             }
+            if (index_hint)
+                index_hint->getActions().serialize(out, registry, input_header);
         }
         else if (node.type == ActionType::ARRAY_JOIN)
         {
@@ -5544,6 +5583,16 @@ ActionsDAG ActionsDAG::deserialize(ReadBuffer & in, DeserializedSetsRegistry & r
                     node.result_type,
                     function_name);
 
+                node.function = node.function_base->prepare(arguments);
+                node.is_function_compiled = false;
+            }
+            else if (column_flags & 8)
+            {
+                if (function_name != FunctionIndexHint::name)
+                    throw Exception(ErrorCodes::INCORRECT_DATA, "Deserialized function {} has the condition of indexHint", function_name);
+                auto index_hint = std::make_shared<FunctionIndexHint>();
+                index_hint->setActions(ActionsDAG::deserialize(in, registry, context, max_type_complexity));
+                node.function_base = std::make_shared<FunctionToOverloadResolverAdaptor>(std::move(index_hint))->build(arguments);
                 node.function = node.function_base->prepare(arguments);
                 node.is_function_compiled = false;
             }
