@@ -593,6 +593,9 @@ struct DeltaQuery::DeltaTerms
 /// the old cursor, and it is the difference of the query at the new and at the old time over the rows whose filter changed.
 ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const
 {
+    if (!cluster.empty())
+        return parseSelect(readShards(cluster, "*", fmt::format("SELECT * FROM deltaQuery(({}), {}, {})",
+            shard_query->formatWithSecretsOneLine(), makeShardCursor(old_cursor), makeShardCursor(new_cursor))));
     const auto tables = snapshotTables(inputs);
     const auto old_bounds = parseCursor(old_cursor, inputs, tables, "old cursor");
     const auto new_bounds = parseCursor(new_cursor, inputs, tables, "new cursor");

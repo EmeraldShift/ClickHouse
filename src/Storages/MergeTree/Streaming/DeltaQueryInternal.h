@@ -210,6 +210,9 @@ void setTable(ASTTableExpression & expression, ASTPtr table);
 
 void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts);
 
+/// Parses `sql`, whose unions have explicit modes.
+ASTPtr parseSelect(const String & sql);
+
 ASTPtr makeSelectWithUnion(ASTPtr select);
 
 /// `query_1 UNION ALL ...` over selects and unions of selects. The unions of delta queries are UNION ALL, so the selects of
@@ -290,6 +293,14 @@ std::optional<Int64> getTime(const CursorTreeNodePtr & tree);
 /// if it gets rows again.
 Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & inputs, const std::map<String, TableBlocks> & tables,
     std::string_view name);
+
+/// `SELECT columns FROM cluster(cluster, view(query))`. It runs `query` on one replica of each shard, and all shards must
+/// run it. This server runs its own shard over a connection too. Then `shardNum()` in `query` is the number of the shard.
+/// A local read would reuse the table functions of `query` that this server evaluates for the header, with `shardNum()` 0.
+String readShards(const String & cluster, const String & columns, const String & query);
+
+/// The expression that each shard evaluates to its cursor in `cursor`, the subtree of its number.
+String makeShardCursor(const CursorTreeNodePtr & cursor);
 
 
 /// Conjuncts that keep the rows of an input with `lower` <= `_block_number` < `upper`, where a null `lower` keeps every row

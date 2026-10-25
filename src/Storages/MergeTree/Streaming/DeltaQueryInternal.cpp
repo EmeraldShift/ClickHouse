@@ -3,6 +3,7 @@
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 #include <Analyzer/FunctionNode.h>
+#include <Interpreters/NormalizeSelectWithUnionQueryVisitor.h>
 #include <Interpreters/addTypeConversionToAST.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
@@ -13,6 +14,8 @@
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/ParserSelectWithUnionQuery.h>
+#include <Parsers/parseQuery.h>
 
 
 #include <map>
@@ -124,6 +127,15 @@ void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
     }
     else
         conjuncts.push_back(node);
+}
+
+ASTPtr parseSelect(const String & sql)
+{
+    ParserSelectWithUnionQuery parser;
+    auto ast = parseQuery(parser, sql, 0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+    NormalizeSelectWithUnionQueryVisitor::Data data{SetOperationMode::ALL};
+    NormalizeSelectWithUnionQueryVisitor(data).visit(ast);
+    return ast;
 }
 
 ASTPtr makeSelectWithUnion(ASTPtr select)

@@ -1,5 +1,8 @@
 #include <Storages/MergeTree/Streaming/DeltaQueryInternal.h>
 
+#include <Common/quoteString.h>
+#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
+#include <Processors/Executors/PullingPipelineExecutor.h>
 #include <Storages/StorageMergeTree.h>
 
 #include <fmt/ranges.h>
@@ -97,6 +100,25 @@ Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & in
     return cursor;
 }
 
+String readShards(const String & cluster, const String & columns, const String & query)
+{
+    return fmt::format("SELECT {} FROM cluster({}, view({})) SETTINGS prefer_localhost_replica = 0, skip_unavailable_shards = 0",
+        columns, quoteString(cluster), query);
+}
+
+String makeShardCursor(const CursorTreeNodePtr & cursor)
+{
+    Strings entries;
+    for (const auto & entry : cursor ? cursorTreeToMap(cursor) : Map{})
+    {
+        const auto & pair = entry.safeGet<Tuple>();
+        entries.push_back(fmt::format("{}, {}", quoteString(pair.at(0).safeGet<String>()), pair.at(1).safeGet<Int64>()));
+    }
+    return fmt::format("mapApply((key, value) -> (substring(key, length(toString(shardNum())) + 2), value), "
+        "mapFilter((key, value) -> startsWith(key, concat(toString(shardNum()), '.')), CAST(map({}), 'Map(String, Int64)')))",
+        fmt::join(entries, ", "));
+}
+
 }
 
 void checkReadableAsOf(const MergeTreeData & storage, const DataPartsVector & parts, const std::map<String, Int64> & bounds)
@@ -135,6 +157,21 @@ DataPartsVector getPatchParts(const MergeTreeData & storage, const std::map<Stri
 
 CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
 {
+    if (!cluster.empty())
+    {
+        auto tree = from ? from->clone() : std::make_shared<CursorTreeNode>();
+        const auto shard_frontiers = readShards(cluster, "_shard_num, cursor", fmt::format("SELECT cursor FROM deltaQueryFrontier(({}), {})",
+            shard_query->formatWithSecretsOneLine(), makeShardCursor(from)));
+        InterpreterSelectQueryAnalyzer interpreter(parseSelect(shard_frontiers), analysis_context, SelectQueryOptions());
+        auto io = interpreter.execute();
+        PullingPipelineExecutor executor(io.pipeline);
+        Block block;
+        while (executor.pull(block))
+            for (size_t row = 0; row < block.rows(); ++row)
+                tree->setSubtree(toString((*block.getByPosition(0).column)[row].safeGet<UInt64>()),
+                    buildCursorTree((*block.getByPosition(1).column)[row].safeGet<Map>()));
+        return tree;
+    }
     const auto tables = snapshotTables(inputs);
     auto frontier = parseCursor(from, inputs, tables, "cursor");
     for (const auto & [key, blocks] : tables)
@@ -154,6 +191,8 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
 
 std::vector<scope_guard> DeltaQuery::holdCursor(const CursorTreeNodePtr & cursor) const
 {
+    if (!cluster.empty())
+        return {};
     const auto tables = snapshotTables(inputs);
     const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
     std::vector<scope_guard> guards;

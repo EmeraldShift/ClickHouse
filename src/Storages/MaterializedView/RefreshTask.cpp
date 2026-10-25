@@ -87,6 +87,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int TABLE_UUID_MISMATCH;
     extern const int KEEPER_EXCEPTION;
+    extern const int DELTA_QUERY_HISTORY_LOST;
 }
 
 namespace FailPoints
@@ -1491,7 +1492,8 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             query_for_logging = "(create target table)";
             normalized_query_hash = normalizedQueryHash(query_for_logging, false);
             QueryScope query_scope;
-            std::tie(refresh_query, query_scope) = view->prepareRefresh(refresh_mode, refresh_context, table_to_drop, stream_cursor, new_cursor_holds);
+            std::tie(refresh_query, query_scope) = view->prepareRefresh(
+                refresh_mode, refresh_context, table_to_drop, stream_cursor, new_cursor_holds, execution.history_lost);
             new_table_id = refresh_query->table_id;
 
             /// Add the query to system.processes and allow it to be killed with KILL QUERY.
@@ -1621,6 +1623,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     catch (...)
     {
         ProfileEvents::increment(ProfileEvents::RefreshableViewRefreshFailed);
+        execution.history_lost = getCurrentExceptionCode() == ErrorCodes::DELTA_QUERY_HISTORY_LOST;
 
         bool cancelled = execution.interrupt_execution.load();
 
@@ -1650,6 +1653,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     }
 
     ProfileEvents::increment(ProfileEvents::RefreshableViewRefreshSuccess);
+    execution.history_lost = false;
 
     if (table_to_drop.has_value())
         view->dropTempTable(table_to_drop.value(), refresh_context, out_error_message);

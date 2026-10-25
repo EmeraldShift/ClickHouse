@@ -12,6 +12,7 @@
 #include <Core/Joins.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
@@ -24,6 +25,7 @@
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/StorageDistributed.h>
 #include <Storages/StorageProxy.h>
 
 #include <base/find_symbols.h>
@@ -217,6 +219,52 @@ void checkNoSubqueries(const IAST & ast)
             throwUnsupported("subqueries");
         checkNoSubqueries(*child);
     }
+}
+
+/// `query` with each `Distributed` table in FROM replaced by its local table, under the name of the `Distributed` table
+/// unless it has an alias. The other tables get the current database, because a shard resolves tables in its own default
+/// database. Returns null if `query` reads no `Distributed` table. Sets `cluster` to the cluster of the `Distributed`
+/// tables, which must be the same.
+ASTPtr readLocalTables(const ASTPtr & query, const ContextPtr & context, String & cluster)
+{
+    auto result = query->clone();
+    for (const auto & select : result->as<ASTSelectWithUnionQuery &>().list_of_selects->children)
+    {
+        /// The analysis rejects UNION.
+        const auto * select_query = select->as<ASTSelectQuery>();
+        const auto & tables = select_query ? select_query->tables() : nullptr;
+        if (!tables)
+            continue;
+        for (const auto & element : tables->children)
+        {
+            const auto & table_expression = element->as<ASTTablesInSelectQueryElement &>().table_expression;
+            auto * expression = table_expression ? table_expression->as<ASTTableExpression>() : nullptr;
+            const auto * identifier = expression && expression->database_and_table_name
+                ? expression->database_and_table_name->as<ASTTableIdentifier>() : nullptr;
+            if (!identifier)
+                continue;
+            const auto table_id = context->resolveStorageID(identifier->getTableId());
+            auto storage = DatabaseCatalog::instance().tryGetTable(table_id, context);
+            if (!storage)
+                continue;
+            ASTPtr table;
+            auto alias = identifier->tryGetAlias();
+            if (auto distributed = castStorage<StorageDistributed>(storage, DeferredTable::Load))
+            {
+                if (!cluster.empty() && cluster != distributed->getCluster()->getName())
+                    throwUnsupported("Distributed tables of different clusters");
+                cluster = distributed->getCluster()->getName();
+                table = make_intrusive<ASTTableIdentifier>(distributed->getRemoteDatabaseName(), distributed->getRemoteTableName());
+                if (alias.empty())
+                    alias = table_id.table_name;
+            }
+            else
+                table = make_intrusive<ASTTableIdentifier>(table_id.database_name, table_id.table_name);
+            table->setAlias(alias);
+            setTable(*expression, std::move(table));
+        }
+    }
+    return cluster.empty() ? nullptr : result;
 }
 
 /// Rejects tables outside FROM, like in `k IN t`, which the cursors do not cover, and window functions, whose result over
@@ -485,9 +533,10 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
         context->setSetting("delta_query_sign_column", sign_column_setting);
     }
     checkNoSubqueries(*query_);
+    shard_query = readLocalTables(query_, context, cluster);
     analysis_context = context;
 
-    analyze(query_, context, sign_column_setting);
+    analyze(shard_query ? shard_query : query_, context, sign_column_setting);
 }
 
 DeltaQuery::~DeltaQuery() = default;

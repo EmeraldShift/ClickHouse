@@ -329,6 +329,9 @@ private:
         /// Should be writtent to zookeeper only if the refresh succeeds.
         AllDependenciesInfo dependencies;
         bool out_of_schedule = false;
+        /// Whether the last refresh failed with `DELTA_QUERY_HISTORY_LOST`. The delta of a query over `Distributed` tables
+        /// finds that on the shards as it runs. The next refresh then recomputes the view, see `prepareRefresh`.
+        bool history_lost = false;
     };
 
     struct SchedulingState

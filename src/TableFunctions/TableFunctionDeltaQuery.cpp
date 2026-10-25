@@ -404,6 +404,13 @@ tables of `ReplicatedMergeTree` don't support them. A merge that writes later up
 the cursor, loses the table as of the cursor, and the delta throws `DELTA_QUERY_HISTORY_LOST`. The delta throws `UNFINISHED` until
 the mutations below its cursors are done.
 
+A query can also read `Distributed` tables of one cluster. Each shard then runs the query over its local tables, as with
+`distributed_product_mode = 'local'`. So the rows that the query joins must be on the same shard. Each shard reads the other tables
+of the query itself, and `delta_query_lookup_tables` names local tables. The server that runs `deltaQuery` analyzes the query over
+its own local tables, so it must have them. Each key of a cursor then starts with the number of a shard, and the shards must keep
+their numbers. The replicas of a shard must share block numbers, as `ReplicatedMergeTree` replicas do. The delta reads the shards with
+the `cluster` table function, so it needs the grant `READ ON REMOTE`.
+
 Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
 the tables of `query`, and on `_block_offset` of the tables with lightweight updates.
 )DOCS_MD", .category = FunctionDocumentation::Category::TableFunction}, SecretArgumentsSpec{}, {.allow_readonly = true});
