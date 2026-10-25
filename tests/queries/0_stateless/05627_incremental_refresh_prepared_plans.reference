@@ -1,0 +1,22 @@
+both inputs	rows	1
+both inputs	totals	1
+new rows of t	rows	1
+new rows of t	totals	1
+more rows of t	rows	1
+more rows of t	totals	1
+after a merge	rows	1
+after a merge	totals	1
+new partition	rows	1
+new partition	totals	1
+new rows of both	rows	1
+new rows of both	totals	1
+more rows of both	rows	1
+more rows of both	totals	1
+after an ALTER	rows	1
+after an ALTER	totals	1
+after an ALTER again	rows	1
+after an ALTER again	totals	1
+times of now64()	3
+refresh of clock	[0,0,0]
+refresh of rows	[0,0,1,1,1,0,1,0,1]
+refresh of totals	[0,0,1,1,1,0,1,0,1]

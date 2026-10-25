@@ -1,0 +1,9 @@
+first refresh	10
+second refresh	20
+third refresh	30
+ACCESS_DENIED
+after REVOKE	30
+after GRANT	50
+after GRANT again	60
+after a row policy	65
+[0,0,1,0,1,0]

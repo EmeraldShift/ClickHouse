@@ -317,8 +317,7 @@ static bool hasNonDeterministicObfuscate(const ASTPtr & node, ContextPtr context
     return false;
 }
 
-/// Does AST contain non-deterministic functions like rand() and now()?
-static bool astContainsNonDeterministicFunctions(ASTPtr ast, ContextPtr context)
+bool astContainsNonDeterministicFunctions(ASTPtr ast, ContextPtr context)
 {
     HasNonDeterministicFunctionsMatcher::Data finder_data{context};
     HasNonDeterministicFunctionsVisitor(finder_data).visit(ast);

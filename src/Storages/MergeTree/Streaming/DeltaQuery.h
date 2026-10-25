@@ -20,7 +20,15 @@
 namespace DB
 {
 
+/// The block number bounds of the inputs of a delta, by slot and partition ID. `__deltaQueryBound('slot', _partition_id)`
+/// returns them from the context, see `Context::setDeltaQueryBounds`.
+struct DeltaQueryBounds
+{
+    std::map<String, std::map<String, Int64, std::less<>>, std::less<>> slots;
+};
+
 class MergeTreeData;
+struct StorageInMemoryMetadata;
 class IMergeTreeDataPart;
 using DataPartPtr = std::shared_ptr<const IMergeTreeDataPart>;
 using DataPartsVector = std::vector<DataPartPtr>;
@@ -130,8 +138,30 @@ public:
     std::vector<scope_guard> holdCursor(const CursorTreeNodePtr & cursor) const;
 
     /// The delta between `old_cursor` and `new_cursor`. A null `old_cursor` is the empty cursor. Throws unless
-    /// `old_cursor` <= `new_cursor` and this server has committed every block that the delta reads.
-    ASTPtr buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
+    /// `old_cursor` <= `new_cursor` and this server has committed every block that the delta reads. With `out_bounds`, the
+    /// delta reads the bounds of the cursors with `__deltaQueryBound` instead of having them as literals, and `out_bounds`
+    /// gets them. Then the text of the delta depends only on which inputs have new rows. A delta over `Distributed` tables
+    /// or with recursion has the bounds as literals anyway.
+    ASTPtr buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor,
+        DeltaQueryBounds * out_bounds = nullptr) const;
+
+    /// Whether the text of a delta from `buildDelta` with `out_bounds` depends on the cursors only through which inputs have
+    /// new rows. It doesn't for a query over `Distributed` tables, with recursion, stages or a residual, with functions that
+    /// aren't deterministic like now64(), whose values the analysis folds into the delta, or with an input that can have
+    /// lightweight updates.
+    bool hasReusableDeltas() const;
+
+    /// An input of the query as of its analysis.
+    struct InputTable
+    {
+        StorageID id;
+        std::shared_ptr<const StorageInMemoryMetadata> metadata;
+    };
+    std::vector<InputTable> getInputTables() const;
+
+    /// Makes the later analyses of this query, like the one for its result columns, run in `context`. A view that keeps
+    /// the query between refreshes gives it the context of each refresh.
+    void setContext(const ContextPtr & context);
 
     /// A query with the result columns of the rows that the deltas insert into a target. That is the query that each delta
     /// evaluates over part of the inputs, or for a query with a residual, the residual with the sign column.
@@ -250,6 +280,8 @@ private:
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;
     ASTs clock_conjuncts;
+    /// Whether the query calls only deterministic functions.
+    bool deterministic = true;
     /// The result columns of a signed query without aggregates, without the sign column. A delta with pairs of terms sums
     /// the signs of equal rows.
     Names consolidated_columns;
@@ -262,6 +294,8 @@ private:
     ASTPtr shard_query;
     /// The context of the analysis. It also reads the frontiers of the shards and the types of the result columns.
     ContextPtr analysis_context;
+    /// The result columns once `getResultColumns` resolves them.
+    mutable std::optional<NamesAndTypesList> result_columns;
 };
 
 /// Throws `DELTA_QUERY_HISTORY_LOST` unless `parts` of `storage` hold its rows as of `bounds`, the first block number that

@@ -33,9 +33,13 @@ using namespace DeltaQueryInternal;
 namespace
 {
 
-/// `transform(_partition_id, ids, bounds, 0)`, the bound of the partition of the row. A missing partition has bound 0.
-ASTPtr makeBound(const String & qualifier, const std::map<String, Int64> & partitions)
+/// `transform(_partition_id, ids, bounds, 0)`, the bound of the partition of the row, or `__deltaQueryBound(slot,
+/// _partition_id)` if `slots` has the bounds. A missing partition has bound 0.
+ASTPtr makeBound(const String & qualifier, const std::map<String, Int64> & partitions, const BoundSlots * slots)
 {
+    if (slots)
+        if (auto it = slots->find(&partitions); it != slots->end())
+            return makeASTFunction("__deltaQueryBound", make_intrusive<ASTLiteral>(Field(it->second)), makeColumn(qualifier, "_partition_id"));
     Array ids;
     Array bounds;
     for (const auto & [partition_id, bound] : partitions)
@@ -66,7 +70,7 @@ ASTPtr makeBoundsMap(const std::map<String, Int64> & bounds)
 /// keeps the rows of `input` that its lightweight updates with versions in [`lower`, `upper`) change.
 ASTPtr makeUpdatedRowsIn(const Input & input, const std::map<String, Int64> & lower, const std::map<String, Int64> & upper)
 {
-    const auto table_id = input.storage->getStorageID();
+    const auto table_id = lockStorage(input)->getStorageID();
     auto patches = makeASTFunction("deltaQueryPatches", make_intrusive<ASTLiteral>(Field(table_id.database_name)),
         make_intrusive<ASTLiteral>(Field(table_id.table_name)), makeBoundsMap(lower), makeBoundsMap(upper));
     return makeASTFunction("in",
@@ -137,19 +141,19 @@ namespace DeltaQueryInternal
 {
 
 void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
-    const std::map<String, Int64> & upper)
+    const std::map<String, Int64> & upper, const BoundSlots * slots)
 {
     auto part_block = [&](const String & field)
     {
         return makeASTFunction("tupleElement",
             makeASTFunction("mergeTreePartInfo", makeColumn(qualifier, "_part")), make_intrusive<ASTLiteral>(field));
     };
-    ASTs part_bounds{makeASTFunction("less", part_block("min_block"), makeBound(qualifier, upper))};
-    conjuncts.push_back(makeASTFunction("less", makeColumn(qualifier, "_block_number"), makeBound(qualifier, upper)));
+    ASTs part_bounds{makeASTFunction("less", part_block("min_block"), makeBound(qualifier, upper, slots))};
+    conjuncts.push_back(makeASTFunction("less", makeColumn(qualifier, "_block_number"), makeBound(qualifier, upper, slots)));
     if (lower)
     {
-        conjuncts.push_back(makeASTFunction("greaterOrEquals", makeColumn(qualifier, "_block_number"), makeBound(qualifier, *lower)));
-        part_bounds.push_back(makeASTFunction("greaterOrEquals", part_block("max_block"), makeBound(qualifier, *lower)));
+        conjuncts.push_back(makeASTFunction("greaterOrEquals", makeColumn(qualifier, "_block_number"), makeBound(qualifier, *lower, slots)));
+        part_bounds.push_back(makeASTFunction("greaterOrEquals", part_block("max_block"), makeBound(qualifier, *lower, slots)));
     }
     conjuncts.push_back(makeASTFunction("indexHint", std::move(part_bounds)));
 }
@@ -263,6 +267,7 @@ struct DeltaQuery::DeltaTerms
     const std::vector<Input> & inputs;
     const Cursor & old_bounds;
     const Cursor & new_bounds;
+    const BoundSlots * slots;
     const ASTSelectQuery & select;
     ASTPtr terms = make_intrusive<ASTExpressionList>();
     /// Whether some terms come in pairs of opposite signs, see `consolidated_columns`.
@@ -274,11 +279,12 @@ struct DeltaQuery::DeltaTerms
     /// The delta of a query with aggregates is the sum of the aggregates over the rows of all its terms. So each term returns
     /// the identifiers that the aggregates and the keys read, and one aggregation over the union of the terms computes the
     /// delta. Planning then builds the aggregates once instead of once per term.
-    DeltaTerms(const DeltaQuery & query_, const Cursor & old_bounds_, const Cursor & new_bounds_)
+    DeltaTerms(const DeltaQuery & query_, const Cursor & old_bounds_, const Cursor & new_bounds_, const BoundSlots * slots_)
         : query(query_)
         , inputs(query.inputs)
         , old_bounds(old_bounds_)
         , new_bounds(new_bounds_)
+        , slots(slots_)
         , select(query.query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>())
     {
         if (!select.groupBy() && !std::ranges::any_of(select.select()->children, [](const auto & column) { return isAggregate(*column); }))
@@ -334,7 +340,7 @@ struct DeltaQuery::DeltaTerms
     {
         const auto & key = inputs[j].key;
         addBounds(conjuncts, inputs[j].alias, rows == Rows::Delta ? &old_bounds.at(key) : nullptr,
-            rows == Rows::Old || rows == Rows::Prior ? old_bounds.at(key) : new_bounds.at(key));
+            rows == Rows::Old || rows == Rows::Prior ? old_bounds.at(key) : new_bounds.at(key), slots);
     }
 
     /// The table of input j as of the cursor of `rows`.
@@ -595,7 +601,8 @@ struct DeltaQuery::DeltaTerms
 ///
 /// A filter by now() is a join with the time, which is one more input after the others. Its term reads every input below
 /// the old cursor, and it is the difference of the query at the new and at the old time over the rows whose filter changed.
-ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const
+ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor,
+    DeltaQueryBounds * out_bounds) const
 {
     if (recursion)
         return buildRecursiveDelta(old_cursor, new_cursor);
@@ -605,6 +612,19 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
     const auto tables = snapshotTables(inputs);
     const auto old_bounds = parseCursor(old_cursor, inputs, tables, "old cursor");
     const auto new_bounds = parseCursor(new_cursor, inputs, tables, "new cursor");
+    BoundSlots slots;
+    if (out_bounds)
+    {
+        for (const auto * bounds : {&old_bounds, &new_bounds})
+        {
+            for (const auto & [key, partitions] : *bounds)
+            {
+                auto slot = fmt::format("{}.{}", key, bounds == &old_bounds ? "old" : "new");
+                out_bounds->slots[slot] = {partitions.begin(), partitions.end()};
+                slots.emplace(&partitions, std::move(slot));
+            }
+        }
+    }
     checkCursors(tables, old_bounds, new_bounds, /*is_join=*/ inputs.size() > 1);
     /// The terms read a lookup table only as of the new cursor.
     for (const auto & input : inputs)
@@ -621,7 +641,7 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "The cursors of a delta query that calls now() need the time of their snapshot, which deltaQueryFrontier adds");
 
-    DeltaTerms terms(*this, old_bounds, new_bounds);
+    DeltaTerms terms(*this, old_bounds, new_bounds, out_bounds ? &slots : nullptr);
     using Rows = DeltaTerms::Rows;
     /// From the empty cursor, the delta is the query as of the new cursor. One term reads it, instead of one term per input
     /// that each read all the other inputs.

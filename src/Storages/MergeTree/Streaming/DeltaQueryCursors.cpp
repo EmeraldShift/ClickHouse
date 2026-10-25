@@ -55,7 +55,7 @@ std::map<String, TableBlocks> snapshotTables(const std::vector<Input> & inputs)
 {
     std::map<String, TableBlocks> tables;
     for (const auto & input : inputs)
-        tables.try_emplace(input.key, *input.storage);
+        tables.try_emplace(input.key, lockStorage(input));
     return tables;
 }
 
@@ -258,8 +258,9 @@ std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTr
             last_blocks[partition_id] = bound - 1;
         subscription->update(std::move(last_blocks), {});
         subscription->setCallback(callback);
-        input.storage->subscription_manager.registerSubscription(subscription);
-        input.storage->triggerStreamingSubscriptionEnrichment();
+        const auto storage = lockStorage(input);
+        storage->subscription_manager.registerSubscription(subscription);
+        storage->triggerStreamingSubscriptionEnrichment();
         subscriptions.push_back(std::move(subscription));
     }
     return subscriptions;
@@ -281,7 +282,7 @@ std::vector<scope_guard> DeltaQuery::holdCursor(const CursorTreeNodePtr & cursor
     std::vector<scope_guard> guards;
     std::set<String> keys;
     for (const auto & input : inputs)
-        if (auto storage = std::dynamic_pointer_cast<StorageMergeTree>(input.storage); storage && !input.lookup && keys.insert(input.key).second)
+        if (auto storage = std::dynamic_pointer_cast<StorageMergeTree>(lockStorage(input)); storage && !input.lookup && keys.insert(input.key).second)
             guards.push_back(storage->holdDeltaQueryBounds(bounds.at(input.key)));
     return guards;
 }

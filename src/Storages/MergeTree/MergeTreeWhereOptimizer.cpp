@@ -222,10 +222,29 @@ MergeTreeWhereOptimizer::FilterActionsOptimizeResult MergeTreeWhereOptimizer::op
         }
     }
 
+    /// `indexHint` is 1 for every row and only matters to the index analysis, which also reads PREWHERE. If it's all that
+    /// stays in WHERE, move it to PREWHERE too. With a WHERE step left, the deltas of `deltaQuery` read whole parts even
+    /// where a projection index by the join key skips most granules.
+    const bool only_index_hints_left = !prewhere_conditions_list.empty()
+        && std::ranges::all_of(optimize_result->where_conditions, [](const auto & condition)
+        {
+            return std::ranges::all_of(condition.nodes, [](const auto & n)
+            {
+                return n.isFunction() && n.toFunctionNode().getFunctionName() == "indexHint";
+            });
+        });
+    if (only_index_hints_left)
+    {
+        for (const auto & condition : optimize_result->where_conditions)
+            for (const auto & n : condition.nodes)
+                if (prewhere_conditions.insert(n.getDAGNode()).second)
+                    prewhere_conditions_list.push_back(n.getDAGNode());
+    }
+
     return {
         .prewhere_nodes = std::move(prewhere_conditions),
         .prewhere_nodes_list = std::move(prewhere_conditions_list),
-        .fully_moved_to_prewhere = optimize_result->where_conditions.empty()};
+        .fully_moved_to_prewhere = optimize_result->where_conditions.empty() || only_index_hints_left};
 }
 
 static void collectColumns(

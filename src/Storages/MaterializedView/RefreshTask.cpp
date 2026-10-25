@@ -1532,8 +1532,9 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             query_for_logging = "(create target table)";
             normalized_query_hash = normalizedQueryHash(query_for_logging, false);
             QueryScope query_scope;
-            std::tie(refresh_query, query_scope) = view->prepareRefresh(
-                refresh_mode, refresh_context, table_to_drop, stream_cursor, new_cursor_holds, refresh_holds, execution.history_lost);
+            std::shared_ptr<PreparedSelectPlan> prepared_plan;
+            std::tie(refresh_query, query_scope) = view->prepareRefresh(refresh_mode, refresh_context, table_to_drop, stream_cursor,
+                new_cursor_holds, refresh_holds, prepared_plan, execution.history_lost);
             new_table_id = refresh_query->table_id;
 
             /// Add the query to system.processes and allow it to be killed with KILL QUERY.
@@ -1577,6 +1578,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
                 /* no_squash */ false,
                 /* no_destination */ false,
                 /* async_isnert */ false);
+            interpreter.setPreparedSelectPlan(std::move(prepared_plan));
             BlockIO block_io = interpreter.execute();
             QueryPipeline & pipeline = block_io.pipeline;
 

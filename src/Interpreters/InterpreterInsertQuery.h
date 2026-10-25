@@ -18,6 +18,17 @@ class InsertDependenciesBuilder;
 
 class ParallelReplicasReadingCoordinator;
 using ParallelReplicasReadingCoordinatorPtr = std::shared_ptr<ParallelReplicasReadingCoordinator>;
+struct SelectQueryOptions;
+
+/// The serialized logical plan of the SELECT of an INSERT. The incremental refresh of a view runs the same SELECT on every
+/// refresh with other values of functions that read the context, like `__deltaQueryBound`. The first INSERT fills it, and
+/// the later ones run it without analyzing and planning the SELECT.
+struct PreparedSelectPlan
+{
+    String serialized;
+    /// Whether a step of the plan has no serialization. The INSERTs then plan the SELECT as usual.
+    bool unserializable = false;
+};
 
 /** Interprets the INSERT query.
   */
@@ -65,6 +76,11 @@ public:
     /// privilege is verified up front by the caller. The source `SELECT` access is still checked as the user.
     /// Never set this for a user-visible target table.
     void setSkipTargetInsertAccessCheck(bool skip) { skip_target_insert_access_check = skip; }
+
+    /// Run the SELECT of an INSERT SELECT from `plan`, or fill `plan` first, see `PreparedSelectPlan`. The plan skips the
+    /// analysis of the SELECT, and with it the checks of access rights and the row policies. The caller must reuse it only
+    /// where those give what they gave when the plan was filled.
+    void setPreparedSelectPlan(std::shared_ptr<PreparedSelectPlan> plan) { prepared_select_plan = std::move(plan); }
 
     static bool shouldAddSquashingForStorage(const StoragePtr & table, ContextPtr context);
 
@@ -117,6 +133,7 @@ private:
     const bool positional_arguments_already_resolved;
     bool select_query_sorted = false;
     bool skip_target_insert_access_check = false;
+    std::shared_ptr<PreparedSelectPlan> prepared_select_plan;
 
     size_t max_threads = 0;
     size_t max_insert_threads = 0;
@@ -125,6 +142,9 @@ private:
     /// transform can drop it as soon as the queue has the block; the caller is left with an empty holder.
     QueryPipeline buildInsertSelectPipeline(
         ASTInsertQuery & query, StoragePtr table, bool add_async_insert_queue_transform, TableLockHolder & destination_lock);
+    /// The pipeline of the SELECT from `prepared_select_plan`, or nothing if it's unserializable.
+    std::optional<QueryPipelineBuilder> buildPreparedSelectPipeline(
+        const ASTInsertQuery & query, const ContextPtr & select_context, SelectQueryOptions options);
     QueryPipeline addInsertToSelectPipeline(
         ASTInsertQuery & query, StoragePtr table, QueryPipelineBuilder & pipeline_builder, bool add_async_insert_queue_transform,
         TableLockHolder * destination_lock);

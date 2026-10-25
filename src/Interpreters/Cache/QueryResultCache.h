@@ -349,4 +349,7 @@ private:
 
 using QueryResultCachePtr = std::shared_ptr<QueryResultCache>;
 
+/// Does AST contain non-deterministic functions like rand() and now()?
+bool astContainsNonDeterministicFunctions(ASTPtr ast, ContextPtr context);
+
 }

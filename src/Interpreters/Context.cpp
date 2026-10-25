@@ -1598,6 +1598,7 @@ ContextData::ContextData(const ContextData &o) :
     merge_tree_transaction(o.merge_tree_transaction),
     merge_tree_transaction_holder(o.merge_tree_transaction_holder),
     streaming_cursor(o.streaming_cursor),
+    delta_query_bounds(o.delta_query_bounds),
     remote_read_query_throttler(o.remote_read_query_throttler),
     remote_write_query_throttler(o.remote_write_query_throttler),
     local_read_query_throttler(o.local_read_query_throttler),
@@ -4964,6 +4965,16 @@ void Context::setStreamingCursor(std::shared_ptr<StreamingCursor> cursor)
 std::shared_ptr<StreamingCursor> Context::getStreamingCursor() const
 {
     return streaming_cursor;
+}
+
+void Context::setDeltaQueryBounds(std::shared_ptr<const DeltaQueryBounds> bounds)
+{
+    delta_query_bounds = std::move(bounds);
+}
+
+std::shared_ptr<const DeltaQueryBounds> Context::getDeltaQueryBounds() const
+{
+    return delta_query_bounds;
 }
 
 

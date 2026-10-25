@@ -1768,6 +1768,7 @@ The server successfully detected this situation and will download merged part fr
     \
     M(RefreshableViewRefreshSuccess, "How many times refreshable materialized views refreshed", ValueType::Number) \
     M(RefreshableViewRefreshFailed, "How many times refreshable materialized views failed to refresh", ValueType::Number) \
+    M(InsertSelectReusedPlans, "How many times an INSERT SELECT ran its SELECT from a plan that an earlier INSERT prepared, like the delta of an incremental refresh", ValueType::Number) \
     M(RefreshableViewSyncReplicaSuccess, "How many times a SELECT from refreshable materialized view did an implicit SYNC REPLICA", ValueType::Number) \
     M(RefreshableViewSyncReplicaRetry, "How many times a SELECT from refreshable materialized view failed and retried an implicit SYNC REPLICA", ValueType::Number) \
     M(RefreshableViewLockTableRetry, "How many times a SELECT from refreshable materialized view had to switch to a new table because the old table was dropped", ValueType::Number) \

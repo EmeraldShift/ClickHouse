@@ -432,7 +432,7 @@ ASTPtr DeltaQuery::buildRecursiveTerm(const CursorTreeNodePtr & new_cursor, cons
             continue;
         }
         ASTs conjuncts;
-        addBounds(conjuncts, input.alias, nullptr, bounds.at(input.key));
+        addBounds(conjuncts, input.alias, nullptr, bounds.at(input.key), nullptr);
         setInput(term_select, input, makeSnapshot(input, bounds.at(input.key)), std::move(conjuncts), where, sign_column);
     }
     term_select.setExpression(ASTSelectQuery::Expression::WHERE, makeConjunction(std::move(where)));

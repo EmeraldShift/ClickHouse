@@ -32,6 +32,11 @@
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/stripQuerySettings.h>
 #include <Processors/Sinks/EmptySink.h>
+#include <Processors/QueryPlan/BuildQueryPipelineSettings.h>
+#include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
+#include <Core/ProtocolDefines.h>
+#include <IO/ReadBufferFromString.h>
+#include <Common/ProfileEvents.h>
 #include <Processors/Transforms/CountingTransform.h>
 #include <Processors/Transforms/ExpressionTransform.h>
 #include <Processors/Transforms/DeduplicationTokenTransforms.h>
@@ -69,6 +74,11 @@
 #include <unordered_set>
 
 
+namespace ProfileEvents
+{
+    extern const Event InsertSelectReusedPlans;
+}
+
 namespace DB
 {
 namespace Setting
@@ -98,6 +108,7 @@ namespace Setting
     extern const SettingsUInt64 shrink_over_allocated_columns_min_waste_bytes;
     extern const SettingsString insert_deduplication_token;
     extern const SettingsBool use_concurrency_control;
+    extern const SettingsBool make_distributed_plan;
     extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsUInt64 parallel_distributed_insert_select;
     extern const SettingsBool enable_parsing_to_custom_serialization;
@@ -780,6 +791,10 @@ QueryPipeline InterpreterInsertQuery::buildInsertSelectPipeline(
     {
         auto select_query_options = SelectQueryOptions(QueryProcessingStage::Complete, 1)
             .positionalArgumentsAlreadyResolved(positional_arguments_already_resolved);
+        /// A distributed plan needs a decision of the planner that a deserialized plan has no context for.
+        if (prepared_select_plan && !prepared_select_plan->unserializable && !select_context->getSettingsRef()[Setting::make_distributed_plan])
+            if (auto prepared = buildPreparedSelectPipeline(query, select_context, select_query_options))
+                return std::move(*prepared);
         InterpreterSelectQueryAnalyzer interpreter_select_analyzer(query.select, select_context, select_query_options);
         return interpreter_select_analyzer.buildQueryPipeline();
     }();
@@ -795,6 +810,37 @@ QueryPipeline InterpreterInsertQuery::buildInsertSelectPipeline(
     return addInsertToSelectPipeline(query, table, pipeline, add_async_insert_queue_transform, &destination_lock);
 }
 
+
+std::optional<QueryPipelineBuilder> InterpreterInsertQuery::buildPreparedSelectPipeline(
+    const ASTInsertQuery & query, const ContextPtr & select_context, SelectQueryOptions options)
+{
+    auto & prepared = *prepared_select_plan;
+    if (prepared.serialized.empty())
+    {
+        /// Like the plan of a shard of a distributed query, see `createLocalPlan`.
+        options.build_logical_plan = true;
+        auto plan = InterpreterSelectQueryAnalyzer(query.select, select_context, options).extractQueryPlan();
+        if (findNonSerializableStep(plan.getRootNode()))
+        {
+            prepared.unserializable = true;
+            return {};
+        }
+        WriteBufferFromString out(prepared.serialized);
+        plan.serialize(out, DBMS_QUERY_PLAN_SERIALIZATION_VERSION);
+        out.finalize();
+    }
+    else
+        ProfileEvents::increment(ProfileEvents::InsertSelectReusedPlans);
+
+    /// Like a shard that gets a plan, see `executeQueryImpl`. The plan gets new reads, sets and functions.
+    ReadBufferFromString in(prepared.serialized);
+    auto plan = QueryPlan::makeSets(QueryPlan::deserialize(in, select_context, /*max_type_complexity=*/ 0), select_context);
+    plan.resolveStorages(select_context);
+    QueryPlanOptimizationSettings optimization_settings(select_context);
+    plan.setConcurrencyControl(select_context->getSettingsRef()[Setting::use_concurrency_control]);
+    plan.optimize(optimization_settings);
+    return std::move(*plan.buildQueryPipeline(optimization_settings, BuildQueryPipelineSettings(select_context), /*do_optimize=*/ false));
+}
 
 std::pair<QueryPipeline, ClusterProxy::LocalPlanParallelReplicasInfo> InterpreterInsertQuery::buildLocalInsertSelectPipelineForParallelReplicas(
     ASTInsertQuery & query, const StoragePtr & table, ContextPtr select_context)

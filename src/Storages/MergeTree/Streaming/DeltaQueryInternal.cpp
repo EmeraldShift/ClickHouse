@@ -32,10 +32,19 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_TABLE;
 }
 
 namespace DeltaQueryInternal
 {
+
+std::shared_ptr<MergeTreeData> lockStorage(const DeltaQuery::Input & input)
+{
+    auto storage = input.storage.lock();
+    if (!storage)
+        throw Exception(ErrorCodes::UNKNOWN_TABLE, "Table {} of the delta query was dropped", input.table_id.getNameForLogs());
+    return storage;
+}
 
 [[noreturn]] void throwUnsupported(std::string_view construct)
 {

@@ -13,6 +13,7 @@
 #include <Core/Joins.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <Interpreters/Cache/QueryResultCache.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -210,7 +211,7 @@ Input makeInput(const TableNode & table)
 
     const bool updatable = !storage->supportsReplication() && storage->supportsLightweightUpdate().has_value();
     return {.alias = table.getAlias(), .key = toString(table_id.uuid), .table_id = table_id, .storage = std::move(storage),
-        .updatable = updatable};
+        .metadata = table.getStorageSnapshot()->metadata, .updatable = updatable};
 }
 
 /// Rejects subqueries, which could read tables that the cursors do not cover. Resolution replaces scalar subqueries by
@@ -614,6 +615,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     /// A filter by now() changes its result as time passes, see `buildDelta`. Elsewhere now() would change rows that no
     /// delta reads again.
     const bool has_clock = callsNow(*query_);
+    deterministic = !astContainsNonDeterministicFunctions(query_, context);
     if (const auto & selects = query_->as<ASTSelectWithUnionQuery &>().list_of_selects->children; has_clock && selects.size() == 1)
     {
         const auto & original = selects[0]->as<ASTSelectQuery &>();
@@ -658,7 +660,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
             if (num_stage_inputs == stages.size() && recursion_table)
             {
                 inputs.push_back({.alias = function->getAlias(), .key = toString(recursion_table->uuid), .table_id = *recursion_table,
-                    .storage = nullptr, .stage = true, .is_signed = true});
+                    .storage = {}, .stage = true, .is_signed = true});
                 continue;
             }
             if (num_stage_inputs == stages.size())
@@ -666,7 +668,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
             const auto & stage = stages[num_stage_inputs++];
             /// The table of a stage whose rows never retract holds rows of sign 1, so the query reads it unsigned.
             inputs.push_back({.alias = function->getAlias(), .key = toString(stage.table.uuid), .table_id = stage.table,
-                .storage = nullptr, .stage = true, .is_signed = stage.query->retractsRows()});
+                .storage = {}, .stage = true, .is_signed = stage.query->retractsRows()});
             continue;
         }
         inputs.push_back(makeInput(table->as<TableNode &>()));
@@ -856,6 +858,25 @@ ASTPtr DeltaQuery::getQuery() const
     return result;
 }
 
+bool DeltaQuery::hasReusableDeltas() const
+{
+    return deterministic && !recursion && cluster.empty() && stages.empty() && !residual && !clock_input && asof_joins.empty()
+        && std::ranges::none_of(inputs, [](const auto & input) { return input.updatable || input.stage; });
+}
+
+std::vector<DeltaQuery::InputTable> DeltaQuery::getInputTables() const
+{
+    std::vector<InputTable> tables;
+    for (const auto & input : inputs)
+        tables.push_back({input.table_id, input.metadata});
+    return tables;
+}
+
+void DeltaQuery::setContext(const ContextPtr & context)
+{
+    analysis_context = context;
+}
+
 NamesAndTypesList DeltaQuery::getResultColumns() const
 {
     if (recursion)
@@ -863,9 +884,13 @@ NamesAndTypesList DeltaQuery::getResultColumns() const
     if (residual)
         return residual->output_columns;
     /// The passes after resolution keep the types of the result columns. Resolution alone finds them.
-    InterpreterSelectQueryAnalyzer interpreter(getQuery(), analysis_context, SelectQueryOptions().analyze().ignoreASTOptimizations());
-    const auto & columns = interpreter.getQueryTree()->as<const QueryNode &>().getProjectionColumns();
-    return NamesAndTypesList(columns.begin(), columns.end());
+    if (!result_columns)
+    {
+        InterpreterSelectQueryAnalyzer interpreter(getQuery(), analysis_context, SelectQueryOptions().analyze().ignoreASTOptimizations());
+        const auto & columns = interpreter.getQueryTree()->as<const QueryNode &>().getProjectionColumns();
+        result_columns.emplace(columns.begin(), columns.end());
+    }
+    return *result_columns;
 }
 
 ASTs DeltaQuery::castToResultTypes(const Names & columns) const

@@ -33,8 +33,10 @@ struct DeltaQuery::Input
     /// The key of the table in cursors: its UUID.
     String key;
     StorageID table_id = StorageID::createEmpty();
-    /// Null for a stage table until `bindStageTables`.
-    std::shared_ptr<MergeTreeData> storage;
+    /// Empty for a stage table until `bindStageTables`. Weak, so that a view that keeps the query doesn't keep a dropped table.
+    std::weak_ptr<MergeTreeData> storage;
+    /// The metadata of the table in the analysis.
+    std::shared_ptr<const StorageInMemoryMetadata> metadata = {};
     /// Whether the input is the table of a stage, see `DeltaQuery::Stage`.
     bool stage = false;
     /// Whether `delta_query_lookup_tables` names the table. Its new rows then have no term, and the other terms read its
@@ -178,6 +180,9 @@ constexpr auto internal_sign_column = "__delta_query_sign";
 /// The factor of the weights of queries whose deltas have terms that retract rows, see `DeltaQuery::buildDelta`.
 constexpr auto term_sign_name = "__term_sign";
 
+/// The slots of `__deltaQueryBound` of the bounds of the inputs of a delta, by the address of the bounds.
+using BoundSlots = std::map<const std::map<String, Int64> *, String>;
+
 Int64 getBound(const std::map<String, Int64> & partitions, const String & partition_id);
 
 /// The parts of one table on this server, the promoters that report the blocks in flight to it, and its unfinished
@@ -185,8 +190,9 @@ Int64 getBound(const std::map<String, Int64> & partitions, const String & partit
 class TableBlocks
 {
 public:
-    explicit TableBlocks(MergeTreeData & storage_)
-        : storage(storage_)
+    explicit TableBlocks(std::shared_ptr<MergeTreeData> storage_)
+        : holder(std::move(storage_))
+        , storage(*holder)
         , parts(storage.getDataPartsVectorForInternalUsage({MergeTreeData::DataPartState::Active},
             {MergeTreeData::DataPartKind::Regular, MergeTreeData::DataPartKind::Patch}))
         , blocks(getLocalParts(parts))
@@ -248,6 +254,7 @@ private:
         Int64 block_number;
     };
 
+    std::shared_ptr<MergeTreeData> holder;
     MergeTreeData & storage;
     DataPartsVector parts;
     LocalPartsByPartition blocks;
@@ -255,6 +262,9 @@ private:
     std::vector<Mutation> unfinished_mutations;
 };
 
+
+/// The table of `input`. Throws if it was dropped since the analysis of the query.
+std::shared_ptr<MergeTreeData> lockStorage(const DeltaQuery::Input & input);
 
 [[noreturn]] void throwUnsupported(std::string_view construct);
 
@@ -399,7 +409,7 @@ String makeShardCursor(const CursorTreeNodePtr & cursor);
 /// below `upper`. The `indexHint` on `mergeTreePartInfo(_part)` skips the parts outside the bounds before reading them.
 /// Rows don't evaluate it.
 void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
-    const std::map<String, Int64> & upper);
+    const std::map<String, Int64> & upper, const BoundSlots * slots);
 
 /// The table of `input` with the lightweight updates below `bounds`, `deltaQuerySnapshot('database', 'table', map(...))`,
 /// or the table itself if it can't have updates.

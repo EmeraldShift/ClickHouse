@@ -61,6 +61,8 @@
 #include <Common/quoteString.h>
 
 #include <Backups/BackupEntriesCollector.h>
+#include <Access/ContextAccess.h>
+#include <Storages/getEffectiveRowPolicyFilter.h>
 
 namespace DB
 {
@@ -162,11 +164,12 @@ namespace
 
     /// The rows that make `target` follow `delta_query` from `old_cursor` to the new cursor, which goes to `new_cursor`. The
     /// stages of `delta_query` first insert their rows into their stage tables. The hidden tables of the residual of a query
-    /// follow from `owner`, which is the view or the stage table.
+    /// follow from `owner`, which is the view or the stage table. With `out_bounds`, the delta of a query without a residual
+    /// reads the bounds with `__deltaQueryBound`, and `out_bounds` gets them, see `DeltaQuery::buildDelta`.
     ASTPtr buildIncrementalRefresh(DeltaQuery & delta_query, const StorageID & owner, const StorageID & target,
         const CursorTreeNodePtr & old_cursor, CursorTreeNodePtr & new_cursor, bool recompute, const ContextMutablePtr & refresh_context,
         RefreshSnapshot & snapshot, std::optional<StorageID> & out_temp_table_id, std::vector<scope_guard> & out_cursor_holds,
-        std::vector<scope_guard> & out_refresh_holds)
+        std::vector<scope_guard> & out_refresh_holds, DeltaQueryBounds * out_bounds)
     {
         std::map<String, CursorTreeNodePtr> stage_cursors;
         std::set<String> stage_keys;
@@ -186,7 +189,7 @@ namespace
             std::optional<StorageID> stage_delta;
             auto rows = buildIncrementalRefresh(*stage.query, stage.table, stage.table,
                 old_cursor && old_cursor->hasSubtree(key) ? old_cursor->getSubtree(key) : nullptr, stage_cursors[key], recompute,
-                refresh_context, snapshot, stage_delta, out_cursor_holds, out_refresh_holds);
+                refresh_context, snapshot, stage_delta, out_cursor_holds, out_refresh_holds, /*out_bounds=*/ nullptr);
             Strings columns;
             for (const auto & column : stage.query->getResultColumns())
                 columns.push_back(backQuote(column.name));
@@ -211,7 +214,7 @@ namespace
         {
             try
             {
-                select_query = delta_query.buildDelta(own_cursor, new_cursor);
+                select_query = delta_query.buildDelta(own_cursor, new_cursor, delta_query.hasResidual() ? nullptr : out_bounds);
             }
             catch (const Exception & e)
             {
@@ -388,6 +391,151 @@ namespace
     }
 }
 
+namespace
+{
+
+/// What the analysis of the query of a `REFRESH ... INCREMENTAL` view and the plans of its deltas depend on besides their
+/// text, the settings and the current database. The analysis checks the access rights of the definer, and the analysis
+/// and the plans have the metadata of the inputs. The plans would also have their row policies, so inputs with row
+/// policies get none.
+struct RefreshDependencies
+{
+    std::vector<StorageMetadataPtr> inputs;
+    std::shared_ptr<const AccessRights> access;
+};
+
+/// The dependencies of a cached analysis or plan, which are valid while they are the same objects as the current ones.
+struct CachedRefreshDependencies
+{
+    std::vector<std::weak_ptr<const StorageInMemoryMetadata>> inputs;
+    std::weak_ptr<const AccessRights> access;
+
+    explicit CachedRefreshDependencies(const RefreshDependencies & dependencies)
+        : inputs(dependencies.inputs.begin(), dependencies.inputs.end()), access(dependencies.access)
+    {
+    }
+
+    bool isCurrent(const RefreshDependencies & current) const
+    {
+        return access.lock() == current.access
+            && std::ranges::equal(inputs, current.inputs, [](const auto & weak, const auto & metadata) { return weak.lock() == metadata; });
+    }
+};
+
+/// The current dependencies of the inputs `tables` of a query, which it resolves by name. Nothing if a table doesn't resolve
+/// or has a row policy.
+std::optional<RefreshDependencies> getRefreshDependencies(const std::vector<DeltaQuery::InputTable> & tables, const ContextPtr & context)
+{
+    RefreshDependencies dependencies{.inputs = {}, .access = context->getAccess()->getAccessRights()};
+    for (const auto & table : tables)
+    {
+        auto storage = DatabaseCatalog::instance().tryGetTable(StorageID(table.id.database_name, table.id.table_name), context);
+        if (!storage || getEffectiveRowPolicyFilter(*storage, context))
+            return {};
+        auto metadata = storage->getInMemoryMetadataPtr(context, false);
+        dependencies.inputs.push_back(metadata);
+    }
+    return dependencies;
+}
+
+/// The key of the analysis or plan of `query` in `context`.
+UInt128 getRefreshCacheKey(const IAST & query, const ContextPtr & context)
+{
+    SipHash hash;
+    const auto tree_hash = query.getTreeHash(/*ignore_aliases=*/ false);
+    hash.update(tree_hash.low64);
+    hash.update(tree_hash.high64);
+    hash.update(context->getCurrentDatabase());
+    for (const auto & change : context->getSettingsRef().changes())
+    {
+        /// The retries of a refresh have other log comments.
+        if (change.name == "log_comment")
+            continue;
+        hash.update(change.name);
+        hash.update(change.value.dump());
+    }
+    return hash.get128();
+}
+
+}
+
+/// The refreshes of a view run one at a time, so a refresh uses the cached `DeltaQuery` alone.
+struct StorageMaterializedView::RefreshCache
+{
+    /// The analysis of `query`, the query of the view, or the one of an earlier refresh if it is still valid. Only queries
+    /// with reusable deltas are kept, see `DeltaQuery::hasReusableDeltas`.
+    std::shared_ptr<DeltaQuery> getQuery(const ASTPtr & query, const ContextPtr & context, const StorageID & view)
+    {
+        const auto key = getRefreshCacheKey(*query, context);
+        std::lock_guard lock(mutex);
+        if (analysis && analysis->key == key)
+        {
+            const auto current = getRefreshDependencies(analysis->query->getInputTables(), context);
+            if (current && analysis->dependencies.isCurrent(*current))
+            {
+                analysis->query->setContext(context);
+                return analysis->query;
+            }
+        }
+        analysis.reset();
+        /// Before the analysis, so that a change of the grants during the analysis invalidates it.
+        const auto access = context->getAccess()->getAccessRights();
+        auto delta_query = std::make_shared<DeltaQuery>(query, context, view);
+        if (delta_query->hasReusableDeltas())
+        {
+            /// The dependencies as of the analysis.
+            RefreshDependencies dependencies{.inputs = {}, .access = access};
+            for (const auto & table : delta_query->getInputTables())
+                dependencies.inputs.push_back(table.metadata);
+            analysis.emplace(key, delta_query, CachedRefreshDependencies(dependencies));
+        }
+        return delta_query;
+    }
+
+    /// The plan of `delta`, a delta of `delta_query`, that the refreshes with the same delta share. Null if the inputs have
+    /// row policies.
+    std::shared_ptr<PreparedSelectPlan> getPlan(const ASTPtr & delta, const DeltaQuery & delta_query, const ContextPtr & context)
+    {
+        /// Before the INSERT plans the delta, like the dependencies of the analysis.
+        const auto current = getRefreshDependencies(delta_query.getInputTables(), context);
+        if (!current)
+            return nullptr;
+        const auto key = getRefreshCacheKey(*delta, context);
+        std::lock_guard lock(mutex);
+        if (auto it = plans.find(key); it != plans.end())
+        {
+            if (it->second.dependencies.isCurrent(*current))
+                return it->second.plan;
+            plans.erase(it);
+        }
+        /// Deltas have one shape per set of inputs with new rows. A view with many inputs could have many.
+        if (plans.size() >= 16)
+            plans.clear();
+        auto plan = std::make_shared<PreparedSelectPlan>();
+        plans.emplace(key, Plan{plan, CachedRefreshDependencies(*current)});
+        return plan;
+    }
+
+private:
+    struct Analysis
+    {
+        UInt128 key;
+        std::shared_ptr<DeltaQuery> query;
+        CachedRefreshDependencies dependencies;
+    };
+    struct Plan
+    {
+        std::shared_ptr<PreparedSelectPlan> plan;
+        CachedRefreshDependencies dependencies;
+    };
+
+    std::mutex mutex;
+    std::optional<Analysis> analysis TSA_GUARDED_BY(mutex);
+    std::map<UInt128, Plan> plans TSA_GUARDED_BY(mutex);
+};
+
+StorageMaterializedView::~StorageMaterializedView() = default;
+
 StorageMaterializedView::StorageMaterializedView(
     const StorageID & table_id_,
     ContextPtr local_context,
@@ -397,6 +545,7 @@ StorageMaterializedView::StorageMaterializedView(
     const String & comment,
     bool is_restore_from_backup)
     : StorageWithCommonVirtualColumns(table_id_), WithMutableContext(local_context->getGlobalContext())
+    , refresh_cache(std::make_unique<RefreshCache>())
 {
     StorageInMemoryMetadata storage_metadata;
     storage_metadata.setColumns(columns_);
@@ -970,7 +1119,7 @@ std::vector<StreamSubscriptionPtr> StorageMaterializedView::subscribeToInputComm
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
     const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds,
-    bool recompute) const
+    std::shared_ptr<PreparedSelectPlan> & out_prepared_plan, bool recompute) const
 {
     const bool append = mode != RefreshMode::Replace;
     const bool incremental = mode == RefreshMode::AppendIncremental;
@@ -1002,15 +1151,20 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
 
     if (delta)
     {
-        DeltaQuery delta_query(select_query, refresh_context, getStorageID());
+        const auto delta_query_ptr = refresh_cache->getQuery(select_query, refresh_context, getStorageID());
+        auto & delta_query = *delta_query_ptr;
         /// Like a refresh that replaces the target, the definer creates, drops, reads and writes the hidden tables.
         if (delta_query.hasResidual() || !delta_query.getStages().empty())
             refresh_context->checkAccess(AccessType::DROP_TABLE | AccessType::CREATE_TABLE | AccessType::SELECT | AccessType::INSERT,
                 getStorageID().database_name);
         CursorTreeNodePtr new_cursor;
         RefreshSnapshot snapshot;
+        auto bounds = std::make_shared<DeltaQueryBounds>();
         select_query = buildIncrementalRefresh(delta_query, getStorageID(), inner_table_id, stream_cursor, new_cursor, recompute,
-            refresh_context, snapshot, out_temp_table_id, out_cursor_holds, out_refresh_holds);
+            refresh_context, snapshot, out_temp_table_id, out_cursor_holds, out_refresh_holds, bounds.get());
+        /// Without bounds, the delta is a correction, or no input has new rows.
+        const bool bound = !bounds->slots.empty();
+        refresh_context->setDeltaQueryBounds(std::move(bounds));
         /// Each delta returns the result columns of the query. Planning the delta just for its header would cost about as much as
         /// planning it for the INSERT.
         for (const auto & column : delta_query.getResultColumns())
@@ -1027,6 +1181,9 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
         refresh_context->setSetting("allow_insert_into_iceberg", Field(UInt64{1}));
         /// A transactional target commits the whole round in one snapshot with the cursor, so it must be a single writer.
         refresh_context->setSetting("max_insert_threads", Field(UInt64{1}));
+
+        if (bound && !recompute && delta_query.hasReusableDeltas())
+            out_prepared_plan = refresh_cache->getPlan(select_query, delta_query, refresh_context);
     }
 
     if (!append)

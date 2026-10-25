@@ -15,6 +15,7 @@ namespace DB
 
 class CursorTreeNode;
 using CursorTreeNodePtr = std::shared_ptr<CursorTreeNode>;
+struct PreparedSelectPlan;
 
 class StorageMaterializedView final : public StorageWithCommonVirtualColumns, WithMutableContext
 {
@@ -27,6 +28,7 @@ public:
         LoadingStrictnessLevel mode,
         const String & comment,
         bool is_restore_from_backup);
+    ~StorageMaterializedView() override;
 
     std::string getName() const override { return "MaterializedView"; }
     bool isView() const override { return true; }
@@ -161,6 +163,11 @@ private:
     /// have UUID, and we do inner table lookup by name instead.
     bool fixed_uuid = true;
 
+    /// The analysis of the query of a `REFRESH ... INCREMENTAL` view and the plans of its deltas, which later refreshes
+    /// reuse.
+    struct RefreshCache;
+    std::unique_ptr<RefreshCache> refresh_cache;
+
     friend class RefreshTask;
 
     void checkStatementCanBeForwarded() const;
@@ -175,10 +182,11 @@ private:
     /// until the refresh ends.
     /// With `recompute`, such a refresh makes the target equal to the query as of the new cursor if it can, see
     /// `DeltaQuery::canCorrect`. It does that also when it finds that the delta from `stream_cursor` lost history.
+    /// It sets `out_prepared_plan` to the plan of the INSERT's SELECT if later refreshes can reuse it.
     std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
     prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
         const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds,
-        bool recompute) const;
+        std::shared_ptr<PreparedSelectPlan> & out_prepared_plan, bool recompute) const;
     std::optional<StorageID> exchangeTargetTable(StorageID fresh_table, ContextPtr refresh_context) const;
     void dropTempTable(StorageID table, ContextMutablePtr refresh_context, String & out_exception);
 

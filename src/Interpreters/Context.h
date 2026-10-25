@@ -343,6 +343,7 @@ struct StreamingCursor
     std::mutex mutex;
     CursorTreeNodePtr tree;
 };
+struct DeltaQueryBounds;
 using QueryMetadataCachePtr = std::shared_ptr<QueryMetadataCache>;
 using QueryMetadataCacheWeakPtr = std::weak_ptr<QueryMetadataCache>;
 
@@ -792,6 +793,9 @@ protected:
     /// Final `STREAM [BOUNDED]` cursor holder (tree + its mutex), shared across `Context::createCopy` so
     /// parallel reading streams serialize their merges into the one tree.
     std::shared_ptr<StreamingCursor> streaming_cursor;
+
+    /// The bounds that `__deltaQueryBound` returns.
+    std::shared_ptr<const DeltaQueryBounds> delta_query_bounds;
 
     /// Use copy constructor or createGlobal() instead
     ContextData();
@@ -1412,6 +1416,10 @@ public:
     /// it (under its mutex), and the outer query reads it back.
     void setStreamingCursor(std::shared_ptr<StreamingCursor> cursor);
     std::shared_ptr<StreamingCursor> getStreamingCursor() const;
+
+    /// The bounds of the inputs of a delta query whose text refers to them with `__deltaQueryBound`.
+    void setDeltaQueryBounds(std::shared_ptr<const DeltaQueryBounds> bounds);
+    std::shared_ptr<const DeltaQueryBounds> getDeltaQueryBounds() const;
 
     /// I/O formats.
     InputFormatPtr getInputFormat(
