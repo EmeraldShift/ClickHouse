@@ -32,7 +32,11 @@ struct DeltaQuery::Input
     String alias;
     /// The key of the table in cursors: its UUID.
     String key;
+    StorageID table_id = StorageID::createEmpty();
+    /// Null for a stage table until `bindStageTables`.
     std::shared_ptr<MergeTreeData> storage;
+    /// Whether the input is the table of a stage, see `DeltaQuery::Stage`.
+    bool stage = false;
     /// Whether `delta_query_lookup_tables` names the table. Its new rows then have no term, and the other terms read its
     /// rows below the new cursor.
     bool lookup = false;
@@ -141,8 +145,8 @@ struct DeltaQuery::Residual
 };
 
 /// The base and the steps of a query `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r`. Each step reads the
-/// table of `delta_query_recursion_table` instead of `r`, as a lookup table. Its delta then joins the new rows of its other
-/// inputs with the rows of `r` at the old cursor.
+/// table of `delta_query_recursion_table` instead of `r`, as a lookup table. A step of a recursive stage reads the stage
+/// table instead. Its delta then joins the new rows of its other inputs with the rows of `r` at the old cursor.
 struct DeltaQuery::Recursion
 {
     std::unique_ptr<DeltaQuery> base;

@@ -1,0 +1,6 @@
+mv	0	354	9
+mv	1	323	9
+mv	2	350	9
+expected	0	354	9
+expected	1	323	9
+expected	2	350	9

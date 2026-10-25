@@ -1,3 +1,5 @@
 after a fact: "a",10 
+nested after a fact: 1,1 
 after a dimension: no refresh
 after a fact of the new dimension: "a",10 "b",5 
+nested after a fact of the new dimension: 1,2 

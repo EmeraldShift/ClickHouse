@@ -7,6 +7,7 @@
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/JoinNode.h>
 #include <Analyzer/QueryNode.h>
+#include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
 #include <Core/Joins.h>
@@ -133,7 +134,9 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
 {
     switch (node->getNodeType())
     {
+        /// A table function stands for the table of a stage, see `DeltaQuery::DeltaQuery`.
         case QueryTreeNodeType::TABLE:
+        case QueryTreeNodeType::TABLE_FUNCTION:
             tables.push_back(node);
             return;
         case QueryTreeNodeType::ARRAY_JOIN:
@@ -163,7 +166,7 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
             if (join.getLocality() == JoinLocality::Global)
                 throwUnsupported("GLOBAL joins");
             const auto right_type = join.getRightTableExpressionNode()->getNodeType();
-            if (is_keyed && (right_type != QueryTreeNodeType::TABLE || !join.isOnJoinExpression()))
+            if (is_keyed && ((right_type != QueryTreeNodeType::TABLE && right_type != QueryTreeNodeType::TABLE_FUNCTION) || !join.isOnJoinExpression()))
                 throwUnsupported("LEFT, SEMI, ANTI or ASOF joins whose right side isn't a table joined by ON");
             collectJoinTree(join.getLeftTableExpressionNode(), tables, join_conditions, keyed_joins);
             collectJoinTree(join.getRightTableExpressionNode(), tables, join_conditions, keyed_joins);
@@ -206,7 +209,8 @@ Input makeInput(const TableNode & table)
                 table_id.getNameForLogs(), virtual_column);
 
     const bool updatable = !storage->supportsReplication() && storage->supportsLightweightUpdate().has_value();
-    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage), .updatable = updatable};
+    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .table_id = table_id, .storage = std::move(storage),
+        .updatable = updatable};
 }
 
 /// Rejects subqueries, which could read tables that the cursors do not cover. Resolution replaces scalar subqueries by
@@ -276,7 +280,7 @@ void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_in
         if (!child)
             continue;
         auto type = child->getNodeType();
-        if (type == QueryTreeNodeType::TABLE && !input_indexes.contains(child.get()))
+        if ((type == QueryTreeNodeType::TABLE || type == QueryTreeNodeType::TABLE_FUNCTION) && !input_indexes.contains(child.get()))
             throwUnsupported("IN over tables");
         if (const auto * function = child->as<FunctionNode>(); is_linear && function && function->isWindowFunction())
             throwUnsupported(fmt::format("window functions in {}", linear_queries));
@@ -473,10 +477,23 @@ std::optional<DeltaQuery::AsofJoin> makeAsofJoin(const JoinNode & join, size_t r
     return asof;
 }
 
+/// How a query without aggregates or GROUP BY returns the weights of its rows as `sign_column`.
+enum class RowWeights : uint8_t
+{
+    /// No sign column if no input has one, and the weight as Int8 otherwise.
+    Omitted,
+    /// The weight as Int8, for inputs whose weights are 1 or -1.
+    Signs,
+    /// As many rows as the absolute weight, of sign 1 or -1.
+    Expanded,
+    /// The weight as Int64, for the table of a stage.
+    Weights,
+};
+
 /// Rewrites the resolved `select` of `query` to carry the weights of its rows, the product of the signs of the signed
-/// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, unless it has no signs and
-/// not `unit_sign`. A query with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
-void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & signs, const String & sign_column, bool unit_sign)
+/// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, see `RowWeights`. A query
+/// with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
+void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & signs, const String & sign_column, RowWeights row_weights)
 {
     const auto & nodes = query.getProjection().getNodes();
     const auto & columns = query.getProjectionColumns();
@@ -491,9 +508,16 @@ void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & s
     {
         if (std::ranges::any_of(columns, [&](const auto & column) { return column.name == sign_column; }))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The delta query returns column {}, which delta_query_sign_column names", sign_column);
-        if (signs.empty() && !unit_sign)
+        if (signs.empty() && row_weights == RowWeights::Omitted)
             return;
-        auto sign = makeASTFunction("toInt8", weight);
+        ASTPtr sign;
+        if (row_weights == RowWeights::Weights)
+            sign = makeASTFunction("toInt64", weight);
+        else if (row_weights == RowWeights::Expanded)
+            sign = makeASTFunction("arrayJoin", makeASTFunction("arrayWithConstant",
+                makeASTFunction("toUInt64", makeASTFunction("abs", weight->clone())), makeASTFunction("toInt8", makeASTFunction("sign", weight))));
+        else
+            sign = makeASTFunction("toInt8", weight);
         sign->setAlias(sign_column);
         projection.push_back(std::move(sign));
         return;
@@ -519,28 +543,38 @@ void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & s
 
 }
 
-DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
+DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path)
+    : DeltaQuery(query_, context_, view, stage_path, nullptr)
+{
+}
+
+DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path,
+    const RecursionTable * recursion_table_)
+    : is_stage(!stage_path.empty())
 {
     /// The query can set `delta_query_sign_column` in its SETTINGS, as the query of a view does.
     auto context = Context::createCopy(context_);
     InterpreterSetQuery::applySettingsFromQuery(query_, context);
     /// The deltas weigh their rows by a sign column. Without `delta_query_sign_column`, no input has a sign column, and the
-    /// sign column of the deltas has an internal name. The parts of a recursive CTE get the same name.
+    /// sign column of the deltas has an internal name. The stages and the parts of a recursive CTE get the same name.
     String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
     if (sign_column_setting.empty())
     {
         sign_column_setting = internal_sign_column;
         context->setSetting("delta_query_sign_column", sign_column_setting);
     }
-    if (analyzeRecursion(query_, context))
+    if (analyzeRecursion(query_, context, view, stage_path))
         return;
-    checkNoSubqueries(*query_);
-    shard_query = readLocalTables(query_, context, cluster);
+    auto rewritten = analyzeStages(query_, context, view, stage_path, recursion_table_);
+    checkNoSubqueries(*rewritten);
+    shard_query = readLocalTables(rewritten, context, cluster);
+    if (!cluster.empty() && !stages.empty())
+        throwUnsupported("subqueries in FROM of queries over Distributed tables");
     analysis_context = context;
 
     Residual split;
     split.sign_column = sign_column_setting;
-    auto core = analyze(shard_query ? shard_query : query_, context, sign_column_setting, &split);
+    auto core = analyze(shard_query ? shard_query : rewritten, context, sign_column_setting, &split);
     if (!core)
         return;
     if (shard_query)
@@ -614,11 +648,29 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
             lookup_tables.insert(name);
     }
     std::set<String> found_lookup_tables;
+    size_t num_stage_inputs = 0;
     for (const auto & table : tables)
     {
         input_indexes.emplace(table.get(), inputs.size());
+        /// The table functions stand for the stages in the order of FROM.
+        if (const auto * function = table->as<TableFunctionNode>())
+        {
+            if (num_stage_inputs == stages.size() && recursion_table)
+            {
+                inputs.push_back({.alias = function->getAlias(), .key = toString(recursion_table->uuid), .table_id = *recursion_table,
+                    .storage = nullptr, .stage = true, .is_signed = true});
+                continue;
+            }
+            if (num_stage_inputs == stages.size())
+                throwUnsupported("table functions in FROM");
+            const auto & stage = stages[num_stage_inputs++];
+            /// The table of a stage whose rows never retract holds rows of sign 1, so the query reads it unsigned.
+            inputs.push_back({.alias = function->getAlias(), .key = toString(stage.table.uuid), .table_id = stage.table,
+                .storage = nullptr, .stage = true, .is_signed = stage.query->retractsRows()});
+            continue;
+        }
         inputs.push_back(makeInput(table->as<TableNode &>()));
-        const auto table_id = inputs.back().storage->getStorageID();
+        const auto & table_id = inputs.back().table_id;
         for (const auto & name : {table_id.table_name, table_id.getFullNameNotQuoted()})
             if (lookup_tables.contains(name))
             {
@@ -667,7 +719,7 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     std::unordered_set<const IQueryTreeNode *> signed_tables;
     for (size_t i = 0; i < tables.size(); ++i)
     {
-        if (!hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
+        if (inputs[i].stage ? !inputs[i].is_signed : !hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
             continue;
         inputs[i].is_signed = true;
         signed_tables.insert(tables[i].get());
@@ -690,8 +742,11 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     {
         return inputs[asof.right].is_signed || inputs[asof.right].updatable || !inputs[asof.left].join_keys.empty();
     });
+    /// The residual of a stage with aggregates makes each refresh replace the rows of the groups that it changes.
+    const bool has_aggregates = query_node->hasGroupBy()
+        || std::ranges::any_of(query_node->getProjection().getNodes(), hasAggregateFunctionNodes);
     has_signs = !signs.empty();
-    const bool has_residual = split && needsResidual(*query_node, !signs.empty());
+    const bool has_residual = split && (needsResidual(*query_node, !signs.empty()) || (is_stage && has_aggregates));
     checkExpressions(*query_tree, input_indexes, !has_residual);
     if (has_residual)
     {
@@ -722,8 +777,16 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     /// Without GROUP BY, a delta that reads no rows still returns one row by default, with 0 for `min` and `max`.
     if (!select.groupBy())
         setSetting(select, "empty_result_for_aggregation_by_empty_set", true);
-    /// The rows for a target with a sign column have a sign even if no input has one.
-    addWeights(select, *query_node, signs, sign_column, sign_column != internal_sign_column);
+    /// The rows of a stage and the rows for a target with a sign column have a sign even if no input has one. The rows of a
+    /// stage that retracts rows sum their weights. A weight can then exceed 1.
+    auto row_weights = RowWeights::Omitted;
+    if (is_stage)
+        row_weights = RowWeights::Weights;
+    else if (std::ranges::any_of(inputs, [](const auto & input) { return input.stage && input.is_signed; }))
+        row_weights = RowWeights::Expanded;
+    else if (sign_column != internal_sign_column)
+        row_weights = RowWeights::Signs;
+    addWeights(select, *query_node, signs, sign_column, row_weights);
 
     std::map<String, std::set<String>> columns;
     collectColumns(select, columns);

@@ -130,8 +130,8 @@ void checkReadableAsOf(const MergeTreeData & storage, const DataPartsVector & pa
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support replicated table {}, which has lightweight updates",
                 storage.getStorageID().getNameForLogs());
         const auto range = getBlockRange(*part);
-        /// The last update or mutation that the part holds. A merged part of a table whose merges rewrite rows combines the
-        /// rows of all its blocks.
+        /// The last update or mutation that the part holds. A merged part of a table whose merges rewrite rows, like a stage
+        /// table, combines the rows of all its blocks.
         Int64 last = part->info.isPatch() ? range.max_block : part->info.mutation;
         if (!part->info.isPatch() && storage.merging_params.mode != MergeTreeData::MergingParams::Ordinary)
             last = std::max(last, range.max_block);
@@ -232,11 +232,21 @@ std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTr
     }
     if (!cluster.empty())
         return {};
-    const auto tables = snapshotTables(inputs);
-    const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
+    /// The stages subscribe to the commits of their inputs. A stage table commits only when a refresh runs the stage.
     std::vector<StreamSubscriptionPtr> subscriptions;
+    for (const auto & stage : stages)
+        std::ranges::move(stage.query->subscribeToCommits(cursor && cursor->hasSubtree(stage.getCursorKey())
+            ? cursor->getSubtree(stage.getCursorKey()) : nullptr, callback), std::back_inserter(subscriptions));
+    std::vector<Input> tables_inputs;
+    std::ranges::copy_if(inputs, std::back_inserter(tables_inputs), [](const auto & input) { return !input.stage; });
+    CursorTreeNodePtr tables_cursor = cursor && !stages.empty() ? std::make_shared<CursorTreeNode>() : cursor;
+    for (const auto & input : tables_inputs)
+        if (tables_cursor != cursor && cursor->hasSubtree(input.key))
+            tables_cursor->setSubtree(input.key, cursor->getSubtree(input.key));
+    const auto tables = snapshotTables(tables_inputs);
+    const auto bounds = parseCursor(tables_cursor, tables_inputs, tables, "cursor");
     std::set<String> keys;
-    for (const auto & input : inputs)
+    for (const auto & input : tables_inputs)
     {
         if (input.lookup || !keys.insert(input.key).second)
             continue;

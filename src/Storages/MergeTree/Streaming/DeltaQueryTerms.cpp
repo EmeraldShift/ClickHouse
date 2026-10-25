@@ -156,7 +156,7 @@ void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String
 
 ASTPtr makeSnapshot(const Input & input, const std::map<String, Int64> & bounds)
 {
-    const auto table_id = input.storage->getStorageID();
+    const auto & table_id = input.table_id;
     if (!input.updatable)
         return make_intrusive<ASTTableIdentifier>(table_id);
     return makeASTFunction("deltaQuerySnapshot", make_intrusive<ASTLiteral>(Field(table_id.database_name)),

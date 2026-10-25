@@ -9,6 +9,7 @@
 #include <Storages/Streaming/IStreamSubscription.h>
 #include <base/scope_guard.h>
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <memory>
@@ -50,6 +51,7 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// Here `d_0` is the delta of the base plus the delta of each step over the rows of `r` at the old cursor, and `step(d)` reads
 /// the inputs at the new cursor. The rows of `r` at the old cursor come from `delta_query_recursion_table`, which a
 /// `REFRESH ... INCREMENTAL` view sets to its target. The weights of the rows make this hold for retractions too.
+/// Any other query over `r` reads `r` as a stage. The stage table then holds `r`.
 ///
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
@@ -66,13 +68,52 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// that write later updates into older rows lose the rows as of a cursor, and the delta then throws
 /// `DELTA_QUERY_HISTORY_LOST`, see `checkReadableAsOf`.
 ///
+/// The query of a `REFRESH ... INCREMENTAL` view can also read subqueries and CTEs in FROM. Each subquery and
+/// each CTE in FROM is a stage.
+/// A stage is a delta query of its own, and its deltas go to a hidden stage table of the view. The query reads the stage
+/// table as a signed input. A stage with aggregates has a residual even if its aggregates are sums. So a refresh retracts
+/// the old row of each group that it changes and inserts the new row. The stage table then holds the rows of the subquery
+/// with signs. The cursor of a query with stages has the cursor of each stage under the key of the stage, see `Stage`.
+///
 /// `deltaQuery` and `REFRESH ... INCREMENTAL` views use this class.
 class DeltaQuery
 {
 public:
-    /// Throws unless `query` is supported and the grants of `context` allow running it.
-    DeltaQuery(const ASTPtr & query, const ContextPtr & context);
+    /// Throws unless `query` is supported and the grants of `context` allow running it. Subqueries in FROM need a `view`.
+    /// The view names their stage tables. A non-empty `stage_path` makes the query the stage of that path of `view`.
+    DeltaQuery(const ASTPtr & query, const ContextPtr & context, const StorageID & view = StorageID::createEmpty(),
+        const String & stage_path = {});
     ~DeltaQuery();
+
+    /// A subquery in FROM and its stage table. The path of the i-th subquery in FROM of the query of a view is `i`. The path
+    /// of the i-th subquery in FROM of the stage of path `p` is `p.i`.
+    struct Stage
+    {
+        String path;
+        StorageID table;
+        std::unique_ptr<DeltaQuery> query;
+
+        /// The key of the cursor of the stage in the cursor of the query that reads the stage. The serialized cursor joins the
+        /// keys on a path with dots, so the key replaces the dots of the path.
+        String getCursorKey() const
+        {
+            String key = "stage_" + path;
+            std::ranges::replace(key, '.', '_');
+            return key;
+        }
+    };
+    const std::vector<Stage> & getStages() const { return stages; }
+    std::vector<Stage> & getStages() { return stages; }
+
+    /// The stage tables of the subqueries of `query` of `view` and of their subqueries. Doesn't analyze `query`.
+    static std::vector<StorageID> getStageTables(const ASTPtr & query, const StorageID & view);
+
+    /// `CREATE TABLE IF NOT EXISTS` of the stage table `table` of this stage. The stage table weighs its rows by an Int64
+    /// sign. Its merges sum the signs of equal rows unless a column can't be in a sorting key.
+    String getStageCreateQuery(const StorageID & table) const;
+
+    /// Makes the inputs of the stages read the stage tables, which must exist. The frontier and the delta need them.
+    void bindStageTables(const ContextPtr & context);
 
     /// The cursor `from` extended by the blocks that this server has committed since. A null `from` is the empty cursor.
     /// For a query over `Distributed` tables, each shard extends its cursor.
@@ -134,9 +175,15 @@ public:
     /// their rows by a sign column of an internal name, and a target can't have that column.
     void checkResultSign() const;
 
+    /// The columns of the stage table of this stage, see `getStageCreateQuery`.
+    NamesAndTypesList getStageColumns() const;
+
     /// Whether a row of the deltas can have a sign other than 1. A residual retracts rows, and so do signed inputs, LEFT,
     /// SEMI and ANTI joins, filters by now() and lightweight updates.
     bool retractsRows() const { return residual || recursion || has_signs; }
+
+    /// The entries of `tree` for the inputs of this query, and its time.
+    CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
 
     struct Input;
     struct SemiJoinEdge;
@@ -145,9 +192,25 @@ public:
     struct Recursion;
 
 private:
+    /// The stage table that a step of a recursive stage reads instead of the CTE, see `Recursion`.
+    struct RecursionTable
+    {
+        String cte;
+        StorageID table;
+        /// The columns of `table`. The table may not exist yet.
+        String structure;
+    };
+    DeltaQuery(const ASTPtr & query, const ContextPtr & context, const StorageID & view, const String & stage_path,
+        const RecursionTable * recursion_table);
+
     /// Returns false unless `query` is `WITH RECURSIVE r AS (...) SELECT * FROM r`, see `Recursion`. Otherwise analyzes it into
     /// `recursion`.
-    bool analyzeRecursion(const ASTPtr & query, const ContextPtr & context);
+    bool analyzeRecursion(const ASTPtr & query, const ContextPtr & context, const StorageID & view, const String & stage_path);
+
+    /// Fills `stages` and returns `query` with each subquery and CTE in FROM replaced by `null` with the columns of its stage
+    /// table. A step of a recursive stage also reads `recursion_table` that way.
+    ASTPtr analyzeStages(const ASTPtr & query, const ContextPtr & context, const StorageID & view, const String & stage_path,
+        const RecursionTable * recursion_table);
 
     /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
     /// fills `split` and returns its core instead, which the caller analyzes.
@@ -161,9 +224,6 @@ private:
     /// `CAST(c, type) AS c, ...` of `columns` of a target, with the types of the rows that the deltas insert. A target can
     /// declare other types, like UInt64 for a count that the deltas weigh as Int64.
     ASTs castToResultTypes(const Names & columns) const;
-
-    /// The entries of `tree` for the inputs of this query, and its time.
-    CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
 
     /// The delta of a recursive query, see `Recursion`.
     ASTPtr buildRecursiveDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
@@ -179,6 +239,11 @@ private:
     std::vector<AsofJoin> asof_joins;
     std::shared_ptr<const Residual> residual;
     std::shared_ptr<const Recursion> recursion;
+    std::vector<Stage> stages;
+    /// The stage table that the table function in FROM stands for, in a step of a recursive stage.
+    std::optional<StorageID> recursion_table;
+    /// Whether this query is a stage, see `Stage`.
+    bool is_stage = false;
     /// Whether the rows of the deltas have a sign other than 1, see `retractsRows`.
     bool has_signs = false;
     String sign_column;

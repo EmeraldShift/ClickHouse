@@ -1486,6 +1486,8 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     bool cursor_persisted_by_target = false;
     /// Keep merges from losing the inputs as of the new cursor from when the refresh picks it.
     std::vector<scope_guard> new_cursor_holds;
+    /// Keep merges from losing the inputs as of the old cursor until the refresh ends.
+    std::vector<scope_guard> refresh_holds;
 
     try
     {
@@ -1531,7 +1533,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             normalized_query_hash = normalizedQueryHash(query_for_logging, false);
             QueryScope query_scope;
             std::tie(refresh_query, query_scope) = view->prepareRefresh(
-                refresh_mode, refresh_context, table_to_drop, stream_cursor, new_cursor_holds, execution.history_lost);
+                refresh_mode, refresh_context, table_to_drop, stream_cursor, new_cursor_holds, refresh_holds, execution.history_lost);
             new_table_id = refresh_query->table_id;
 
             /// Add the query to system.processes and allow it to be killed with KILL QUERY.

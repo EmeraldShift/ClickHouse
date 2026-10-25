@@ -22,6 +22,19 @@ CREATE VIEW expected AS
         JOIN (SELECT src, dst FROM edges GROUP BY src, dst HAVING sum(sign) > 0) AS e ON e.src = r.node)
     SELECT node, depth, toInt64(count()) AS n FROM r GROUP BY node, depth;
 
+-- A query over the CTE reads it as a stage, whose stage table holds the CTE.
+CREATE TABLE depths (depth UInt32, n Int64) ENGINE = SummingMergeTree ORDER BY depth;
+CREATE MATERIALIZED VIEW depths_mv REFRESH EVERY 10 YEAR INCREMENTAL TO depths EMPTY AS
+    WITH RECURSIVE r AS (
+        SELECT node, toUInt32(0) AS depth FROM roots
+        UNION ALL
+        SELECT e.dst AS node, toUInt32(r.depth + 1) AS depth FROM r JOIN edges AS e ON e.src = r.node)
+    SELECT depth, count() AS n FROM r GROUP BY depth SETTINGS delta_query_sign_column = 'sign';
+CREATE VIEW depths_differ AS
+    SELECT depth, sum(n) AS n FROM depths GROUP BY depth HAVING n != 0
+    EXCEPT SELECT depth, sum(n) FROM expected GROUP BY depth
+    UNION ALL (SELECT depth, sum(n) FROM expected GROUP BY depth EXCEPT SELECT depth, sum(n) AS n FROM depths GROUP BY depth HAVING n != 0);
+
 CREATE VIEW actual AS SELECT node, depth, sum(sign) AS n FROM paths GROUP BY node, depth HAVING n != 0;
 
 -- Round 1: a chain. Round 2: edges that extend old paths, where path 1-3-4 needs both new edges. Round 3: a new root.
@@ -30,24 +43,32 @@ INSERT INTO roots VALUES (1);
 INSERT INTO edges VALUES (1, 2, 1), (2, 3, 1);
 SYSTEM REFRESH VIEW paths_mv; SYSTEM WAIT VIEW paths_mv;
 SELECT 'round 1', * FROM actual ORDER BY ALL;
+SYSTEM REFRESH VIEW depths_mv; SYSTEM WAIT VIEW depths_mv;
+SELECT 'round 1 depths differ', * FROM depths_differ;
 SELECT 'round 1 differs', * FROM (SELECT * FROM actual EXCEPT SELECT * FROM expected UNION ALL SELECT * FROM expected EXCEPT SELECT * FROM actual);
 
 INSERT INTO edges VALUES (3, 4, 1), (1, 3, 1);
 SYSTEM REFRESH VIEW paths_mv; SYSTEM WAIT VIEW paths_mv;
 SELECT 'round 2', * FROM actual ORDER BY ALL;
+SYSTEM REFRESH VIEW depths_mv; SYSTEM WAIT VIEW depths_mv;
+SELECT 'round 2 depths differ', * FROM depths_differ;
 SELECT 'round 2 differs', * FROM (SELECT * FROM actual EXCEPT SELECT * FROM expected UNION ALL SELECT * FROM expected EXCEPT SELECT * FROM actual);
 
 INSERT INTO roots VALUES (2);
 SYSTEM REFRESH VIEW paths_mv; SYSTEM WAIT VIEW paths_mv;
 SELECT 'round 3', * FROM actual ORDER BY ALL;
+SYSTEM REFRESH VIEW depths_mv; SYSTEM WAIT VIEW depths_mv;
+SELECT 'round 3 depths differ', * FROM depths_differ;
 SELECT 'round 3 differs', * FROM (SELECT * FROM actual EXCEPT SELECT * FROM expected UNION ALL SELECT * FROM expected EXCEPT SELECT * FROM actual);
 
 INSERT INTO edges VALUES (2, 3, -1);
 SYSTEM REFRESH VIEW paths_mv; SYSTEM WAIT VIEW paths_mv;
 SELECT 'round 4', * FROM actual ORDER BY ALL;
+SYSTEM REFRESH VIEW depths_mv; SYSTEM WAIT VIEW depths_mv;
+SELECT 'round 4 depths differ', * FROM depths_differ;
 SELECT 'round 4 differs', * FROM (SELECT * FROM actual EXCEPT SELECT * FROM expected UNION ALL SELECT * FROM expected EXCEPT SELECT * FROM actual);
 
--- deltaQuery needs the table that holds the CTE, and the query must return the CTE as it is.
+-- deltaQuery needs the table that holds the CTE, and reads no other query over the CTE.
 SELECT * FROM deltaQuery((WITH RECURSIVE r AS (SELECT node FROM roots UNION ALL SELECT e.dst FROM r JOIN edges AS e ON e.src = r.node)
     SELECT * FROM r), map(), map()); -- { serverError BAD_ARGUMENTS }
 SELECT * FROM deltaQuery((WITH RECURSIVE r AS (SELECT node FROM roots UNION ALL SELECT e.dst FROM r JOIN edges AS e ON e.src = r.node)

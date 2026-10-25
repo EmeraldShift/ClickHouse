@@ -171,12 +171,14 @@ private:
     /// out_temp_table_id may be assigned before throwing an exception, in which case the caller
     /// must drop the temp table before rethrowing.
     /// The refresh of a `REFRESH ... INCREMENTAL` view sets `out_cursor_holds` to the guards of the new cursor, see
-    /// `DeltaQuery::holdCursor`.
+    /// `DeltaQuery::holdCursor`. It sets `out_refresh_holds` to the guards of the old cursor. The caller keeps those guards
+    /// until the refresh ends.
     /// With `recompute`, such a refresh makes the target equal to the query as of the new cursor if it can, see
     /// `DeltaQuery::canCorrect`. It does that also when it finds that the delta from `stream_cursor` lost history.
     std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
     prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
-        const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, bool recompute) const;
+        const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds,
+        bool recompute) const;
     std::optional<StorageID> exchangeTargetTable(StorageID fresh_table, ContextPtr refresh_context) const;
     void dropTempTable(StorageID table, ContextMutablePtr refresh_context, String & out_exception);
 
