@@ -44,7 +44,7 @@ SELECT * FROM deltaQueryFrontier((SELECT sum(v), count(), sumIf(v, v > 0), count
 SELECT * FROM deltaQueryFrontier((SELECT min(v), max(v), any(v), groupBitOr(t.k), groupBitAnd(t.k), groupBitXor(t.k) FROM t JOIN u ON t.k = u.k)) FORMAT Null;
 SELECT * FROM deltaQueryFrontier((SELECT t.k + 1 AS j, sum(v * 2) AS s, s FROM t JOIN u ON t.k = u.k GROUP BY t.k)) FORMAT Null;
 
--- A query over one table follows the rules of joins.
+-- A query over one table follows the rules of joins. Its HAVING is a residual, which only views evaluate.
 INSERT INTO t VALUES (1, 10), (2, -3);
 INSERT INTO t VALUES (2, 5);
 SELECT * FROM deltaQuery(
@@ -79,7 +79,6 @@ CREATE TABLE string_sign (k UInt64, sign String) ENGINE = MergeTree ORDER BY k S
 CREATE TABLE unsigned_sign (k UInt64, sign UInt8) ENGINE = MergeTree ORDER BY k SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 SET delta_query_sign_column = 'sign';
 SELECT * FROM deltaQueryFrontier((SELECT k, min(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT k, avg(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, uniqState(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k, sumState(v) FROM s GROUP BY k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT s.k, min(v) FROM s JOIN t ON s.k = t.k GROUP BY s.k)); -- { serverError NOT_IMPLEMENTED }
@@ -90,11 +89,20 @@ SELECT * FROM deltaQueryFrontier((SELECT k FROM s WHERE sign > 0)); -- { serverE
 SELECT * FROM deltaQueryFrontier((SELECT k, v AS sign FROM s)); -- { serverError BAD_ARGUMENTS }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM string_sign)); -- { serverError BAD_ARGUMENTS }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM unsigned_sign)); -- { serverError BAD_ARGUMENTS }
--- With the setting too, a query over one table follows the rules of joins.
-SELECT * FROM deltaQueryFrontier((SELECT k FROM t ORDER BY k)); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT k, count() FROM t GROUP BY k HAVING count() > 1)); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT k, row_number() OVER () FROM t)); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT DISTINCT k FROM t)); -- { serverError NOT_IMPLEMENTED }
+-- With the setting too, a query over one table follows the rules of joins. Clauses that need the integral of the query, like
+-- HAVING, are a residual, which only views evaluate.
+SELECT * FROM deltaQueryFrontier((SELECT k FROM t ORDER BY k)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT k, count() FROM t GROUP BY k HAVING count() > 1)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT k, row_number() OVER () FROM t)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT DISTINCT k FROM t)) FORMAT Null;
+SELECT * FROM deltaQueryFrontier((SELECT k, avg(v) FROM s GROUP BY k)) FORMAT Null;
+SELECT * FROM deltaQuery((SELECT k, count() FROM t GROUP BY k HAVING count() > 1), map(), map()); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQuery((SELECT k, avg(v) FROM s GROUP BY k), map(), map()); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, sum(v) FROM t GROUP BY k WITH TOTALS)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQueryFrontier((SELECT k, sum(v) AS s, s * 2 AS sign FROM t GROUP BY k HAVING s > 0)); -- { serverError BAD_ARGUMENTS }
+-- Names of the columns that the residual generates.
+SELECT * FROM deltaQueryFrontier((SELECT k AS __val_1, sum(v) + 1 AS __key_1 FROM t GROUP BY k)); -- { serverError BAD_ARGUMENTS }
+SELECT * FROM deltaQueryFrontier((SELECT k AS __count, sum(v) + 1 FROM t GROUP BY k)); -- { serverError BAD_ARGUMENTS }
 -- Accepted result columns over signed inputs, and over unsigned inputs with the setting.
 SELECT * FROM deltaQueryFrontier((SELECT k, count(), count(v), countIf(v > 0), sum(v), sumIf(v, v > 0), exponentialMovingAverageState(1)(v, k)
     FROM s GROUP BY k)) FORMAT Null;

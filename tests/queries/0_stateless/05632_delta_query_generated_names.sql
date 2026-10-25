@@ -24,3 +24,15 @@ SELECT * FROM deltaQuery((SELECT l.k AS __delta_column_1, sum(l.__index) AS s FR
     GROUP BY __delta_column_1), (SELECT cursor FROM cursors WHERE round = 0), (SELECT cursor FROM cursors WHERE round = 1))
 ORDER BY ALL;
 
+-- A residual whose result has a column named __weight.
+CREATE TABLE s (k UInt64, v Int64, sign Int8) ENGINE = MergeTree ORDER BY k
+    SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+CREATE MATERIALIZED VIEW mv REFRESH EVERY 10 YEAR INCREMENTAL ENGINE = CollapsingMergeTree(sign) ORDER BY (k, __weight)
+    EMPTY AS SELECT k, sum(v) + 1 AS __weight FROM s GROUP BY k HAVING count() > 0 SETTINGS delta_query_sign_column = 'sign';
+INSERT INTO s VALUES (1, 10, 1), (2, 5, 1);
+SYSTEM REFRESH VIEW mv;
+SYSTEM WAIT VIEW mv;
+INSERT INTO s VALUES (1, 10, -1), (1, 4, 1);
+SYSTEM REFRESH VIEW mv;
+SYSTEM WAIT VIEW mv;
+SELECT k, __weight, sum(sign) AS n FROM mv GROUP BY k, __weight HAVING n != 0 ORDER BY ALL;

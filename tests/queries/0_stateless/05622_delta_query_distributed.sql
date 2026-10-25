@@ -35,13 +35,19 @@ SELECT * FROM deltaQuery((SELECT dl.k FROM dl JOIN ol ON dl.k = ol.k), map(), ma
 
 CREATE MATERIALIZED VIEW joined REFRESH EVERY 10 YEAR INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
     SELECT dl.k AS k, sum(v * w) AS s, count() AS n FROM dl JOIN dr ON dl.k = dr.k GROUP BY k SETTINGS delta_query_sign_column = 'sign';
+-- HAVING needs a residual.
+CREATE MATERIALIZED VIEW tops REFRESH EVERY 10 YEAR INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
+    SELECT k % 2 AS g, sum(v) AS m FROM dl GROUP BY g HAVING m > 5 SETTINGS delta_query_sign_column = 'sign';
 
 CREATE VIEW contents AS
-    SELECT 'joined', toString(groupArray((k, s, n))) FROM (SELECT k, sum(s) AS s, sum(n) AS n FROM joined GROUP BY k HAVING n != 0 ORDER BY k);
+    SELECT 'joined', toString(groupArray((k, s, n))) FROM (SELECT k, sum(s) AS s, sum(n) AS n FROM joined GROUP BY k HAVING n != 0 ORDER BY k)
+    UNION ALL SELECT 'tops', toString(groupArray((g, m, n))) FROM (SELECT g, m, sum(sign) AS n FROM tops GROUP BY g, m HAVING n != 0 ORDER BY ALL);
 CREATE VIEW expected AS
-    SELECT 'joined', toString(groupArray((k, s, n))) FROM (SELECT dl.k AS k, sum(v * w) AS s, count() AS n FROM dl JOIN dr ON dl.k = dr.k GROUP BY k ORDER BY k);
+    SELECT 'joined', toString(groupArray((k, s, n))) FROM (SELECT dl.k AS k, sum(v * w) AS s, count() AS n FROM dl JOIN dr ON dl.k = dr.k GROUP BY k ORDER BY k)
+    UNION ALL SELECT 'tops', toString(groupArray((g, m, 1))) FROM (SELECT k % 2 AS g, sum(v) AS m FROM dl GROUP BY g HAVING m > 5 ORDER BY g);
 
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
+SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
 SELECT 'initial', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
 
@@ -49,6 +55,7 @@ INSERT INTO l VALUES (4, 4);
 INSERT INTO r VALUES (4, 40);
 UPDATE l SET v = 5 WHERE k = 2;
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
+SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
 SELECT 'incremental', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
 
@@ -57,11 +64,14 @@ SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mod
 ALTER TABLE l UPDATE v = v * 100 WHERE k = 3 SETTINGS mutations_sync = 2;
 INSERT INTO l VALUES (5, 5);
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined; -- { serverError REFRESH_FAILED }
+SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops; -- { serverError REFRESH_FAILED }
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
+SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
 SELECT 'corrected', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';
 
 UPDATE l SET v = 6 WHERE k = 1;
 SYSTEM REFRESH VIEW joined; SYSTEM WAIT VIEW joined;
+SYSTEM REFRESH VIEW tops; SYSTEM WAIT VIEW tops;
 SELECT 'after', * FROM contents ORDER BY ALL;
 SELECT 'expected', * FROM expected ORDER BY ALL SETTINGS distributed_product_mode = 'local';

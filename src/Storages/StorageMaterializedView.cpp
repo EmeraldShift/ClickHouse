@@ -13,6 +13,8 @@
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTRefreshStrategy.h>
+#include <Parsers/ParserSelectWithUnionQuery.h>
+#include <Parsers/parseQuery.h>
 #include <Parsers/queryNormalization.h>
 
 #include <Access/Common/AccessFlags.h>
@@ -50,10 +52,13 @@
 #include <Processors/QueryPlan/QueryPlan.h>
 #include <Processors/Sinks/SinkToStorage.h>
 #include <QueryPipeline/Pipe.h>
+#include <Common/CurrentThread.h>
 #include <Common/checkStackSize.h>
 #include <Common/typeid_cast.h>
 #include <Common/randomSeed.h>
 #include <Core/UUID.h>
+#include <Common/SipHash.h>
+#include <Common/quoteString.h>
 
 #include <Backups/BackupEntriesCollector.h>
 
@@ -63,6 +68,7 @@ namespace Setting
 {
     extern const SettingsSeconds lock_acquire_timeout;
     extern const SettingsUInt64 log_queries_cut_to_length;
+    extern const SettingsFloat delta_query_residual_full_recompute_ratio;
 }
 
 namespace ServerSetting
@@ -120,6 +126,36 @@ static void removeNonCommonColumns(const Block & src_header, Block & target_head
 
 namespace
 {
+    /// The hidden tables of a `REFRESH ... INCREMENTAL` view whose query has a residual: the integral of the
+    /// core of the query, and the delta of the core in the last refresh. The UUID of the integral follows from the UUID of
+    /// the view, so a rename can find the integral without the lock of the database.
+    std::pair<StorageID, StorageID> getResidualTableIds(const StorageID & view_id)
+    {
+        const auto uuid = toString(view_id.uuid);
+        SipHash hash;
+        hash.update(view_id.uuid);
+        hash.update("integral");
+        return {StorageID(view_id.database_name, ".inner_integral." + uuid, UUID(hash.get128())),
+            StorageID(view_id.database_name, ".inner_delta." + uuid)};
+    }
+
+    /// Runs `query` as an internal query of the refresh. The text of a delta can be deeper than the limits of the parser allow
+    /// for a query that a user writes.
+    void executeRefreshStep(const String & query, const ContextPtr & refresh_context)
+    {
+        auto context = Context::createCopy(refresh_context);
+        context->makeQueryContext();
+        context->setCurrentQueryId("");
+        context->setStreamingCursor(nullptr);
+        /// The key types of the integral are those of the query, which the user could create.
+        context->setSetting("allow_suspicious_low_cardinality_types", true);
+        QueryScope query_scope;
+        if (!CurrentThread::getGroup())
+            query_scope = QueryScope::create(context);
+        auto io = executeQuery(query, context, QueryFlags{.internal = true, .parse_server_owned_query_without_limits = true}).second;
+        executeTrivialBlockIO(io, context);
+    }
+
     void checkTargetTableHasQueryOutputColumns(const ColumnsDescription & target_table_columns, const ColumnsDescription & select_query_output_columns)
     {
         for (const auto & column : select_query_output_columns)
@@ -304,6 +340,18 @@ StorageMaterializedView::StorageMaterializedView(
                 "CREATE OR REPLACE and REPLACE are not supported for `REFRESH ... INCREMENTAL` views");
         DeltaQuery delta_query(select.select_query, mv_db_context);
         delta_query.checkResultSign();
+        if (delta_query.hasResidual())
+        {
+            /// The integral is a local table named by the UUID of the view.
+            if (!table_id_.hasUUID())
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "`REFRESH ... INCREMENTAL` views with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over "
+                    "aggregates require an Atomic database");
+            if (DatabaseCatalog::instance().getDatabase(table_id_.database_name)->getEngineName() == "Replicated")
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "`REFRESH ... INCREMENTAL` views with HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over "
+                    "aggregates do not support Replicated databases");
+        }
     }
 
     storage_metadata.setSelectQuery(select);
@@ -662,12 +710,20 @@ void StorageMaterializedView::drop()
 
 void StorageMaterializedView::dropInnerTableIfAny(bool sync, ContextPtr local_context)
 {
-    if (!has_inner_table)
-        return;
-
-    std::vector<StorageID> to_drop = {getTargetTableId()};
-    if (!fixed_uuid)
-        to_drop.push_back(StorageID(to_drop[0].getDatabaseName(), ".tmp" + to_drop[0].getTableName()));
+    std::vector<StorageID> to_drop;
+    const auto metadata = getInMemoryMetadataPtr(local_context, false);
+    const auto * refresh = metadata->refresh ? metadata->refresh->as<ASTRefreshStrategy>() : nullptr;
+    if (refresh && refresh->isDelta() && getStorageID().hasUUID())
+    {
+        auto [integral_id, delta_id] = getResidualTableIds(getStorageID());
+        to_drop = {integral_id, delta_id};
+    }
+    if (has_inner_table)
+    {
+        to_drop.push_back(getTargetTableId());
+        if (!fixed_uuid)
+            to_drop.push_back(StorageID(getTargetTableId().getDatabaseName(), ".tmp" + getTargetTableId().getTableName()));
+    }
 
     for (const StorageID & inner_table_id : to_drop)
     {
@@ -832,7 +888,63 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
             }
         }
         if (correct)
-            select_query = delta_query.buildCorrection(new_cursor, inner_table_id);
+            select_query = delta_query.hasResidual() ? delta_query.buildDelta(nullptr, new_cursor)
+                                                     : delta_query.buildCorrection(new_cursor, inner_table_id);
+        /// If no input has new rows and the time of the snapshot is the same, the residual equals the target. The refresh then
+        /// inserts nothing and skips the hidden tables.
+        const bool unchanged = stream_cursor && cursorTreeToMap(stream_cursor) == cursorTreeToMap(new_cursor);
+        if (delta_query.hasResidual() && unchanged)
+        {
+            Strings columns;
+            for (const auto & column : delta_query.getResultColumns())
+                columns.push_back(backQuote(column.name));
+            ParserSelectWithUnionQuery parser;
+            select_query = parseQuery(parser, fmt::format("SELECT {} FROM {} WHERE 0", fmt::join(columns, ", "), inner_table_id.getFullTableName()),
+                0, DBMS_DEFAULT_MAX_PARSER_DEPTH, DBMS_DEFAULT_MAX_PARSER_BACKTRACKS);
+        }
+        else if (delta_query.hasResidual())
+        {
+            /// The integral absorbs the delta of the core, and the refresh inserts the rows that make the target equal to
+            /// the residual over the integral. A failure after the integral absorbs the delta and before the cursor persists
+            /// makes the next refresh add the delta again.
+            auto [integral_id, delta_id] = getResidualTableIds(getStorageID());
+            /// Like a refresh that replaces the target, the definer creates, drops, reads and writes the hidden tables.
+            refresh_context->checkAccess(AccessType::DROP_TABLE | AccessType::CREATE_TABLE | AccessType::SELECT | AccessType::INSERT,
+                integral_id.database_name);
+            const bool append_only = delta_query.isAppendOnly();
+            if (!append_only)
+            {
+                /// An append-only view creates no integral. If an input gained a sign column, the view isn't append-only
+                /// anymore and its integral would miss the rows of the earlier refreshes.
+                if (stream_cursor && !correct && !DatabaseCatalog::instance().isTableExist(integral_id, refresh_context))
+                    throw Exception(ErrorCodes::INCORRECT_QUERY,
+                        "The inputs of `REFRESH ... INCREMENTAL` view {} have a sign column that they didn't have when "
+                        "the view started, so the view must be created again", getStorageID().getNameForLogs());
+                executeRefreshStep(delta_query.getIntegralCreateQuery(integral_id), refresh_context);
+                /// The integral absorbs the delta from the empty cursor. A failure before the target takes the residual makes the
+                /// next refresh recompute again.
+                if (correct)
+                    executeRefreshStep(fmt::format("TRUNCATE TABLE {}", integral_id.getFullTableName()), refresh_context);
+            }
+            executeRefreshStep(fmt::format("CREATE OR REPLACE TABLE {} ENGINE = Memory AS {}", delta_id.getFullTableName(),
+                select_query->formatWithSecretsOneLine()), refresh_context);
+            if (!append_only)
+                executeRefreshStep(fmt::format("INSERT INTO {} SELECT * FROM {}", integral_id.getFullTableName(),
+                    delta_id.getFullTableName()), refresh_context);
+            auto delta_rows = DatabaseCatalog::instance().getTable(delta_id, refresh_context)->totalRows(refresh_context).value_or(0);
+            /// Recomputing many touched keys costs more than recomputing all keys, because the filters by the touched keys read
+            /// most granules anyway and add a set lookup per row. The integral counts rows of parts that haven't merged yet.
+            bool all_keys = correct;
+            if (!correct && !append_only && delta_rows > 0 && delta_query.hasPartitionedResidual())
+            {
+                const auto ratio = static_cast<double>(refresh_context->getSettingsRef()[Setting::delta_query_residual_full_recompute_ratio]);
+                auto integral_rows = DatabaseCatalog::instance().getTable(integral_id, refresh_context)->totalRows(refresh_context).value_or(0);
+                all_keys = ratio < 1 && static_cast<double>(delta_rows) > ratio * static_cast<double>(integral_rows);
+            }
+            select_query = delta_query.buildResidualDelta(integral_id, delta_id, delta_rows == 0 && !correct, inner_table_id, all_keys);
+            /// `RefreshTask` drops the delta after the refresh, which frees its memory.
+            out_temp_table_id = delta_id;
+        }
         /// Each delta returns the result columns of the query. Planning the delta just for its header would cost about as much as
         /// planning it for the INSERT.
         for (const auto & column : delta_query.getResultColumns())
@@ -1130,6 +1242,17 @@ void StorageMaterializedView::mutate(const MutationCommands & commands, ContextP
 {
     checkStatementCanBeForwarded();
     getTargetTable()->mutate(commands, local_context);
+}
+
+void StorageMaterializedView::checkTableCanBeRenamed(const StorageID & new_name) const
+{
+    /// The hidden tables are in the database of the view.
+    const auto table_id = getStorageID();
+    if (new_name.database_name != table_id.database_name && table_id.hasUUID()
+        && DatabaseCatalog::instance().tryGetByUUID(getResidualTableIds(table_id).first.uuid).second)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Cannot move a `REFRESH ... INCREMENTAL` view with HAVING, ORDER BY, LIMIT, DISTINCT, windows or "
+            "expressions over aggregates to another database");
 }
 
 void StorageMaterializedView::renameInMemory(const StorageID & new_table_id)

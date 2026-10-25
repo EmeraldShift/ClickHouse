@@ -34,6 +34,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
 }
 
@@ -88,6 +89,16 @@ protected:
     ASTs cursor_arguments;
 };
 
+/// The residual of a query runs over the integral of its core, which only a view keeps.
+void checkNoResidual(const DeltaQuery & query)
+{
+    if (query.hasResidual())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Table function deltaQuery does not support HAVING, ORDER BY, LIMIT, DISTINCT, windows or expressions over aggregates. "
+            "`REFRESH ... INCREMENTAL` views support them");
+    query.checkResultSign();
+}
+
 class TableFunctionDeltaQuery : public TableFunctionDeltaQueryBase
 {
 public:
@@ -101,14 +112,14 @@ private:
     ColumnsDescription getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const override
     {
         DeltaQuery query(delta_query, context);
-        query.checkResultSign();
+        checkNoResidual(query);
         return ColumnsDescription(query.getResultColumns());
     }
 
     StoragePtr executeImpl(const ASTPtr &, ContextPtr context, const String & table_name, ColumnsDescription cached_columns, bool) const override
     {
         DeltaQuery query(delta_query, context);
-        query.checkResultSign();
+        checkNoResidual(query);
         ASTCreateQuery create;
         create.set(create.select, query.buildDelta(parseCursor(cursor_arguments[0], context), parseCursor(cursor_arguments[1], context)));
         /// Each term of the delta has the columns of the query. Analyzing the query once is much cheaper than analyzing every
@@ -382,8 +393,8 @@ for `DateTime` and `DateTime64` and in the units of the column for integers. It 
 applies to right tables that aren't signed and don't take lightweight updates, and to left tables that aren't the right side of a
 `LEFT`, `SEMI`, `ANTI` or `ASOF` join.
 
-`target UNION ALL deltaQuery(query, cursor, frontier)` reads the result of a `REFRESH ... INCREMENTAL` view as of
-now, where `cursor` is the column of `system.view_refreshes` and `frontier` is the cursor that `deltaQueryFrontier` returns. Each of its result columns is
+`target UNION ALL deltaQuery(query, cursor, frontier)` reads the result of a `REFRESH ... INCREMENTAL` view without a residual
+as of now, where `cursor` is the column of `system.view_refreshes` and `frontier` is the cursor that `deltaQueryFrontier` returns. Each of its result columns is
 either free of aggregates or one call of `sum`, `count`, their `-If` forms, `min`, `max`, `any`, `groupBitOr`, `groupBitAnd`, `groupBitXor`,
 or any `-State` aggregate.
 
@@ -394,7 +405,7 @@ as a column of that name, for a `CollapsingMergeTree` target. A query with aggre
 including retracted rows. The deltas sum to the result over the rows that remain, for a `SummingMergeTree`
 target. Without the setting, the delta of a query whose rows retract throws `BAD_ARGUMENTS`, because its rows have no sign column.
 `deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows or expressions over aggregates. Over
-rows that retract, it supports only the aggregates above.
+rows that retract, it supports only the aggregates above. `REFRESH ... INCREMENTAL` views support them.
 
 A lightweight update of a `MergeTree` table takes a block number, and the table as of a cursor has the updates below the cursor. A query
 reads the lightweight updates of the tables with `enable_block_offset_column = 1`, and of lightweight

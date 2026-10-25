@@ -37,6 +37,14 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// A query can also have LEFT, SEMI, ANTI and ASOF joins of a table, and filters by now() in WHERE. Their deltas retract
 /// rows. See `buildDelta`.
 ///
+/// A query can also have a residual: the clauses whose result over the union of the deltas
+/// differs from the union of their results, like HAVING, ORDER BY with LIMIT, LIMIT BY, DISTINCT, window functions,
+/// expressions over aggregates and aggregates like `uniq`. The query then splits into a linear core and the residual. The
+/// core groups the rows by keys, which are the GROUP BY keys or else the columns that the residual reads, and its deltas
+/// have the form above. An integral table sums the deltas of the core. Each refresh evaluates the residual over the rows of
+/// the integral whose keys the delta touched, and diffs the result with the rows that the target has for those keys. The
+/// rows of the diff have the sign column, so the target can be a `CollapsingMergeTree`.
+///
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
 /// table as of a cursor is the rows with `_block_number` below the value, and a missing partition or table has no rows.
@@ -79,15 +87,38 @@ public:
     ASTPtr buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
 
     /// A query with the result columns of the rows that the deltas insert into a target. That is the query that each delta
-    /// evaluates over part of the inputs.
+    /// evaluates over part of the inputs, or for a query with a residual, the residual with the sign column.
     ASTPtr getQuery() const;
 
+    /// Whether the query has a residual. `buildDelta` then returns the deltas of the core, which go to the integral.
+    bool hasResidual() const { return residual != nullptr; }
+
+    /// Whether the residual needs no integral, because the target holds all of its state. See `Residual::append_only`.
+    bool isAppendOnly() const;
+
+    /// `CREATE TABLE IF NOT EXISTS` of the integral of the core.
+    String getIntegralCreateQuery(const StorageID & integral) const;
+
+    /// Whether the residual compares rows only within the touched values of some keys, like HAVING, LIMIT BY or a window
+    /// with PARTITION BY. A refresh can then recompute the residual for the touched values or for all keys.
+    bool hasPartitionedResidual() const;
+
+    /// The rows that make `target` equal to the residual over `integral`, after `integral` absorbed the delta of the core
+    /// in table `delta`. The rows have the sign column. The residual runs over the keys that the delta touched, unless
+    /// `all_keys` is set or the residual can move rows between keys, like a LIMIT over all rows. Then it runs over all keys.
+    /// An empty `delta` touches no keys. An append-only residual runs over the rows of `target` and `delta` instead of
+    /// `integral`.
+    ASTPtr buildResidualDelta(const StorageID & integral, const StorageID & delta, bool delta_is_empty, const StorageID & target,
+        bool all_keys = false) const;
+
     /// Whether rows can make a target that holds the deltas of the query equal to the query as of a cursor. A signed query
-    /// allows that. A query with aggregates that aren't all sums doesn't. `buildCorrection` returns those rows.
+    /// allows that. A query with an append-only residual doesn't, nor does a query with aggregates that aren't all
+    /// sums. For a query with a residual, `buildResidualDelta` over all keys returns those rows after the integral absorbs
+    /// the delta from the empty cursor. For the others, `buildCorrection` returns them.
     bool canCorrect() const;
 
-    /// The rows that make `target` equal to the query as of `new_cursor`. They retract the rows of `target` and add the rows
-    /// of the query. Rows that cancel each other are left out.
+    /// The rows that make `target` equal to the query as of `new_cursor`, for a query without a residual. They retract the
+    /// rows of `target` and add the rows of the query. Rows that cancel each other are left out.
     ASTPtr buildCorrection(const CursorTreeNodePtr & new_cursor, const StorageID & target) const;
 
     /// The columns of the rows that the deltas insert into a target, see `getQuery`.
@@ -97,13 +128,22 @@ public:
     /// their rows by a sign column of an internal name, and a target can't have that column.
     void checkResultSign() const;
 
+    /// Whether a row of the deltas can have a sign other than 1. A residual retracts rows, and so do signed inputs, LEFT,
+    /// SEMI and ANTI joins, filters by now() and lightweight updates.
+    bool retractsRows() const { return residual || has_signs; }
+
     struct Input;
     struct SemiJoinEdge;
     struct AsofJoin;
+    struct Residual;
 
 private:
-    /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`.
-    void analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column);
+    /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
+    /// fills `split` and returns its core instead, which the caller analyzes.
+    ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
+
+    /// Analyzes `core`, the core of a query with a residual, and sets `residual` to `split` with the types of the core.
+    void analyzeResidual(Residual split, const ASTPtr & core, const ContextPtr & context);
 
     struct DeltaTerms;
 
@@ -111,12 +151,15 @@ private:
     /// declare other types, like UInt64 for a count that the deltas weigh as Int64.
     ASTs castToResultTypes(const Names & columns) const;
 
-    /// The resolved query, whose tables have unique aliases.
+    /// The resolved query, whose tables have unique aliases. For a query with a residual, its core.
     ASTPtr query;
     std::vector<Input> inputs;
     std::vector<SemiJoinEdge> semi_join_edges;
     /// The ASOF joins whose deltas read only the rows near the time of the changes, see `delta_query_asof_lookback`.
     std::vector<AsofJoin> asof_joins;
+    std::shared_ptr<const Residual> residual;
+    /// Whether the rows of the deltas have a sign other than 1, see `retractsRows`.
+    bool has_signs = false;
     String sign_column;
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;
@@ -127,7 +170,8 @@ private:
     /// The result columns of a query with aggregates over signed inputs that are all sums, like `count` and `sum`. The flag
     /// marks the aggregates. The rows of a target with equal other columns add up.
     std::vector<std::pair<String, bool>> summed_columns;
-    /// For a query over `Distributed` tables, their cluster and the query that each shard runs over its local tables.
+    /// For a query over `Distributed` tables, their cluster and the query that each shard runs over its local tables. For a
+    /// query with a residual, that is the core.
     String cluster;
     ASTPtr shard_query;
     /// The context of the analysis. It also reads the frontiers of the shards and the types of the result columns.

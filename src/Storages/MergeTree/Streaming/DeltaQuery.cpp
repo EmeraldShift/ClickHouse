@@ -267,9 +267,9 @@ ASTPtr readLocalTables(const ASTPtr & query, const ContextPtr & context, String 
     return cluster.empty() ? nullptr : result;
 }
 
-/// Rejects tables outside FROM, like in `k IN t`, which the cursors do not cover, and window functions, whose result over
-/// the union of the terms differs from the union of their results.
-void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_indexes)
+/// Rejects tables outside FROM, like in `k IN t`, which the cursors do not cover. A linear query also rejects window
+/// functions, whose result over the union of the terms differs from the union of their results.
+void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_indexes, bool is_linear)
 {
     for (const auto & child : node.getChildren())
     {
@@ -278,9 +278,9 @@ void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_in
         auto type = child->getNodeType();
         if (type == QueryTreeNodeType::TABLE && !input_indexes.contains(child.get()))
             throwUnsupported("IN over tables");
-        if (const auto * function = child->as<FunctionNode>(); function && function->isWindowFunction())
+        if (const auto * function = child->as<FunctionNode>(); is_linear && function && function->isWindowFunction())
             throwUnsupported(fmt::format("window functions in {}", linear_queries));
-        checkExpressions(*child, input_indexes);
+        checkExpressions(*child, input_indexes, is_linear);
     }
 }
 
@@ -536,7 +536,14 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     shard_query = readLocalTables(query_, context, cluster);
     analysis_context = context;
 
-    analyze(shard_query ? shard_query : query_, context, sign_column_setting);
+    Residual split;
+    split.sign_column = sign_column_setting;
+    auto core = analyze(shard_query ? shard_query : query_, context, sign_column_setting, &split);
+    if (!core)
+        return;
+    if (shard_query)
+        shard_query = core;
+    analyzeResidual(std::move(split), core, context);
 }
 
 DeltaQuery::~DeltaQuery() = default;
@@ -545,11 +552,12 @@ void DeltaQuery::checkResultSign() const
 {
     if (sign_column == internal_sign_column && getResultColumns().contains(sign_column))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "The delta query retracts rows, like the rows of LEFT, SEMI and ANTI joins, of lightweight updates or of filters by "
-            "now(). The setting delta_query_sign_column must name the sign column of its result");
+            "The delta query retracts rows, like the rows of LEFT, SEMI and ANTI joins, of lightweight updates, of filters by now() "
+            "or of HAVING, ORDER BY, LIMIT, DISTINCT and windows. The setting delta_query_sign_column must name the sign column "
+            "of its result");
 }
 
-void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_)
+ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_, Residual * split)
 {
     inputs.clear();
     asof_joins.clear();
@@ -673,7 +681,15 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     {
         return inputs[asof.right].is_signed || inputs[asof.right].updatable || !inputs[asof.left].join_keys.empty();
     });
-    checkExpressions(*query_tree, input_indexes);
+    has_signs = !signs.empty();
+    const bool has_residual = split && needsResidual(*query_node, !signs.empty());
+    checkExpressions(*query_tree, input_indexes, !has_residual);
+    if (has_residual)
+    {
+        auto resolved = query_tree->toAST(ast_options);
+        return splitResidual(*query_node, resolved->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>(),
+            !signs.empty(), *split);
+    }
     checkLinearClauses(*query_node);
     checkResultColumns(*query_node, !signs.empty());
 
@@ -755,18 +771,21 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     /// Resolution checks only that the user can see the tables. Building the plan checks the grants on the columns that
     /// the query reads.
     interpreter.getSampleBlock();
+    return nullptr;
 }
 
 ASTPtr DeltaQuery::getQuery() const
 {
     /// The weights of the query read `__term_sign`, which each term of a delta binds. The query itself is one term of sign 1.
-    auto result = query->clone();
+    auto result = (residual ? residual->output_query : query)->clone();
     bindTerm(*result, 1, {});
     return result;
 }
 
 NamesAndTypesList DeltaQuery::getResultColumns() const
 {
+    if (residual)
+        return residual->output_columns;
     /// The passes after resolution keep the types of the result columns. Resolution alone finds them.
     InterpreterSelectQueryAnalyzer interpreter(getQuery(), analysis_context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     const auto & columns = interpreter.getQueryTree()->as<const QueryNode &>().getProjectionColumns();

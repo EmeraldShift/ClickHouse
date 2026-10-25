@@ -192,12 +192,14 @@ void setInput(ASTSelectQuery & select, const Input & input, ASTPtr table, ASTs c
 
 bool DeltaQuery::canCorrect() const
 {
+    if (residual)
+        return !residual->append_only;
     return !consolidated_columns.empty() || !summed_columns.empty();
 }
 
 ASTPtr DeltaQuery::buildCorrection(const CursorTreeNodePtr & new_cursor, const StorageID & target) const
 {
-    chassert(canCorrect());
+    chassert(canCorrect() && !residual);
     auto query_rows = makeSubquery(buildDelta(nullptr, new_cursor));
     auto target_table = make_intrusive<ASTTableIdentifier>(target);
     if (!consolidated_columns.empty())

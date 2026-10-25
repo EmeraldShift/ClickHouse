@@ -84,6 +84,62 @@ struct DeltaQuery::AsofJoin
     ASTPtr lookback;
 };
 
+/// The residual of a query and how to evaluate it over the integral of the core. The integral has a column `__key_i` per
+/// key and a column `__agg_m` per aggregate of the core, where `__agg_0` is `count()`.
+struct DeltaQuery::Residual
+{
+    String sign_column;
+    /// Whether the keys are GROUP BY keys. Otherwise they are the columns that the residual reads, and each row of the
+    /// integral stands for `__agg_0` rows.
+    bool has_aggregates = false;
+    size_t num_keys = 0;
+    /// The function of the `SimpleAggregateFunction` of each aggregate column of the integral, or empty for a state.
+    Strings simple_functions;
+    /// The merge of each aggregate `__val_j` of the residual, which reads the aggregate columns of the integral.
+    ASTs merges;
+    /// The merges of `sum` and `avg`, with the integral columns of their sum and of their count of non-NULL arguments. The
+    /// count is null for a `sum`, whose integral has no count unless its argument is Nullable.
+    struct SumMerge
+    {
+        size_t merge;
+        String sum_column;
+        String count_column;
+        ASTPtr count;
+    };
+    std::vector<SumMerge> sum_merges;
+    /// The residual as a select without FROM.
+    ASTPtr outer;
+    Names outputs;
+    /// The keys whose values bound the rows that a change of the integral can change, and the output columns that equal
+    /// them. A refresh recomputes the rows of the touched values of these keys. Empty if it recomputes all rows.
+    std::vector<size_t> partition_keys;
+    Names partition_outputs;
+    /// The output column that equals each key, or empty.
+    Names key_outputs;
+    /// Whether the residual over its own result and new rows equals the residual over all rows. Then the target holds all
+    /// the state and the view needs no integral. That holds over unsigned inputs, which only get inserts, for a residual
+    /// over rows that only drops rows that inserts can't bring back, like LIMIT, LIMIT BY, DISTINCT and QUALIFY with an
+    /// upper bound on a rank. Every key must be an output column, so the target rows can stand for the input rows.
+    bool append_only = false;
+
+    /// Filled from the analysis of the core.
+    DataTypes key_types;
+    NamesAndTypesList integral_columns;
+    ASTPtr output_query;
+    /// The columns of the rows of `output_query`.
+    NamesAndTypesList output_columns;
+
+    /// The rows of the table `integral` that pass `where`, if not null, merged per key.
+    ASTPtr buildInput(ASTPtr integral, ASTPtr where) const;
+    /// The net rows of `target` that pass `where`, if not null, as rows of keys, and the rows of the delta of the core in
+    /// `delta`.
+    ASTPtr buildAppendOnlyInput(const StorageID & target, ASTPtr where, const StorageID & delta) const;
+    /// The residual over `input`, which selects the keys and the merged aggregates.
+    ASTPtr buildResidual(ASTPtr input) const;
+    /// `(c_1, ...) IN (SELECT __key_p1, ... FROM delta)`, where column c_i equals partition key i.
+    ASTPtr buildPartitionFilter(const Names & columns, const StorageID & delta) const;
+};
+
 namespace DeltaQueryInternal
 {
 
@@ -228,6 +284,9 @@ ASTPtr makeTables(ASTPtr table);
 /// `SELECT columns FROM table WHERE where GROUP BY group_by HAVING having`, without the clauses that are null or empty.
 ASTPtr makeSelect(ASTs columns, ASTPtr table, ASTPtr where = nullptr, ASTs group_by = {}, ASTPtr having = nullptr);
 
+/// Adds `ARRAY JOIN expression` to the FROM clause of `select`.
+void addArrayJoin(ASTSelectQuery & select, ASTPtr expression);
+
 /// `ast AS alias`.
 ASTPtr withAlias(ASTPtr ast, const String & alias);
 
@@ -266,6 +325,8 @@ using Visit = std::function<ASTPtr(const ASTPtr & node)>;
 /// Calls `visit` on the nodes of the expression `node` of `parent` top-down. A node that `visit` returns replaces `node`,
 /// and its children aren't visited. Neither are the identifiers of lambda parameters.
 void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::multiset<String> & lambda_parameters);
+
+String joinNames(const Strings & names);
 
 /// `CAST(column, type) AS column` with the type of `column` in `types`.
 ASTPtr castTo(const String & column, const NamesAndTypesList & types);
@@ -321,6 +382,19 @@ ASTPtr makeSnapshot(const Input & input, const std::map<String, Int64> & bounds)
 /// a row without a match. So the table of the right side becomes the subquery of those rows. Over a signed table the
 /// subquery sums the signs of equal rows, because the join must see which rows remain, not each insert and retraction.
 void setInput(ASTSelectQuery & select, const Input & input, ASTPtr table, ASTs conjuncts, ASTs & where, const String & sign_column);
+
+
+/// Whether the clauses of a query with `delta_query_sign_column` need the integral of the core. The core is the rest of the
+/// query, which `checkLinearClauses` and `checkResultColumns` accept.
+bool needsResidual(const QueryNode & query, bool is_signed);
+
+/// Splits the resolved `select` of `query` into its core, which it returns, and the residual, which it fills in.
+///
+/// The keys of the core are the GROUP BY keys, or else the columns that the residual reads. The core selects the keys as
+/// `__key_i` and the aggregates of the integral as `__agg_m`. The residual is `select` with each key and aggregate replaced
+/// by a column of its input, GROUP BY dropped and HAVING turned into WHERE. Its input selects the keys and merges the
+/// aggregate columns of the integral per key as `__val_j`. Nodes match by their hashes without aliases.
+ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, bool is_signed, DeltaQuery::Residual & residual);
 
 }
 

@@ -18,6 +18,7 @@
 #include <Parsers/ParserSelectWithUnionQuery.h>
 #include <Parsers/parseQuery.h>
 
+#include <fmt/ranges.h>
 
 #include <map>
 #include <set>
@@ -211,6 +212,19 @@ ASTPtr makeSelect(ASTs columns, ASTPtr table, ASTPtr where, ASTs group_by, ASTPt
     return select;
 }
 
+void addArrayJoin(ASTSelectQuery & select, ASTPtr expression)
+{
+    auto array_join = make_intrusive<ASTArrayJoin>();
+    array_join->kind = ASTArrayJoin::Kind::Inner;
+    array_join->expression_list = make_intrusive<ASTExpressionList>();
+    array_join->expression_list->children.push_back(std::move(expression));
+    array_join->children.push_back(array_join->expression_list);
+    auto element = make_intrusive<ASTTablesInSelectQueryElement>();
+    element->array_join = array_join;
+    element->children.push_back(std::move(array_join));
+    select.tables()->children.push_back(std::move(element));
+}
+
 ASTPtr withAlias(ASTPtr ast, const String & alias)
 {
     ast->setAlias(alias);
@@ -346,6 +360,11 @@ void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::mul
     for (auto & child : node->children)
         if (child)
             visitExpression(child, *node, visit, lambda_parameters);
+}
+
+String joinNames(const Strings & names)
+{
+    return fmt::format("{}", fmt::join(names, ", "));
 }
 
 ASTPtr castTo(const String & column, const NamesAndTypesList & types)
