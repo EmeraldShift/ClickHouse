@@ -9,6 +9,7 @@
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTOrderByElement.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
@@ -352,7 +353,7 @@ ASTPtr castTo(const String & column, const NamesAndTypesList & types)
     return withAlias(addTypeConversionToAST(make_intrusive<ASTIdentifier>(column), types.tryGetByName(column)->type->getName()), column);
 }
 
-ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources)
+ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources, bool empty)
 {
     /// The weight and the count need names that no column has.
     NameSet taken(columns.begin(), columns.end());
@@ -376,7 +377,15 @@ ASTPtr consolidate(const Names & columns, const String & sign, std::vector<Weigh
     auto rows = makeIdentifiers(columns);
     rows.push_back(withAlias(makeASTFunction("arrayJoin", makeASTFunction("arrayWithConstant",
         makeASTFunction("toUInt64", makeASTFunction("abs", count_column())), makeASTFunction("toInt8", makeASTFunction("sign", count_column())))), sign));
-    return makeSelectWithUnion(makeSelect(std::move(rows), makeSubquery(std::move(summed))));
+    auto result = makeSelect(std::move(rows), makeSubquery(std::move(summed)), empty ? make_intrusive<ASTLiteral>(Field(UInt8{0})) : nullptr);
+    auto order_by = make_intrusive<ASTOrderByElement>();
+    order_by->direction = 1;
+    order_by->nulls_direction = 1;
+    order_by->children.push_back(make_intrusive<ASTIdentifier>(sign));
+    auto order_by_list = make_intrusive<ASTExpressionList>();
+    order_by_list->children.push_back(std::move(order_by));
+    result->as<ASTSelectQuery &>().setExpression(ASTSelectQuery::Expression::ORDER_BY, std::move(order_by_list));
+    return makeSelectWithUnion(std::move(result));
 }
 
 }

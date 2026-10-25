@@ -6,8 +6,10 @@
 #include <Interpreters/Context_fwd.h>
 #include <Interpreters/StorageID.h>
 #include <Parsers/IAST_fwd.h>
+#include <Storages/Streaming/IStreamSubscription.h>
 #include <base/scope_guard.h>
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -61,6 +63,11 @@ public:
     /// The cursor `from` extended by the blocks that this server has committed since. A null `from` is the empty cursor.
     /// For a query over `Distributed` tables, each shard extends its cursor.
     CursorTreeNodePtr getFrontier(const CursorTreeNodePtr & from) const;
+
+    /// Runs `callback` each time an input commits blocks after `cursor`, on a background thread of the input. Lookup tables
+    /// don't run it, because their new rows don't change the result. Destroying the subscriptions stops the calls. A query
+    /// over `Distributed` tables gets no subscriptions, because its inputs are on the shards.
+    std::vector<StreamSubscriptionPtr> subscribeToCommits(const CursorTreeNodePtr & cursor, std::function<void()> callback) const;
 
     /// Keeps the merges of the inputs from losing their rows as of `cursor` while the guards live, so that the delta from
     /// `cursor` can read them, see `StorageMergeTree::holdDeltaQueryBounds`. The delta reads lookup tables only as of its new

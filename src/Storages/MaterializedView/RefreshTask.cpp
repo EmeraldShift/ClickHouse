@@ -6,7 +6,9 @@
 #include <Core/Settings.h>
 #include <Databases/DatabaseReplicated.h>
 #include <IO/Operators.h>
+#include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromString.h>
+#include <IO/WriteBufferFromFile.h>
 #include <Interpreters/Cache/QueryResultCache.h>
 #include <Interpreters/Context.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
@@ -31,6 +33,7 @@
 #include <Common/CurrentMetrics.h>
 #include <Common/QueryScope.h>
 #include <Common/FailPoint.h>
+#include <Common/filesystemHelpers.h>
 #include <Common/Macros.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
@@ -74,6 +77,7 @@ namespace RefreshSetting
     extern const RefreshSettingsInt64 refresh_retries;
     extern const RefreshSettingsUInt64 refresh_retry_initial_backoff_ms;
     extern const RefreshSettingsUInt64 refresh_retry_max_backoff_ms;
+    extern const RefreshSettingsBool refresh_on_insert;
 }
 
 namespace ErrorCodes
@@ -281,6 +285,20 @@ RefreshTask::RefreshTask(
     {
         if (is_restore_from_backup)
             scheduling.stop_requested = true;
+
+        /// Coordinated views keep the cursor in Keeper. The others keep it in a local file named by the UUID of the view.
+        const auto view_id = view->getStorageID();
+        if (isDelta() && view_id.hasUUID())
+        {
+            cursor_path = fs::path(context->getPath()) / "refresh_cursors" / (toString(view_id.uuid) + ".bin");
+            if (!attach)
+                fs::remove(cursor_path);
+            else if (fs::exists(cursor_path))
+            {
+                ReadBufferFromFile in(cursor_path);
+                coordination.root_znode.cursor = buildCursorTree(readFieldBinary(in).safeGet<Map>());
+            }
+        }
     }
 }
 
@@ -345,12 +363,14 @@ void RefreshTask::startup()
 {
     ContextMutablePtr context;
     StorageID view_id = StorageID::createEmpty();
+    bool on_insert = false;
     {
         std::lock_guard guard(mutex);
 
         /// shutdown() is allowed to run before or during startup() (see its declaration) and nulls `view`.
         if (!view)
             return;
+        on_insert = isDelta() && refresh_settings[RefreshSetting::refresh_on_insert];
 
         if (start_paused || view->getContext()->getSettingsRef()[Setting::stop_refreshable_materialized_views_on_startup])
             scheduling.stop_requested = true;
@@ -366,6 +386,19 @@ void RefreshTask::startup()
 
     /// Outside `mutex`: notifying a dependent view locks that view's own task mutex.
     context->getRefreshSet().notifyDependents(view_id);
+
+    /// A view with `refresh_on_insert` subscribes to the inserts into its inputs in each refresh, so it refreshes once at startup.
+    if (on_insert)
+    {
+        try
+        {
+            run();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger(), "Failed to request a refresh at startup");
+        }
+    }
 }
 
 void RefreshTask::finalizeRestoreFromBackup()
@@ -390,6 +423,7 @@ void RefreshTask::shutdown()
 
         scheduling.stop_requested = true;
         interruptExecution();
+        commit_subscriptions.clear();
         cursor_holds.clear();
     }
 
@@ -445,7 +479,11 @@ void RefreshTask::shutdown()
 void RefreshTask::drop(ContextPtr context, bool is_shared_db)
 {
     if (!coordination.coordinated)
+    {
+        if (!cursor_path.empty())
+            fs::remove(cursor_path);
         return;
+    }
 
     auto component_guard = Coordination::setCurrentComponent("RefreshTask::drop");
     auto zookeeper = context->getZooKeeper();
@@ -1664,10 +1702,64 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
         if (auto cursor = refresh_context->getStreamingCursor())
             out_cursor = cursor->tree;
 
+    /// An insert after the cursor requests a refresh, like `SYSTEM REFRESH VIEW`. Requests coalesce while one is pending.
     {
+        bool on_insert;
+        {
+            std::lock_guard guard(mutex);
+            on_insert = refresh_settings[RefreshSetting::refresh_on_insert];
+        }
+        std::vector<StreamSubscriptionPtr> subscriptions;
+        auto cursor = refresh_context->getStreamingCursor();
+        if (on_insert && isDelta() && cursor)
+        {
+            try
+            {
+                subscriptions = view->subscribeToInputCommits(cursor->tree, refresh_context, [weak_task = weak_from_this()]
+                {
+                    if (auto task = weak_task.lock())
+                    {
+                        try
+                        {
+                            task->run();
+                        }
+                        catch (...)
+                        {
+                            tryLogCurrentException(task->getLogger(), "Failed to request a refresh after an insert");
+                        }
+                    }
+                });
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger(), "Failed to subscribe to the inserts into the inputs");
+            }
+        }
         std::lock_guard guard(mutex);
+        commit_subscriptions = std::move(subscriptions);
         /// The previous guards go out of scope after the lock.
         std::swap(cursor_holds, new_cursor_holds);
+    }
+
+    /// A failure leaves the previous cursor in the file, so the first refresh after a restart repeats the rows since then.
+    if (!cursor_path.empty() && out_cursor)
+    {
+        try
+        {
+            fs::create_directories(fs::path(cursor_path).parent_path());
+            const String temp_path = cursor_path + ".tmp";
+            {
+                WriteBufferFromFile out(temp_path);
+                writeFieldBinary(Field(cursorTreeToMap(out_cursor)), out);
+                out.finalize();
+                out.sync();
+            }
+            fs::rename(temp_path, cursor_path);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger(), "Failed to persist the cursor of the refresh");
+        }
     }
 
     return new_table_id.uuid;

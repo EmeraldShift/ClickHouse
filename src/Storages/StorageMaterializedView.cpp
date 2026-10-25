@@ -766,6 +766,15 @@ ContextMutablePtr StorageMaterializedView::createRefreshContext(const String & l
     return refresh_context;
 }
 
+std::vector<StreamSubscriptionPtr> StorageMaterializedView::subscribeToInputCommits(
+    const CursorTreeNodePtr & cursor, ContextMutablePtr refresh_context, std::function<void()> callback) const
+{
+    auto view_metadata = getInMemoryMetadataPtr(refresh_context, false);
+    auto select_query = view_metadata->getSelectQuery().select_query->clone();
+    InterpreterSetQuery::applySettingsFromQuery(select_query, refresh_context);
+    return DeltaQuery(select_query, refresh_context).subscribeToCommits(cursor, std::move(callback));
+}
+
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
     const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, bool recompute) const
@@ -780,6 +789,8 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
     auto view_metadata = getInMemoryMetadataPtr(refresh_context, false);
     auto select_query = view_metadata->getSelectQuery().select_query->clone();
     InterpreterSetQuery::applySettingsFromQuery(select_query, refresh_context);
+    /// The columns of the target that the INSERT fills, in the order of the columns of its SELECT.
+    Names insert_columns;
 
     if (incremental)
     {
@@ -822,6 +833,10 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
         }
         if (correct)
             select_query = delta_query.buildCorrection(new_cursor, inner_table_id);
+        /// Each delta returns the result columns of the query. Planning the delta just for its header would cost about as much as
+        /// planning it for the INSERT.
+        for (const auto & column : delta_query.getResultColumns())
+            insert_columns.push_back(column.name);
         {
             /// `RefreshTask` persists this cursor after the refresh succeeds. A transactional target commits it with the data.
             auto holder = refresh_context->getStreamingCursor();
@@ -887,10 +902,11 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
     insert_query->setDatabase(target_table.database_name);
     insert_query->table_id = target_table;
 
-    SharedHeader header = InterpreterSelectQueryAnalyzer::getSampleBlock(insert_query->select, refresh_context);
+    if (!delta)
+        insert_columns = InterpreterSelectQueryAnalyzer::getSampleBlock(insert_query->select, refresh_context)->getNames();
 
     auto columns = make_intrusive<ASTExpressionList>(',');
-    for (const String & name : header->getNames())
+    for (const String & name : insert_columns)
         columns->children.push_back(make_intrusive<ASTIdentifier>(name));
     insert_query->columns = std::move(columns);
 

@@ -3,6 +3,7 @@
 #include <Common/quoteString.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Storages/MergeTree/Streaming/Subscription/MergeTreeBoundsSubscription.h>
 #include <Storages/StorageMergeTree.h>
 
 #include <fmt/ranges.h>
@@ -187,6 +188,33 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
     if (clock_input)
         tree->setValue(time_key, std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     return tree;
+}
+
+std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTreeNodePtr & cursor, std::function<void()> callback) const
+{
+    if (!cluster.empty())
+        return {};
+    const auto tables = snapshotTables(inputs);
+    const auto bounds = parseCursor(cursor, inputs, tables, "cursor");
+    std::vector<StreamSubscriptionPtr> subscriptions;
+    std::set<String> keys;
+    for (const auto & input : inputs)
+    {
+        if (input.lookup || !keys.insert(input.key).second)
+            continue;
+        /// The subscription starts at the last block of each partition that the cursor includes, so it runs the callback only
+        /// for blocks after the cursor.
+        auto subscription = std::make_shared<MergeTreeBoundsSubscription>(1, 0);
+        std::map<std::string, int64_t> last_blocks;
+        for (const auto & [partition_id, bound] : bounds.at(input.key))
+            last_blocks[partition_id] = bound - 1;
+        subscription->update(std::move(last_blocks), {});
+        subscription->setCallback(callback);
+        input.storage->subscription_manager.registerSubscription(subscription);
+        input.storage->triggerStreamingSubscriptionEnrichment();
+        subscriptions.push_back(std::move(subscription));
+    }
+    return subscriptions;
 }
 
 std::vector<scope_guard> DeltaQuery::holdCursor(const CursorTreeNodePtr & cursor) const

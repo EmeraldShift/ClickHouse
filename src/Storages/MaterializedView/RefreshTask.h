@@ -3,6 +3,7 @@
 #include <Storages/MaterializedView/RefreshSet.h>
 #include <Storages/MaterializedView/RefreshSchedule.h>
 #include <Storages/MaterializedView/RefreshSettings.h>
+#include <Storages/Streaming/IStreamSubscription.h>
 #include <Parsers/ASTRefreshStrategy.h>
 #include <Common/ZooKeeper/IKeeper.h>
 #include <Common/StopToken.h>
@@ -72,7 +73,8 @@ public:
     /// Information stored in zookeeper shared among replicas to make sure only one replica does a
     /// refresh for each timeslot.
     /// If coordination is disabled, we still do "coordination" the same way (as if there's only one
-    /// replica), but keep the CoordinationZnode in memory without writing to zookeeper.
+    /// replica), but keep the CoordinationZnode in memory without writing to zookeeper. The cursor of a
+    /// `REFRESH ... INCREMENTAL` view also goes to a local file, see `cursor_path`.
     struct CoordinationZnode
     {
         /// "Official" time of the latest successful refresh, i.e. time according to schedule rather than wall clock,
@@ -372,6 +374,8 @@ private:
 
     RefreshSchedule refresh_schedule;
     RefreshSettings refresh_settings;
+    /// With `refresh_on_insert`, the subscriptions to the commits of the inputs after the cursor of the latest refresh.
+    std::vector<StreamSubscriptionPtr> commit_subscriptions;
     /// The guards that keep merges from losing the inputs as of the cursor of the latest refresh of a
     /// `REFRESH ... INCREMENTAL` view.
     std::vector<scope_guard> cursor_holds;
@@ -394,6 +398,9 @@ private:
     Coordination::WatchCallbackPtr watch_callback;
 
     CoordinationState coordination;
+    /// The file that keeps the cursor of an uncoordinated `REFRESH ... INCREMENTAL` view across DETACH and restarts, or
+    /// empty.
+    String cursor_path;
     ExecutionState execution;
     SchedulingState scheduling;
 

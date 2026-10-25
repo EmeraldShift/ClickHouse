@@ -280,9 +280,11 @@ struct WeightedRows
     ASTPtr where = nullptr;
 };
 
-/// The rows of `sources` as rows of `columns` with sign 1 or -1 in column `sign`. Equal rows sum their weights first, so rows
-/// of opposite weights cancel.
-ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources);
+/// The rows of `sources` as rows of `columns` with sign 1 or -1 in column `sign`, or no rows if `empty`. Equal rows sum
+/// their weights first, so rows of opposite weights cancel. The rows of sign -1 come first. A `CollapsingMergeTree` target
+/// sorts each insert by its key without reordering equal keys, and it keeps both rows of a key only when the -1 row is
+/// first. So a target whose key is coarser than the rows keeps an update.
+ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources, bool empty = false);
 
 std::map<String, TableBlocks> snapshotTables(const std::vector<Input> & inputs);
 
