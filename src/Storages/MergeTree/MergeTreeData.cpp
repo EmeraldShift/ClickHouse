@@ -15225,10 +15225,7 @@ bool MergeTreeData::scheduleStreamingJob(BackgroundJobsAssignee & assignee)
     if (subscriptions.empty())
         return false;
 
-    LocalPartsByPartition local_parts;
-    for (const auto & part : getDataPartsVectorForInternalUsage())
-        local_parts[part->info.getPartitionId()].push_back(part->info);
-
+    auto local_parts = getLocalParts(getDataPartsVectorForInternalUsage({DataPartState::Active}, {DataPartKind::Regular, DataPartKind::Patch}));
     auto promoters = buildPromoters();
     bool any_enriched = false;
     for (auto & subscription : subscriptions)

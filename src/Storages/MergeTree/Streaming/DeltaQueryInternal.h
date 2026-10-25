@@ -18,7 +18,7 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int NOT_IMPLEMENTED;
+    extern const int UNFINISHED;
 }
 
 class ASTSelectQuery;
@@ -37,6 +37,9 @@ struct DeltaQuery::Input
     /// rows below the new cursor.
     bool lookup = false;
     bool is_signed = false;
+    /// Whether lightweight updates can change the rows of the table. Delta queries read them from plain `MergeTree` tables,
+    /// which have them with `enable_block_offset_column`.
+    bool updatable = false;
     /// The columns of the table in the equalities of the ON clause, if the table is the right side of a LEFT, SEMI, ANTI or
     /// ASOF join. Such a join isn't linear in the table. A new row of the table changes the result for every left row of
     /// its join keys, see `buildDelta`.
@@ -102,27 +105,27 @@ constexpr auto term_sign_name = "__term_sign";
 
 Int64 getBound(const std::map<String, Int64> & partitions, const String & partition_id);
 
-/// The parts of one table on this server and the promoters that report the blocks in flight to it.
+/// The parts of one table on this server, the promoters that report the blocks in flight to it, and its unfinished
+/// mutations.
 class TableBlocks
 {
 public:
-    explicit TableBlocks(MergeTreeData & storage)
+    explicit TableBlocks(MergeTreeData & storage_)
+        : storage(storage_)
+        , parts(storage.getDataPartsVectorForInternalUsage({MergeTreeData::DataPartState::Active},
+            {MergeTreeData::DataPartKind::Regular, MergeTreeData::DataPartKind::Patch}))
+        , blocks(getLocalParts(parts))
     {
-        if (!storage.getPatchPartsVectorForInternalUsage().empty())
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, which has lightweight updates",
-                storage.getStorageID().getNameForLogs());
-        for (const auto & part : storage.getDataPartsVectorForInternalUsage())
-        {
-            if (part->info.mutation != 0)
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, which has mutated part {}",
-                    storage.getStorageID().getNameForLogs(), part->name);
-            blocks[part->info.getPartitionId()].push_back(part->info);
-        }
+        DB::checkReadableAsOf(storage, parts, {});
         /// Built after the parts snapshot, the promoters report a block committed in between as in flight.
         promoters = storage.buildPromoters();
+        for (const auto & status : storage.getMutationsStatus())
+            if (!status.is_done)
+                for (const auto & [partition_id, block_number] : status.block_numbers)
+                    unfinished_mutations.push_back({status.id, partition_id, block_number});
     }
 
-    /// The block ranges of each partition.
+    /// The block ranges of each partition, see `getLocalParts`.
     const LocalPartsByPartition & getParts() const { return blocks; }
 
     /// Whether this server has no parts of the partition and no parts in flight to it, as after the partition is dropped.
@@ -138,22 +141,43 @@ public:
         return promoteBlockNumber(start - 1, partition_blocks->second, promoter->second) + 1;
     }
 
-    /// Whether some partition has rows with `lower` <= `_block_number` < `upper`.
-    bool hasBlocks(const std::map<String, Int64> & lower, const std::map<String, Int64> & upper) const
+    /// Whether some partition has rows with `lower` <= `_block_number` < `upper`, or for `updates`, lightweight updates
+    /// with versions in that range. A patch part spans no bound that passes `checkReadableAsOf`.
+    bool hasBlocks(const std::map<String, Int64> & lower, const std::map<String, Int64> & upper, bool updates) const
     {
-        return std::ranges::any_of(blocks, [&](const auto & partition)
+        return std::ranges::any_of(parts, [&](const auto & part)
         {
-            const auto & [partition_id, infos] = partition;
-            return std::ranges::any_of(infos, [&](const auto & info)
-            {
-                return info.max_block >= getBound(lower, partition_id) && info.min_block < getBound(upper, partition_id);
-            });
+            const auto range = getBlockRange(*part);
+            return part->info.isPatch() == updates && range.max_block >= getBound(lower, range.getPartitionId())
+                && range.min_block < getBound(upper, range.getPartitionId());
         });
     }
 
+    /// Throws unless the parts hold the rows of the table as of `bounds` and the mutations below `bounds` are done. A mutation
+    /// of a plain `MergeTree` table has one block number for every partition, under the empty partition ID.
+    void checkReadableAsOf(const std::map<String, Int64> & bounds) const
+    {
+        DB::checkReadableAsOf(storage, parts, bounds);
+        for (const auto & [id, partition_id, block_number] : unfinished_mutations)
+            for (const auto & [bound_partition_id, bound] : bounds)
+                if ((partition_id.empty() || partition_id == bound_partition_id) && block_number < bound)
+                    throw Exception(ErrorCodes::UNFINISHED, "Delta queries wait for mutation {} of table {}, which is below block {} of partition {}",
+                        id, storage.getStorageID().getNameForLogs(), bound, bound_partition_id);
+    }
+
 private:
+    struct Mutation
+    {
+        String id;
+        String partition_id;
+        Int64 block_number;
+    };
+
+    MergeTreeData & storage;
+    DataPartsVector parts;
     LocalPartsByPartition blocks;
     CursorPromotersMap promoters;
+    std::vector<Mutation> unfinished_mutations;
 };
 
 
@@ -240,6 +264,9 @@ using Visit = std::function<ASTPtr(const ASTPtr & node)>;
 /// and its children aren't visited. Neither are the identifiers of lambda parameters.
 void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::multiset<String> & lambda_parameters);
 
+/// `CAST(column, type) AS column` with the type of `column` in `types`.
+ASTPtr castTo(const String & column, const NamesAndTypesList & types);
+
 /// The rows of `table` that pass `where`, if not null, with the values `values` of the columns of `consolidate` and the
 /// weight `weight`.
 struct WeightedRows
@@ -271,12 +298,16 @@ Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & in
 void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
     const std::map<String, Int64> & upper);
 
-/// Keeps the rows of `input` in `select` that pass `conjuncts`. The conjuncts go to `where`, the conjuncts of its WHERE,
-/// except for the right side of a LEFT, SEMI, ANTI or ASOF join, which needs its bounds before the join. In WHERE they
-/// would filter the joined rows, and a left row whose matches are all out of bounds would get no row instead of
+/// The table of `input` with the lightweight updates below `bounds`, `deltaQuerySnapshot('database', 'table', map(...))`,
+/// or the table itself if it can't have updates.
+ASTPtr makeSnapshot(const Input & input, const std::map<String, Int64> & bounds);
+
+/// Makes the rows of `table` that pass `conjuncts` the rows of `input` in `select`, whose WHERE gets `where`. The conjuncts
+/// go to `where`, except for the right side of a LEFT, SEMI, ANTI or ASOF join, which needs its bounds before the join. In
+/// WHERE they would filter the joined rows, and a left row whose matches are all out of bounds would get no row instead of
 /// a row without a match. So the table of the right side becomes the subquery of those rows. Over a signed table the
 /// subquery sums the signs of equal rows, because the join must see which rows remain, not each insert and retraction.
-void setInput(ASTSelectQuery & select, const Input & input, ASTs conjuncts, ASTs & where, const String & sign_column);
+void setInput(ASTSelectQuery & select, const Input & input, ASTPtr table, ASTs conjuncts, ASTs & where, const String & sign_column);
 
 }
 

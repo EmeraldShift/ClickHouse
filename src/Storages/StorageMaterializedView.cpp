@@ -90,6 +90,7 @@ namespace ErrorCodes
     extern const int QUERY_IS_NOT_SUPPORTED_IN_MATERIALIZED_VIEW;
     extern const int TOO_MANY_MATERIALIZED_VIEWS;
     extern const int NO_SUCH_COLUMN_IN_TABLE;
+    extern const int DELTA_QUERY_HISTORY_LOST;
 }
 
 namespace ActionLocks
@@ -767,7 +768,7 @@ ContextMutablePtr StorageMaterializedView::createRefreshContext(const String & l
 
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
-    const CursorTreeNodePtr & stream_cursor) const
+    const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds) const
 {
     const bool append = mode != RefreshMode::Replace;
     const bool incremental = mode == RefreshMode::AppendIncremental;
@@ -799,7 +800,23 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
     {
         DeltaQuery delta_query(select_query, refresh_context);
         auto new_cursor = delta_query.getFrontier(stream_cursor);
-        select_query = delta_query.buildDelta(stream_cursor, new_cursor);
+        out_cursor_holds = delta_query.holdCursor(new_cursor);
+        /// Merges can lose the rows of the inputs as of the cursor, see `DeltaQuery`. The refresh then inserts the rows that make
+        /// the target equal to the query as of the new cursor.
+        bool correct = false;
+        try
+        {
+            select_query = delta_query.buildDelta(stream_cursor, new_cursor);
+        }
+        catch (const Exception & e)
+        {
+            if (e.code() != ErrorCodes::DELTA_QUERY_HISTORY_LOST || !delta_query.canCorrect())
+                throw;
+            LOG_WARNING(getLogger("StorageMaterializedView"), "Recomputing view {}: {}", getStorageID().getNameForLogs(), e.message());
+            correct = true;
+        }
+        if (correct)
+            select_query = delta_query.buildCorrection(new_cursor, inner_table_id);
         {
             /// `RefreshTask` persists this cursor after the refresh succeeds. A transactional target commits it with the data.
             auto holder = refresh_context->getStreamingCursor();

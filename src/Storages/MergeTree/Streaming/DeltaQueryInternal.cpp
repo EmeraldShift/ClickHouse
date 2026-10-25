@@ -3,6 +3,7 @@
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
 #include <Analyzer/FunctionNode.h>
+#include <Interpreters/addTypeConversionToAST.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -332,6 +333,11 @@ void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::mul
     for (auto & child : node->children)
         if (child)
             visitExpression(child, *node, visit, lambda_parameters);
+}
+
+ASTPtr castTo(const String & column, const NamesAndTypesList & types)
+{
+    return withAlias(addTypeConversionToAST(make_intrusive<ASTIdentifier>(column), types.tryGetByName(column)->type->getName()), column);
 }
 
 ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources)

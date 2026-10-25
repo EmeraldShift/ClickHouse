@@ -50,18 +50,39 @@ ASTPtr makeBound(const String & qualifier, const std::map<String, Int64> & parti
         make_intrusive<ASTLiteral>(Int64(0)));
 }
 
-/// The table of `input`.
-ASTPtr makeTable(const Input & input)
+/// `map(partition_id, bound, ...)`.
+ASTPtr makeBoundsMap(const std::map<String, Int64> & bounds)
 {
-    return make_intrusive<ASTTableIdentifier>(input.storage->getStorageID());
+    ASTs arguments;
+    for (const auto & [partition_id, bound] : bounds)
+    {
+        arguments.push_back(make_intrusive<ASTLiteral>(Field(partition_id)));
+        arguments.push_back(make_intrusive<ASTLiteral>(Field(bound)));
+    }
+    return makeASTFunction("map", std::move(arguments));
 }
 
-/// `(SELECT columns FROM table AS alias WHERE where)` over the table of `input`. The alias of the input lets `where` qualify
-/// its columns like the conjuncts of the query. With a non-empty `default_type`, the subquery also returns the default of
-/// that type.
-ASTPtr makeSemiJoinSubquery(const Input & input, const Names & columns, ASTPtr where, const String & default_type = {})
+/// `(alias._block_number, alias._block_offset) IN (SELECT _block_number, _block_offset FROM deltaQueryPatches(...))`, which
+/// keeps the rows of `input` that its lightweight updates with versions in [`lower`, `upper`) change.
+ASTPtr makeUpdatedRowsIn(const Input & input, const std::map<String, Int64> & lower, const std::map<String, Int64> & upper)
 {
-    ASTs selects{makeSelect(makeIdentifiers(columns), withAlias(makeTable(input), input.alias), std::move(where))};
+    const auto table_id = input.storage->getStorageID();
+    auto patches = makeASTFunction("deltaQueryPatches", make_intrusive<ASTLiteral>(Field(table_id.database_name)),
+        make_intrusive<ASTLiteral>(Field(table_id.table_name)), makeBoundsMap(lower), makeBoundsMap(upper));
+    return makeASTFunction("in",
+        makeASTFunction("tuple", makeColumn(input.alias, "_block_number"), makeColumn(input.alias, "_block_offset")),
+        makeSubquery(makeSelect(makeIdentifiers({"_block_number", "_block_offset"}), std::move(patches))));
+}
+
+/// `(SELECT columns FROM table AS alias WHERE where UNION ALL ...)` over the pairs `sources` of a table of `input` and a
+/// filter. The alias of the input lets the filters qualify its columns like the conjuncts of the query. With a non-empty
+/// `default_type`, the subquery also returns the default of that type.
+ASTPtr makeSemiJoinSubquery(const Input & input, const Names & columns, const std::vector<std::pair<ASTPtr, ASTPtr>> & sources,
+    const String & default_type = {})
+{
+    ASTs selects;
+    for (const auto & [table, where] : sources)
+        selects.push_back(makeSelect(makeIdentifiers(columns), withAlias(table->clone(), input.alias), where->clone()));
     if (!default_type.empty())
         selects.push_back(makeSelect({makeASTFunction("defaultValueOfTypeName", make_intrusive<ASTLiteral>(Field(default_type)))}, nullptr));
     return makeSubquery(makeUnionAll(selects));
@@ -83,7 +104,8 @@ ASTPtr makeJoinKeysIn(const Input & input, ASTPtr subquery)
 }
 
 /// Throws unless `old_bounds` <= `new_bounds` and this server has committed every block that the delta reads. Term i reads
-/// the blocks of input i in [old, new). In a join, the other terms read the blocks below old or new.
+/// the blocks of input i in [old, new). In a join, the other terms read the blocks below old or new, and the updates of an
+/// input read its rows below old.
 void checkCursors(const std::map<String, TableBlocks> & tables, const Cursor & old_bounds, const Cursor & new_bounds, bool is_join)
 {
     for (const auto & [key, blocks] : tables)
@@ -92,6 +114,7 @@ void checkCursors(const std::map<String, TableBlocks> & tables, const Cursor & o
         for (const auto * bounds : {&old_bounds.at(key), &new_bounds.at(key)})
             for (const auto & [partition_id, _] : *bounds)
                 partition_ids.insert(partition_id);
+        const bool reads_old_rows = is_join || blocks.hasBlocks(old_bounds.at(key), new_bounds.at(key), /*updates=*/ true);
         for (const auto & partition_id : partition_ids)
         {
             Int64 old_bound = getBound(old_bounds.at(key), partition_id);
@@ -99,7 +122,7 @@ void checkCursors(const std::map<String, TableBlocks> & tables, const Cursor & o
             if (old_bound > new_bound)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS, "The old cursor is ahead of the new cursor in partition {} of table {}: {} > {}",
                     partition_id, key, old_bound, new_bound);
-            Int64 committed_end = blocks.getCommittedEnd(partition_id, is_join ? 0 : old_bound);
+            Int64 committed_end = blocks.getCommittedEnd(partition_id, reads_old_rows ? 0 : old_bound);
             if (new_bound > committed_end)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "The cursors include block {} of partition {} of table {}, which this server has not committed",
@@ -131,10 +154,21 @@ void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String
     conjuncts.push_back(makeASTFunction("indexHint", std::move(part_bounds)));
 }
 
-void setInput(ASTSelectQuery & select, const Input & input, ASTs conjuncts, ASTs & where, const String & sign_column)
+ASTPtr makeSnapshot(const Input & input, const std::map<String, Int64> & bounds)
+{
+    const auto table_id = input.storage->getStorageID();
+    if (!input.updatable)
+        return make_intrusive<ASTTableIdentifier>(table_id);
+    return makeASTFunction("deltaQuerySnapshot", make_intrusive<ASTLiteral>(Field(table_id.database_name)),
+        make_intrusive<ASTLiteral>(Field(table_id.table_name)), makeBoundsMap(bounds));
+}
+
+void setInput(ASTSelectQuery & select, const Input & input, ASTPtr table, ASTs conjuncts, ASTs & where, const String & sign_column)
 {
     if (input.join_keys.empty())
     {
+        table->setAlias(input.alias);
+        setTable(findAliasedTable(select, input.alias), std::move(table));
         std::ranges::move(conjuncts, std::back_inserter(where));
         return;
     }
@@ -149,18 +183,77 @@ void setInput(ASTSelectQuery & select, const Input & input, ASTs conjuncts, ASTs
         columns.push_back(withAlias(makeASTFunction("sum", makeColumn(input.alias, sign_column)), sign_column));
         having = makeASTFunction("notEquals", make_intrusive<ASTIdentifier>(sign_column), make_intrusive<ASTLiteral>(Field(UInt64{0})));
     }
-    auto subquery = makeSubquery(makeSelect(std::move(columns), withAlias(makeTable(input), input.alias),
+    auto subquery = makeSubquery(makeSelect(std::move(columns), withAlias(std::move(table), input.alias),
         makeConjunction(std::move(conjuncts)), std::move(group_by), std::move(having)));
     setTable(findAliasedTable(select, input.alias), withAlias(std::move(subquery), input.alias));
 }
 
 }
 
+bool DeltaQuery::canCorrect() const
+{
+    return !consolidated_columns.empty() || !summed_columns.empty();
+}
+
+ASTPtr DeltaQuery::buildCorrection(const CursorTreeNodePtr & new_cursor, const StorageID & target) const
+{
+    chassert(canCorrect());
+    auto query_rows = makeSubquery(buildDelta(nullptr, new_cursor));
+    auto target_table = make_intrusive<ASTTableIdentifier>(target);
+    if (!consolidated_columns.empty())
+    {
+        auto weight = [&] { return makeASTFunction("toInt64", make_intrusive<ASTIdentifier>(sign_column)); };
+        return consolidate(consolidated_columns, sign_column, {
+            {std::move(query_rows), makeIdentifiers(consolidated_columns), weight()},
+            {std::move(target_table), castToResultTypes(consolidated_columns), makeASTFunction("negate", weight())}});
+    }
+    /// Each group gets one row with the sums of the query minus the sums of the target. A target column can have an unsigned
+    /// type that holds negative sums modulo its range. The products with a signed factor have one type in both selects.
+    ASTs columns;
+    ASTs retracted;
+    ASTs results;
+    Names keys;
+    ASTs nonzero;
+    const auto types = getResultColumns();
+    for (const auto & [name, is_sum] : summed_columns)
+    {
+        auto column = [&] { return make_intrusive<ASTIdentifier>(name); };
+        auto times = [&](Int64 factor)
+        {
+            return makeASTFunction("multiply", column(), makeASTFunction("toInt8", make_intrusive<ASTLiteral>(Field(factor))));
+        };
+        if (is_sum)
+        {
+            columns.push_back(withAlias(times(1), name));
+            retracted.push_back(times(-1));
+            results.push_back(withAlias(makeASTFunction("sum", column()), name));
+            nonzero.push_back(makeASTFunction("notEquals", column(), make_intrusive<ASTLiteral>(Field(UInt64{0}))));
+        }
+        else
+        {
+            columns.push_back(column());
+            retracted.push_back(castTo(name, types));
+            results.push_back(column());
+            keys.push_back(name);
+        }
+    }
+    auto rows = makeUnionAll({makeSelect(std::move(columns), std::move(query_rows)), makeSelect(std::move(retracted), std::move(target_table))});
+    auto changed = nonzero.size() == 1 ? std::move(nonzero[0]) : makeASTFunction("or", std::move(nonzero));
+    return makeSelectWithUnion(makeSelect(std::move(results), makeSubquery(std::move(rows)), nullptr, makeIdentifiers(keys), std::move(changed)));
+}
+
 /// The terms of one delta, see `buildDelta`.
 struct DeltaQuery::DeltaTerms
 {
-    /// The rows of an input that a term reads: the rows below old, below new, and in [old, new).
-    enum class Rows : uint8_t { Old, New, Delta };
+    /// The rows of an input that a term reads: the rows below old as of old, below new as of new, in [old, new) as of new, and
+    /// below old as of new.
+    enum class Rows : uint8_t { Old, New, Delta, Prior };
+    /// The rows of an input that also pass `filters`.
+    struct Selection
+    {
+        Rows rows;
+        ASTs filters;
+    };
 
     const DeltaQuery & query;
     const std::vector<Input> & inputs;
@@ -237,16 +330,37 @@ struct DeltaQuery::DeltaTerms
     {
         const auto & key = inputs[j].key;
         addBounds(conjuncts, inputs[j].alias, rows == Rows::Delta ? &old_bounds.at(key) : nullptr,
-            rows == Rows::Old ? old_bounds.at(key) : new_bounds.at(key));
+            rows == Rows::Old || rows == Rows::Prior ? old_bounds.at(key) : new_bounds.at(key));
+    }
+
+    /// The table of input j as of the cursor of `rows`.
+    ASTPtr tableAt(size_t j, Rows rows) const
+    {
+        const auto & key = inputs[j].key;
+        return makeSnapshot(inputs[j], rows == Rows::Old ? old_bounds.at(key) : new_bounds.at(key));
+    }
+
+    /// The table and the filter of each selection of input j.
+    std::vector<std::pair<ASTPtr, ASTPtr>> getSources(size_t j, const std::vector<Selection> & selections) const
+    {
+        std::vector<std::pair<ASTPtr, ASTPtr>> sources;
+        for (const auto & [rows, filters] : selections)
+        {
+            ASTs conjuncts;
+            addRows(conjuncts, j, rows);
+            for (const auto & filter : filters)
+                conjuncts.push_back(filter->clone());
+            sources.emplace_back(tableAt(j, rows), makeConjunction(std::move(conjuncts)));
+        }
+        return sources;
     }
 
     /// The conjuncts of each input that narrow the ASOF joins in a term that reads rows `rows[j]` of each input j, after the
-    /// changes of input `from`, its rows that pass `change`, see `AsofJoin`. For a backward join, a change at time s changes
-    /// only the matches of the left rows from s on. The match of such a row is at or after the latest right row of its keys
-    /// at or before s. So the right input reads the rows of a key from s minus the lookback on if the key has a row from
-    /// there to s, and all the rows of the key otherwise. Here s is the earliest time of the change. A forward join mirrors
-    /// that.
-    std::vector<ASTs> narrowAsof(const std::vector<Rows> & rows, size_t from, const ASTs & change) const
+    /// change `change` of input `from`, see `AsofJoin`. For a backward join, a change at time s changes only the matches of
+    /// the left rows from s on. The match of such a row is at or after the latest right row of its keys at or before s. So
+    /// the right input reads the rows of a key from s minus the lookback on if the key has a row from there to s, and all
+    /// the rows of the key otherwise. Here s is the earliest time of the change. A forward join mirrors that.
+    std::vector<ASTs> narrowAsof(const std::vector<Rows> & rows, size_t from, const std::vector<Selection> & change) const
     {
         std::vector<ASTs> extra(inputs.size());
         for (const auto & asof : query.asof_joins)
@@ -255,7 +369,7 @@ struct DeltaQuery::DeltaTerms
                 continue;
             const auto & left = inputs[asof.left];
             const auto & right = inputs[asof.right];
-            auto changes = [&] { return makeConjunction(cloneAll(change)); };
+            const auto changes = getSources(from, change);
             const auto & time = from == asof.left ? asof.left_time : asof.right_time;
             const auto & keys = from == asof.left ? asof.left_keys : asof.right_keys;
             /// The comparisons `t >= b` and `t < s` or `t <= s` of a backward join. A forward join mirrors them.
@@ -264,20 +378,17 @@ struct DeltaQuery::DeltaTerms
             auto start = [&]
             {
                 return makeSubquery(makeSelect({makeASTFunction(asof.backward ? "min" : "max", make_intrusive<ASTIdentifier>(time))},
-                    makeSemiJoinSubquery(inputs[from], {time}, changes())));
+                    makeSemiJoinSubquery(inputs[from], {time}, changes)));
             };
             auto limit = [&] { return makeASTFunction(asof.backward ? "minus" : "plus", start(), asof.lookback->clone()); };
             auto right_keys = [&] { return makeTuple(makeColumns(right, asof.right_keys)); };
             auto right_time = [&] { return makeColumn(right.alias, asof.right_time); };
-            auto touched = [&] { return makeSemiJoinSubquery(inputs[from], keys, changes()); };
+            auto touched = [&] { return makeSemiJoinSubquery(inputs[from], keys, changes); };
             /// The touched keys that have a right row from the limit to s, in the rows of the right input in the term.
-            ASTs near_conjuncts;
-            addRows(near_conjuncts, asof.right, rows[asof.right]);
-            near_conjuncts.push_back(makeASTFunction(after, right_time(), limit()));
-            near_conjuncts.push_back(makeASTFunction(before, right_time(), start()));
-            near_conjuncts.push_back(makeASTFunction("in", right_keys(), touched()));
-            auto near = makeSelect({right_keys()}, withAlias(makeTable(right), right.alias),
-                makeConjunction(std::move(near_conjuncts)));
+            auto [table, where] = getSources(asof.right, {{rows[asof.right], {}}}).at(0);
+            auto near = makeSelect({right_keys()}, withAlias(std::move(table), right.alias), makeConjunction({std::move(where),
+                makeASTFunction(after, right_time(), limit()), makeASTFunction(before, right_time(), start()),
+                makeASTFunction("in", right_keys(), touched())}));
             auto far = makeSelect(makeIdentifiers(keys), touched(),
                 makeASTFunction("notIn", makeTuple(makeIdentifiers(keys)), makeSubquery(std::move(near))));
             extra[asof.right].push_back(makeASTFunction("or", makeASTFunction(after, right_time(), limit()),
@@ -289,10 +400,10 @@ struct DeltaQuery::DeltaTerms
     }
 
     /// Adds the term that reads rows `rows[j]` of each input j, and of input `from` only those that also pass `own`. The
-    /// reduction starts from the rows of input `from` that pass `change`, or without it from its rows in the term. The rows
-    /// of the term have weight `sign` times their weight in the query, and now() is `time`. Input j also gets `extra[j]`.
-    void addTerm(const std::vector<Rows> & rows, std::optional<size_t> from, ASTs own, const ASTs & change, Int64 sign,
-        std::optional<Int64> time, std::vector<ASTs> extra = {})
+    /// reduction starts from the selections `change` of input `from`, or without them from its rows in the term. The rows of
+    /// the term have weight `sign` times their weight in the query, and now() is `time`. Input j also gets `extra[j]`.
+    void addTerm(const std::vector<Rows> & rows, std::optional<size_t> from, ASTs own, const std::vector<Selection> & change,
+        Int64 sign, std::optional<Int64> time, std::vector<ASTs> extra = {})
     {
         std::vector<ASTs> conjuncts(inputs.size());
         for (size_t j = 0; j < inputs.size(); ++j)
@@ -330,8 +441,9 @@ struct DeltaQuery::DeltaTerms
                     subquery = it->second->clone();
                 else
                 {
-                    auto where = makeConjunction(cloneAll(a == *from && !change.empty() ? change : conjuncts[a]));
-                    subquery = makeSemiJoinSubquery(inputs[a], {edge.from_column}, std::move(where), padded ? edge.from_type : "");
+                    auto sources = a == *from && !change.empty() ? getSources(a, change)
+                        : std::vector<std::pair<ASTPtr, ASTPtr>>{{tableAt(a, rows[a]), makeConjunction(cloneAll(conjuncts[a]))}};
+                    subquery = makeSemiJoinSubquery(inputs[a], {edge.from_column}, sources, padded ? edge.from_type : "");
                 }
                 reducing_sets[edge.to].try_emplace(edge.to_column, subquery);
                 conjuncts[edge.to].push_back(makeASTFunction("in", makeColumn(inputs[edge.to].alias, edge.to_column), subquery->clone()));
@@ -344,7 +456,7 @@ struct DeltaQuery::DeltaTerms
         if (select.where())
             where.push_back(select.where()->clone());
         for (size_t j = 0; j < inputs.size(); ++j)
-            setInput(term_select, inputs[j], std::move(conjuncts[j]), where, query.sign_column);
+            setInput(term_select, inputs[j], tableAt(j, rows[j]), std::move(conjuncts[j]), where, query.sign_column);
         term_select.setExpression(ASTSelectQuery::Expression::WHERE, makeConjunction(std::move(where)));
         /// The reduction already filters each input by the keys that can join. A runtime filter of a join would probe every
         /// row read a second time.
@@ -355,25 +467,43 @@ struct DeltaQuery::DeltaTerms
         terms->children.push_back(std::move(term));
     }
 
-    /// Adds the terms of the changes of input i, its rows in [old, new), at time `time`.
-    void addChanges(size_t i, std::optional<Int64> time)
+    /// Adds the terms of the changes of input i, whose blocks are `blocks`, at time `time`.
+    void addChanges(size_t i, const TableBlocks & blocks, std::optional<Int64> time)
     {
-        ASTs change;
-        addRows(change, i, Rows::Delta);
+        const auto & lower = old_bounds.at(inputs[i].key);
+        const auto & upper = new_bounds.at(inputs[i].key);
+        const bool updated = blocks.hasBlocks(lower, upper, /*updates=*/ true);
+        /// The changes of input i. The rows that the updates change retract as of old and insert as of new.
+        std::vector<Selection> changes;
+        if (blocks.hasBlocks(lower, upper, /*updates=*/ false))
+            changes.push_back({Rows::Delta, {}});
+        if (updated)
+        {
+            auto updated_rows = makeUpdatedRowsIn(inputs[i], lower, upper);
+            changes.push_back({Rows::Prior, {updated_rows->clone()}});
+            changes.push_back({Rows::Old, {updated_rows}});
+        }
+        if (changes.empty())
+            return;
         std::vector<Rows> rows(inputs.size());
         for (size_t j = 0; j < inputs.size(); ++j)
             rows[j] = j < i && !inputs[j].lookup ? Rows::Old : Rows::New;
         if (inputs[i].join_keys.empty())
         {
-            rows[i] = Rows::Delta;
-            addTerm(rows, i, {}, {}, 1, time, narrowAsof(rows, i, change));
+            for (const auto & [own_rows, filters] : changes)
+            {
+                rows[i] = own_rows;
+                addTerm(rows, i, cloneAll(filters), {}, own_rows == Rows::Old ? -1 : 1, time,
+                    narrowAsof(rows, i, {{own_rows, cloneAll(filters)}}));
+            }
+            has_pairs |= updated;
             return;
         }
-        auto keys = makeJoinKeysIn(inputs[i], makeSemiJoinSubquery(inputs[i], inputs[i].join_keys, makeConjunction(cloneAll(change))));
+        auto keys = makeJoinKeysIn(inputs[i], makeSemiJoinSubquery(inputs[i], inputs[i].join_keys, getSources(i, changes)));
         for (auto [own_rows, sign] : {std::pair{Rows::New, Int64{1}}, std::pair{Rows::Old, Int64{-1}}})
         {
             rows[i] = own_rows;
-            addTerm(rows, i, {keys->clone()}, change, sign, time, narrowAsof(rows, i, change));
+            addTerm(rows, i, {keys->clone()}, changes, sign, time, narrowAsof(rows, i, changes));
         }
         has_pairs = true;
     }
@@ -441,6 +571,11 @@ struct DeltaQuery::DeltaTerms
 /// old, and inputs after it read the table as of new. That is the delta of a join of the inputs under the sequential update
 /// rule.
 ///
+/// The changes of input i are its rows in [old, new) as of new, and the rows below old that its lightweight updates in
+/// [old, new) change. Those rows retract as of old and insert as of new. A term reads a table as of a cursor through
+/// `deltaQuerySnapshot`, which applies the updates below the cursor, and the bounds of `addBounds`, which keep the rows below
+/// it. `deltaQueryPatches` names the rows that the updates change.
+///
 /// Term i also gets a semi-join reduction. The reduction makes the cost of term i follow the delta instead of the size of the
 /// other inputs. A breadth-first search from input i follows the join equalities. Each input b reached from input a by
 /// `a.x = b.y` gets the conjunct `b.y IN (SELECT x FROM a WHERE ...)`, where the subquery's WHERE holds the bounds and
@@ -462,6 +597,13 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
     const auto old_bounds = parseCursor(old_cursor, inputs, tables, "old cursor");
     const auto new_bounds = parseCursor(new_cursor, inputs, tables, "new cursor");
     checkCursors(tables, old_bounds, new_bounds, /*is_join=*/ inputs.size() > 1);
+    /// The terms read a lookup table only as of the new cursor.
+    for (const auto & input : inputs)
+    {
+        if (!input.lookup)
+            tables.at(input.key).checkReadableAsOf(old_bounds.at(input.key));
+        tables.at(input.key).checkReadableAsOf(new_bounds.at(input.key));
+    }
 
     const auto old_time = getTime(old_cursor);
     const auto new_time = getTime(new_cursor);
@@ -478,8 +620,8 @@ ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const Cursor
         terms.addTerm(std::vector<Rows>(inputs.size(), Rows::New), {}, {}, {}, 1, new_time);
     /// The changes of a lookup table join with nothing, and the other terms read it as of the new cursor.
     for (size_t i = 0; i < inputs.size() && !from_empty; ++i)
-        if (!inputs[i].lookup && tables.at(inputs[i].key).hasBlocks(old_bounds.at(inputs[i].key), new_bounds.at(inputs[i].key)))
-            terms.addChanges(i, new_time);
+        if (!inputs[i].lookup)
+            terms.addChanges(i, tables.at(inputs[i].key), new_time);
     if (clock_input && !from_empty && *old_time != *new_time)
         terms.addClockChange(*old_time, *new_time);
     return terms.finish(new_time);

@@ -203,7 +203,8 @@ Input makeInput(const TableNode & table)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, whose column {} shadows a virtual column",
                 table_id.getNameForLogs(), virtual_column);
 
-    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage)};
+    const bool updatable = !storage->supportsReplication() && storage->supportsLightweightUpdate().has_value();
+    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage), .updatable = updatable};
 }
 
 /// Rejects subqueries, which could read tables that the cursors do not cover. Resolution replaces scalar subqueries by
@@ -495,8 +496,8 @@ void DeltaQuery::checkResultSign() const
 {
     if (sign_column == internal_sign_column && getResultColumns().contains(sign_column))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
-            "The delta query retracts rows, like the rows of LEFT, SEMI and ANTI joins or of filters by now(). The setting "
-            "delta_query_sign_column must name the sign column of its result");
+            "The delta query retracts rows, like the rows of LEFT, SEMI and ANTI joins, of lightweight updates or of filters by "
+            "now(). The setting delta_query_sign_column must name the sign column of its result");
 }
 
 void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_)
@@ -507,6 +508,7 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     clock_input.reset();
     clock_conjuncts.clear();
     consolidated_columns.clear();
+    summed_columns.clear();
     sign_column = sign_column_;
 
     /// A filter by now() changes its result as time passes, see `buildDelta`. Elsewhere now() would change rows that no
@@ -587,9 +589,12 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
             if (auto asof = makeAsofJoin(join, right, inputs[right], input_indexes, asof_lookback))
                 asof_joins.push_back(std::move(*asof));
     }
-    /// The delta of a join that isn't linear in a table, or of a filter by now(), retracts rows of the result.
-    const bool retracts = has_clock
-        || std::ranges::any_of(inputs, [](const auto & input) { return !input.lookup && !input.join_keys.empty(); });
+    /// The delta of a join that isn't linear in a table, of a filter by now(), or of lightweight updates retracts rows of the
+    /// result.
+    const bool retracts = has_clock || std::ranges::any_of(inputs, [&](const auto & input)
+    {
+        return !input.lookup && (!input.join_keys.empty() || input.updatable);
+    });
 
     /// The deltas must merge into the query over the union of the inputs.
     ASTs signs;
@@ -612,12 +617,12 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     if (retracts)
         signs.push_back(make_intrusive<ASTIdentifier>(term_sign_name));
     checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
-    /// The rows of a signed right input near a time can cancel, so their existence there says nothing about the match. A
-    /// left input with join keys is itself the right side of a join. Its terms read all the rows of the touched keys and not
-    /// just the changes, and the defaults that pad it don't pass its conjuncts.
+    /// The rows of a signed or updated right input near a time can cancel or change, so their existence there says
+    /// nothing about the match. A left input with join keys is itself the right side of a join. Its terms read all the
+    /// rows of the touched keys and not just the changes, and the defaults that pad it don't pass its conjuncts.
     std::erase_if(asof_joins, [&](const auto & asof)
     {
-        return inputs[asof.right].is_signed || !inputs[asof.left].join_keys.empty();
+        return inputs[asof.right].is_signed || inputs[asof.right].updatable || !inputs[asof.left].join_keys.empty();
     });
     checkExpressions(*query_tree, input_indexes);
     checkLinearClauses(*query_node);
@@ -657,8 +662,26 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     /// A signed query without aggregates returns the sign column. The pairs of terms of its delta return most rows twice with
     /// opposite signs.
     if (!signs.empty() && select.select()->children.back()->tryGetAlias() == sign_column)
+    {
         for (const auto & column : query_node->getProjectionColumns())
             consolidated_columns.push_back(column.name);
+    }
+    else if (!signs.empty())
+    {
+        const auto & nodes = query_node->getProjection().getNodes();
+        const auto projection_columns = query_node->getProjectionColumns();
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            const auto * function = nodes[i]->as<FunctionNode>();
+            const bool is_aggregate = function && function->isAggregateFunction();
+            if (is_aggregate && !std::ranges::contains(std::array{"sum", "count"}, splitCombinators(function->getFunctionName()).first))
+            {
+                summed_columns.clear();
+                break;
+            }
+            summed_columns.emplace_back(projection_columns[i].name, is_aggregate);
+        }
+    }
 
     if (has_clock)
     {
@@ -699,6 +722,15 @@ NamesAndTypesList DeltaQuery::getResultColumns() const
     InterpreterSelectQueryAnalyzer interpreter(getQuery(), analysis_context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     const auto & columns = interpreter.getQueryTree()->as<const QueryNode &>().getProjectionColumns();
     return NamesAndTypesList(columns.begin(), columns.end());
+}
+
+ASTs DeltaQuery::castToResultTypes(const Names & columns) const
+{
+    const auto types = getResultColumns();
+    ASTs casts;
+    for (const auto & column : columns)
+        casts.push_back(castTo(column, types));
+    return casts;
 }
 
 }

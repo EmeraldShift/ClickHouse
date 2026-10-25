@@ -24,6 +24,9 @@
 
 #include <Disks/StoragePolicy.h>
 #include <Common/SimpleIncrement.h>
+#include <base/scope_guard.h>
+
+#include <set>
 
 
 namespace DB
@@ -66,6 +69,12 @@ public:
     bool supportsStreaming() const override { return true; }
 
     CursorPromotersMap buildPromoters() override;
+
+    /// Keeps merges from losing the rows of the table as of `bounds`, the first block number that each partition excludes,
+    /// until the returned guard is destroyed. A merge then doesn't write the lightweight updates at or above a bound into
+    /// rows below it, and doesn't merge patch parts across a bound. Delta queries read the table as of such bounds, see
+    /// `DeltaQuery`.
+    scope_guard holdDeltaQueryBounds(const std::map<String, Int64> & bounds);
 
     bool supportsTransactions() const override { return support_transaction; }
 
@@ -155,6 +164,10 @@ private:
     /// Parts that currently participate in merge or mutation.
     /// This set have to be used with `currently_processing_in_background_mutex`.
     DataParts currently_merging_mutating_parts;
+
+    /// The bounds of `holdDeltaQueryBounds` by partition. Guarded by `currently_processing_in_background_mutex`, which
+    /// the merge predicate holds.
+    std::map<String, std::multiset<Int64>> delta_query_bounds;
 
     /// currently mutating parts with future version
     std::map<DataPartPtr, Int64> currently_mutating_part_future_versions;

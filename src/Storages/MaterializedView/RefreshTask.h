@@ -9,6 +9,7 @@
 #include <Core/BackgroundSchedulePoolTaskHolder.h>
 #include <Core/UUID.h>
 #include <IO/Progress.h>
+#include <base/scope_guard.h>
 
 #include <map>
 #include <random>
@@ -368,6 +369,9 @@ private:
 
     RefreshSchedule refresh_schedule;
     RefreshSettings refresh_settings;
+    /// The guards that keep merges from losing the inputs as of the cursor of the latest refresh of a
+    /// `REFRESH ... INCREMENTAL` view.
+    std::vector<scope_guard> cursor_holds;
     std::vector<StorageID> initial_dependencies;
     const RefreshMode refresh_mode;
     bool isAppend() const { return refresh_mode != RefreshMode::Replace; }

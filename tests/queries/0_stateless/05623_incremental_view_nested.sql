@@ -1,8 +1,10 @@
 -- Tags: atomic-database
 -- A query with IN (subquery) runs as an incremental view over a SEMI join.
 
-CREATE TABLE events (user UInt64, x Int64) ENGINE = MergeTree ORDER BY user SETTINGS enable_block_number_column = 1;
-CREATE TABLE vip (id UInt64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1;
+SET enable_lightweight_update = 1;
+CREATE TABLE events (user UInt64, x Int64) ENGINE = MergeTree ORDER BY user
+    SETTINGS enable_block_number_column = 1, enable_block_offset_column = 1;
+CREATE TABLE vip (id UInt64) ENGINE = MergeTree ORDER BY id SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
 
 -- The events of VIP users.
 CREATE MATERIALIZED VIEW vip_mv REFRESH EVERY 10 YEAR INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
@@ -21,6 +23,7 @@ SELECT 'r1 expected', * FROM expected ORDER BY ALL;
 
 INSERT INTO events VALUES (2, 4), (3, 5), (1, 6);
 INSERT INTO vip VALUES (3);
+DELETE FROM events WHERE user = 2 AND x = 3 SETTINGS lightweight_delete_mode = 'lightweight_update';
 SYSTEM REFRESH VIEW vip_mv; SYSTEM WAIT VIEW vip_mv;
 SELECT 'r2', * FROM contents ORDER BY ALL;
 SELECT 'r2 expected', * FROM expected ORDER BY ALL;
