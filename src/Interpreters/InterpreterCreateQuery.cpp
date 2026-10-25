@@ -225,6 +225,7 @@ ASTPtr getInsertedQuery(const ASTCreateQuery & create, const ContextPtr & contex
     if (create.refresh_strategy && create.refresh_strategy->isDelta())
     {
         DeltaQuery delta_query(create.select->clone(), context);
+        delta_query.checkResultSign();
         return delta_query.getQuery()->clone();
     }
     return create.select->clone();

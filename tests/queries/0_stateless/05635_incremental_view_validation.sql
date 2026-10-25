@@ -36,11 +36,12 @@ CREATE MATERIALIZED VIEW val_mv_join
     AS SELECT s.k, s.v FROM val_src s JOIN val_dim d ON s.k = d.k;
 SELECT 'join_created', count() FROM system.tables WHERE database = currentDatabase() AND name = 'val_mv_join';
 
--- A LEFT JOIN is rejected.
+-- Without delta_query_sign_column, a LEFT JOIN is rejected: a new row of the right side would retract rows that the view
+-- already appended, and the target has no sign column.
 CREATE MATERIALIZED VIEW val_mv_left_join
     REFRESH EVERY 10 YEAR INCREMENTAL
     TO val_tgt EMPTY
-    AS SELECT s.k, s.v FROM val_src s LEFT JOIN val_dim d ON s.k = d.k; -- { serverError NOT_IMPLEMENTED }
+    AS SELECT s.k, s.v FROM val_src s LEFT JOIN val_dim d ON s.k = d.k; -- { serverError BAD_ARGUMENTS }
 
 -- An unspecified strictness that `join_default_strictness` makes ANY is rejected too.
 CREATE MATERIALIZED VIEW val_mv_any_join

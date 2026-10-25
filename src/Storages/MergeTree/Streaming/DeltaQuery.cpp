@@ -17,6 +17,7 @@
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
 #include <Interpreters/InterpreterSetQuery.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
@@ -25,6 +26,11 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageProxy.h>
 
+#include <base/find_symbols.h>
+#include <boost/algorithm/string/trim.hpp>
+
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -40,6 +46,7 @@ namespace ErrorCodes
 
 namespace Setting
 {
+    extern const SettingsString delta_query_lookup_tables;
     extern const SettingsString delta_query_sign_column;
 }
 
@@ -115,8 +122,10 @@ ASTPtr makeWeightedAggregate(const ASTFunction & function, const FunctionNode & 
     return makeASTFunction("sumIf", std::move(value), std::move(condition));
 }
 
-/// Appends the tables of the join tree in order. Throws unless each join is an inner join, which is linear in both sides.
-void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables)
+/// Appends the tables of the join tree in order, the ON expressions of its joins, and its joins that are linear only in
+/// their left side. Throws unless each join is an inner join, which is linear in both sides, or a LEFT, SEMI, ANTI or ASOF
+/// join of a table by ON.
+void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, QueryTreeNodes & keyed_joins)
 {
     switch (node->getNodeType())
     {
@@ -124,7 +133,7 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables)
             tables.push_back(node);
             return;
         case QueryTreeNodeType::ARRAY_JOIN:
-            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables);
+            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables, keyed_joins);
             return;
         case QueryTreeNodeType::CROSS_JOIN:
         {
@@ -132,19 +141,30 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables)
             if (std::ranges::any_of(join.getJoinTypes(), [](const auto & type) { return type.locality == JoinLocality::Global; }))
                 throwUnsupported("GLOBAL joins");
             for (const auto & table : join.getTableExpressions())
-                collectJoinTree(table, tables);
+                collectJoinTree(table, tables, keyed_joins);
             return;
         }
         case QueryTreeNodeType::JOIN:
         {
             /// Resolution has replaced an unspecified strictness by `join_default_strictness`.
             const auto & join = node->as<JoinNode &>();
-            if (join.getKind() != JoinKind::Inner || join.getStrictness() != JoinStrictness::All)
-                throwUnsupported("joins other than INNER ALL, CROSS and comma joins");
+            const auto kind = join.getKind();
+            const auto strictness = join.getStrictness();
+            const bool is_keyed = (kind == JoinKind::Left
+                    && (strictness == JoinStrictness::All || strictness == JoinStrictness::Semi || strictness == JoinStrictness::Anti
+                        || strictness == JoinStrictness::Asof))
+                || (kind == JoinKind::Inner && strictness == JoinStrictness::Asof);
+            if (!is_keyed && (kind != JoinKind::Inner || strictness != JoinStrictness::All))
+                throwUnsupported("joins other than INNER ALL, LEFT ALL, LEFT SEMI, LEFT ANTI, ASOF, CROSS and comma joins");
             if (join.getLocality() == JoinLocality::Global)
                 throwUnsupported("GLOBAL joins");
-            collectJoinTree(join.getLeftTableExpressionNode(), tables);
-            collectJoinTree(join.getRightTableExpressionNode(), tables);
+            const auto right_type = join.getRightTableExpressionNode()->getNodeType();
+            if (is_keyed && (right_type != QueryTreeNodeType::TABLE || !join.isOnJoinExpression()))
+                throwUnsupported("LEFT, SEMI, ANTI or ASOF joins whose right side isn't a table joined by ON");
+            collectJoinTree(join.getLeftTableExpressionNode(), tables, keyed_joins);
+            collectJoinTree(join.getRightTableExpressionNode(), tables, keyed_joins);
+            if (is_keyed)
+                keyed_joins.push_back(node);
             return;
         }
         default:
@@ -278,6 +298,44 @@ void checkSignColumnNotRead(const IQueryTreeNode & node, const std::unordered_se
     }
 }
 
+/// The edges of the top-level conjuncts `a.x = b.y` of `conditions` that equate columns of two different inputs.
+///
+/// The delta of a LEFT, SEMI, ANTI or ASOF join reads the right rows of the join keys of the changes with
+/// `b.y IN (SELECT x FROM a ...)`, see `buildDelta`. `IN` casts `b.y` to the type of `x` and looks it up by its binary
+/// representation. That lookup can disagree with `=`. For example, `-0.0 = 0.0` is true and
+/// `-0.0 IN (SELECT 0.0)` is false. So only columns of one type whose equal values have one representation count as join
+/// keys, like integers, strings, UUIDs and decimals. Floats don't.
+std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions, const InputIndexes & input_indexes)
+{
+    QueryTreeNodes conjuncts;
+    for (const auto & condition : conditions)
+        splitConjuncts(condition, conjuncts);
+
+    std::vector<SemiJoinEdge> edges;
+    for (const auto & conjunct : conjuncts)
+    {
+        const auto * function = conjunct->as<FunctionNode>();
+        if (!function || function->getFunctionName() != "equals" || function->getArguments().getNodes().size() != 2)
+            continue;
+        const auto * a = function->getArguments().getNodes()[0]->as<ColumnNode>();
+        const auto * b = function->getArguments().getNodes()[1]->as<ColumnNode>();
+        if (!a || !b)
+            continue;
+        auto a_input = input_indexes.find(a->getColumnSourceOrNull().get());
+        auto b_input = input_indexes.find(b->getColumnSourceOrNull().get());
+        if (a_input == input_indexes.end() || b_input == input_indexes.end() || a_input->second == b_input->second)
+            continue;
+        auto type = removeLowCardinalityAndNullable(a->getColumnType());
+        if (!type->equals(*removeLowCardinalityAndNullable(b->getColumnType()))
+            || !(type->isValueRepresentedByInteger() || isStringOrFixedString(type) || isUUID(type) || isDecimal(type)
+                || isDateTime64(type) || isIPv4(type) || isIPv6(type)))
+            continue;
+        edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName()});
+        edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName()});
+    }
+    return edges;
+}
+
 /// Rewrites the resolved `select` of `query` to carry the weights of its rows, the product of the signs of the signed
 /// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, unless it has no signs and
 /// not `unit_sign`. A query with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
@@ -345,11 +403,34 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
 
 DeltaQuery::~DeltaQuery() = default;
 
+void DeltaQuery::checkResultSign() const
+{
+    if (sign_column == internal_sign_column && getResultColumns().contains(sign_column))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "The delta query retracts rows, like the rows of LEFT, SEMI and ANTI joins or of filters by now(). The setting "
+            "delta_query_sign_column must name the sign column of its result");
+}
+
 void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_)
 {
     inputs.clear();
+    clock_input.reset();
+    clock_conjuncts.clear();
+    consolidated_columns.clear();
     sign_column = sign_column_;
 
+    /// A filter by now() changes its result as time passes, see `buildDelta`. Elsewhere now() would change rows that no
+    /// delta reads again.
+    const bool has_clock = callsNow(*query_);
+    if (const auto & selects = query_->as<ASTSelectWithUnionQuery &>().list_of_selects->children; has_clock && selects.size() == 1)
+    {
+        const auto & original = selects[0]->as<ASTSelectQuery &>();
+        if (std::ranges::any_of(original.children, [&](const auto & child) { return child != original.where() && callsNow(*child); }))
+            throwUnsupported("now() outside WHERE");
+    }
+    /// Resolution folds now() into a constant, and its source expression keeps the call.
+    ConvertToASTOptions ast_options;
+    ast_options.use_source_expression_for_constants = has_clock;
     InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
     auto query_tree = interpreter.getQueryTree()->clone();
 
@@ -361,13 +442,54 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
         throwUnsupported("UNION");
 
     QueryTreeNodes tables;
-    collectJoinTree(query_node->getJoinTreeNode(), tables);
+    QueryTreeNodes keyed_joins;
+    collectJoinTree(query_node->getJoinTreeNode(), tables, keyed_joins);
     InputIndexes input_indexes;
+    std::set<String> lookup_tables;
+    std::vector<std::string> names;
+    splitInto<','>(names, context->getSettingsRef()[Setting::delta_query_lookup_tables].value);
+    for (auto & name : names)
+    {
+        boost::trim(name);
+        if (!name.empty())
+            lookup_tables.insert(name);
+    }
+    std::set<String> found_lookup_tables;
     for (const auto & table : tables)
     {
         input_indexes.emplace(table.get(), inputs.size());
         inputs.push_back(makeInput(table->as<TableNode &>()));
+        const auto table_id = inputs.back().storage->getStorageID();
+        for (const auto & name : {table_id.table_name, table_id.getFullNameNotQuoted()})
+            if (lookup_tables.contains(name))
+            {
+                inputs.back().lookup = true;
+                found_lookup_tables.insert(name);
+            }
     }
+    for (const auto & name : lookup_tables)
+        if (!found_lookup_tables.contains(name))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "delta_query_lookup_tables names {}, which the delta query doesn't read", name);
+    if (std::ranges::all_of(inputs, [](const auto & input) { return input.lookup; }))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "delta_query_lookup_tables names every input of the delta query");
+
+    /// A SEMI or ANTI join returns each left row at most once, whatever the signs of its matches.
+    std::unordered_set<size_t> existence_joins;
+    for (const auto & node : keyed_joins)
+    {
+        const auto & join = node->as<JoinNode &>();
+        const size_t right = input_indexes.at(join.getRightTableExpressionNode().get());
+        for (const auto & edge : collectSemiJoinEdges({join.getJoinExpression()}, input_indexes))
+            if (edge.from == right && std::ranges::find(inputs[right].join_keys, edge.from_column) == inputs[right].join_keys.end())
+                inputs[right].join_keys.push_back(edge.from_column);
+        if (inputs[right].join_keys.empty())
+            throwUnsupported("LEFT, SEMI, ANTI or ASOF joins without an equality of join keys of both sides in ON");
+        if (join.getStrictness() == JoinStrictness::Semi || join.getStrictness() == JoinStrictness::Anti)
+            existence_joins.insert(right);
+    }
+    /// The delta of a join that isn't linear in a table, or of a filter by now(), retracts rows of the result.
+    const bool retracts = has_clock
+        || std::ranges::any_of(inputs, [](const auto & input) { return !input.lookup && !input.join_keys.empty(); });
 
     /// The deltas must merge into the query over the union of the inputs.
     ASTs signs;
@@ -376,15 +498,25 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     {
         if (!hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
             continue;
+        inputs[i].is_signed = true;
         signed_tables.insert(tables[i].get());
-        signs.push_back(makeColumn(inputs[i].alias, sign_column));
+        auto sign = makeColumn(inputs[i].alias, sign_column);
+        if (existence_joins.contains(i))
+            continue;
+        /// A left row without a match gets sign 0 from the right side.
+        if (!inputs[i].join_keys.empty())
+            sign = makeASTFunction("if", makeASTFunction("equals", sign->clone(), make_intrusive<ASTLiteral>(Field(Int64{0}))),
+                make_intrusive<ASTLiteral>(Field(Int64{1})), sign);
+        signs.push_back(std::move(sign));
     }
+    if (retracts)
+        signs.push_back(make_intrusive<ASTIdentifier>(term_sign_name));
     checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
     checkExpressions(*query_tree, input_indexes);
     checkLinearClauses(*query_node);
     checkResultColumns(*query_node, !signs.empty());
 
-    query = query_tree->toAST();
+    query = query_tree->toAST(ast_options);
 
     auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
     /// Without GROUP BY, a delta that reads no rows still returns one row by default, with 0 for `min` and `max`.
@@ -393,6 +525,40 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     /// The rows for a target with a sign column have a sign even if no input has one.
     addWeights(select, *query_node, signs, sign_column, sign_column != internal_sign_column);
 
+    std::map<String, std::set<String>> columns;
+    collectColumns(select, columns);
+    for (auto & input : inputs)
+        if (!input.join_keys.empty())
+            for (const auto & column : columns[input.alias])
+                if (column != sign_column)
+                    input.columns.push_back(column);
+
+    /// A signed query without aggregates returns the sign column. The pairs of terms of its delta return most rows twice with
+    /// opposite signs.
+    if (!signs.empty() && select.select()->children.back()->tryGetAlias() == sign_column)
+        for (const auto & column : query_node->getProjectionColumns())
+            consolidated_columns.push_back(column.name);
+
+    if (has_clock)
+    {
+        ASTs conjuncts{select.where()};
+        if (const auto * function = select.where()->as<ASTFunction>(); function && function->name == "and")
+            conjuncts = function->arguments->children;
+        std::map<String, std::set<String>> clocked;
+        for (const auto & conjunct : conjuncts)
+            if (callsNow(*conjunct))
+            {
+                clock_conjuncts.push_back(conjunct->clone());
+                collectColumns(*conjunct, clocked);
+            }
+        auto it = clocked.size() == 1
+            ? std::ranges::find_if(inputs, [&](const auto & input) { return input.alias == clocked.begin()->first; })
+            : inputs.end();
+        if (it == inputs.end() || !it->join_keys.empty())
+            throwUnsupported("filters by now() unless they read one table, which isn't the right side of a LEFT, SEMI, ANTI or ASOF join");
+        clock_input = it - inputs.begin();
+    }
+
     /// Resolution checks only that the user can see the tables. Building the plan checks the grants on the columns that
     /// the query reads.
     interpreter.getSampleBlock();
@@ -400,7 +566,10 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
 
 ASTPtr DeltaQuery::getQuery() const
 {
-    return query->clone();
+    /// The weights of the query read `__term_sign`, which each term of a delta binds. The query itself is one term of sign 1.
+    auto result = query->clone();
+    bindTerm(*result, 1, {});
+    return result;
 }
 
 NamesAndTypesList DeltaQuery::getResultColumns() const

@@ -2,12 +2,19 @@
 
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/Combinators/AggregateFunctionCombinatorFactory.h>
+#include <Analyzer/FunctionNode.h>
+#include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
 
+
+#include <map>
 #include <set>
 
 
@@ -61,11 +68,155 @@ bool isMergeableAggregate(const String & name)
     return suffixes.empty() && without_if.contains(base);
 }
 
+ASTPtr & getTable(ASTTableExpression & expression)
+{
+    if (expression.table_function)
+        return expression.table_function;
+    if (expression.subquery)
+        return expression.subquery;
+    return expression.database_and_table_name;
+}
+
+ASTTableExpression * findTable(const ASTSelectQuery & select, const std::function<bool(const IAST & table)> & matches)
+{
+    if (!select.tables())
+        return nullptr;
+    for (const auto & element : select.tables()->children)
+    {
+        const auto & table_expression = element->as<ASTTablesInSelectQueryElement &>().table_expression;
+        if (!table_expression)
+            continue;
+        auto & expression = table_expression->as<ASTTableExpression &>();
+        if (const auto & table = getTable(expression); table && matches(*table))
+            return &expression;
+    }
+    return nullptr;
+}
+
+ASTTableExpression & findAliasedTable(const ASTSelectQuery & select, const String & alias)
+{
+    auto * expression = findTable(select, [&](const IAST & table) { return table.tryGetAlias() == alias; });
+    chassert(expression);
+    return *expression;
+}
+
+void setTable(ASTTableExpression & expression, ASTPtr table)
+{
+    expression.reset(getTable(expression));
+    auto & field = table->as<ASTTableIdentifier>() ? expression.database_and_table_name
+        : table->as<ASTFunction>() ? expression.table_function : expression.subquery;
+    expression.setOrReplace(field, std::move(table));
+}
+
+void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
+{
+    if (const auto * function = node->as<FunctionNode>(); function && function->getFunctionName() == "and")
+    {
+        for (const auto & argument : function->getArguments().getNodes())
+            splitConjuncts(argument, conjuncts);
+    }
+    else
+        conjuncts.push_back(node);
+}
+
+ASTPtr makeSelectWithUnion(ASTPtr select)
+{
+    auto selects = make_intrusive<ASTExpressionList>();
+    selects->children.push_back(std::move(select));
+    auto query = make_intrusive<ASTSelectWithUnionQuery>();
+    query->list_of_selects = selects;
+    query->children.push_back(std::move(selects));
+    return query;
+}
+
+ASTPtr makeUnionAll(const ASTs & queries)
+{
+    auto selects = make_intrusive<ASTExpressionList>();
+    for (const auto & query : queries)
+    {
+        if (const auto * union_query = query->as<ASTSelectWithUnionQuery>())
+        {
+            const auto & children = union_query->list_of_selects->children;
+            chassert(children.size() == 1 || union_query->union_mode == SelectUnionMode::UNION_ALL);
+            selects->children.insert(selects->children.end(), children.begin(), children.end());
+        }
+        else
+            selects->children.push_back(query);
+    }
+    if (selects->children.size() == 1)
+        return makeSelectWithUnion(selects->children[0]);
+    auto result = make_intrusive<ASTSelectWithUnionQuery>();
+    result->union_mode = SelectUnionMode::UNION_ALL;
+    result->is_normalized = true;
+    result->list_of_selects = selects;
+    result->children.push_back(std::move(selects));
+    return result;
+}
+
+ASTPtr makeSubquery(ASTPtr query)
+{
+    if (query->as<ASTSelectQuery>())
+        query = makeSelectWithUnion(std::move(query));
+    return make_intrusive<ASTSubquery>(std::move(query));
+}
+
+ASTPtr makeTables(ASTPtr table)
+{
+    auto expression = make_intrusive<ASTTableExpression>();
+    setTable(*expression, std::move(table));
+    auto element = make_intrusive<ASTTablesInSelectQueryElement>();
+    element->table_expression = expression;
+    element->children.push_back(std::move(expression));
+    auto tables = make_intrusive<ASTTablesInSelectQuery>();
+    tables->children.push_back(std::move(element));
+    return tables;
+}
+
+ASTPtr makeSelect(ASTs columns, ASTPtr table, ASTPtr where, ASTs group_by, ASTPtr having)
+{
+    auto select = make_intrusive<ASTSelectQuery>();
+    auto list = make_intrusive<ASTExpressionList>();
+    list->children = std::move(columns);
+    select->setExpression(ASTSelectQuery::Expression::SELECT, std::move(list));
+    if (table)
+        select->setExpression(ASTSelectQuery::Expression::TABLES, makeTables(std::move(table)));
+    select->setExpression(ASTSelectQuery::Expression::WHERE, std::move(where));
+    if (!group_by.empty())
+    {
+        auto keys = make_intrusive<ASTExpressionList>();
+        keys->children = std::move(group_by);
+        select->setExpression(ASTSelectQuery::Expression::GROUP_BY, std::move(keys));
+    }
+    select->setExpression(ASTSelectQuery::Expression::HAVING, std::move(having));
+    return select;
+}
+
+ASTPtr withAlias(ASTPtr ast, const String & alias)
+{
+    ast->setAlias(alias);
+    return ast;
+}
+
+ASTs makeIdentifiers(const Names & names)
+{
+    ASTs identifiers;
+    for (const auto & name : names)
+        identifiers.push_back(make_intrusive<ASTIdentifier>(name));
+    return identifiers;
+}
+
 ASTPtr makeColumn(const String & qualifier, const String & column)
 {
     if (qualifier.empty())
         return make_intrusive<ASTIdentifier>(column);
     return make_intrusive<ASTIdentifier>(std::vector<String>{qualifier, column});
+}
+
+ASTPtr makeTuple(ASTs elements)
+{
+    if (elements.size() == 1)
+        return std::move(elements[0]);
+    return makeASTFunction("tuple", std::move(elements));
 }
 
 ASTPtr makeConjunction(ASTs conjuncts)
@@ -77,6 +228,56 @@ ASTPtr makeConjunction(ASTs conjuncts)
     return makeASTFunction("and", std::move(conjuncts));
 }
 
+ASTs cloneAll(const ASTs & asts)
+{
+    ASTs result;
+    for (const auto & ast : asts)
+        result.push_back(ast->clone());
+    return result;
+}
+
+String makeUniqueName(const String & base, const NameSet & taken)
+{
+    String name = base;
+    for (size_t i = 1; taken.contains(name); ++i)
+        name = fmt::format("{}_{}", base, i);
+    return name;
+}
+
+void bindTerm(IAST & ast, std::optional<Int64> sign, std::optional<Int64> time)
+{
+    for (auto & child : ast.children)
+    {
+        const auto * identifier = child->as<ASTIdentifier>();
+        const auto * function = child->as<ASTFunction>();
+        if (sign && identifier && identifier->name() == term_sign_name)
+        {
+            auto literal = make_intrusive<ASTLiteral>(Field(*sign));
+            literal->setAlias(identifier->tryGetAlias());
+            child = std::move(literal);
+        }
+        else if (time && function && function->name == "now")
+            child = makeASTFunction("toDateTime", make_intrusive<ASTLiteral>(Field(static_cast<UInt64>(*time))));
+        else
+            bindTerm(*child, sign, time);
+    }
+}
+
+bool callsNow(const IAST & ast)
+{
+    if (const auto * function = ast.as<ASTFunction>(); function && function->name == "now")
+        return true;
+    return std::ranges::any_of(ast.children, [](const auto & child) { return callsNow(*child); });
+}
+
+void collectColumns(const IAST & ast, std::map<String, std::set<String>> & columns)
+{
+    if (const auto * identifier = ast.as<ASTIdentifier>(); identifier && identifier->compound())
+        columns[identifier->name_parts[0]].insert(identifier->name_parts[1]);
+    for (const auto & child : ast.children)
+        collectColumns(*child, columns);
+}
+
 void setSetting(ASTSelectQuery & select, std::string_view name, const Field & value)
 {
     auto settings = select.settings() ? select.settings()->clone() : make_intrusive<ASTSetQuery>();
@@ -84,6 +285,33 @@ void setSetting(ASTSelectQuery & select, std::string_view name, const Field & va
     set_query.is_standalone = false;
     set_query.changes.setSetting(name, value);
     select.setExpression(ASTSelectQuery::Expression::SETTINGS, std::move(settings));
+}
+
+ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources)
+{
+    /// The weight and the count need names that no column has.
+    NameSet taken(columns.begin(), columns.end());
+    taken.insert(sign);
+    const auto weight = makeUniqueName("__weight", taken);
+    taken.insert(weight);
+    const auto count = makeUniqueName("__count", taken);
+    auto count_column = [&] { return make_intrusive<ASTIdentifier>(count); };
+
+    ASTs weighted;
+    for (auto & source : sources)
+    {
+        source.values.push_back(withAlias(std::move(source.weight), weight));
+        weighted.push_back(makeSelect(std::move(source.values), std::move(source.table), std::move(source.where)));
+    }
+    auto sums = makeIdentifiers(columns);
+    sums.push_back(withAlias(makeASTFunction("sum", make_intrusive<ASTIdentifier>(weight)), count));
+    auto summed = makeSelect(std::move(sums), makeSubquery(makeUnionAll(weighted)), nullptr, makeIdentifiers(columns),
+        makeASTFunction("notEquals", count_column(), make_intrusive<ASTLiteral>(Field(UInt64{0}))));
+
+    auto rows = makeIdentifiers(columns);
+    rows.push_back(withAlias(makeASTFunction("arrayJoin", makeASTFunction("arrayWithConstant",
+        makeASTFunction("toUInt64", makeASTFunction("abs", count_column())), makeASTFunction("toInt8", makeASTFunction("sign", count_column())))), sign));
+    return makeSelectWithUnion(makeSelect(std::move(rows), makeSubquery(std::move(summed))));
 }
 
 }

@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/Streaming/DeltaQueryInternal.h>
 
+#include <chrono>
 #include <map>
 
 
@@ -16,6 +17,9 @@ using namespace DeltaQueryInternal;
 
 namespace
 {
+
+/// The key of the time of the snapshot in the cursors of queries that call now(). Its value is in seconds.
+constexpr auto time_key = "now";
 
 CursorTreeNodePtr makeCursorTree(const Cursor & cursor)
 {
@@ -45,6 +49,13 @@ std::map<String, TableBlocks> snapshotTables(const std::vector<Input> & inputs)
     return tables;
 }
 
+std::optional<Int64> getTime(const CursorTreeNodePtr & tree)
+{
+    if (!tree || !tree->hasValue(time_key))
+        return {};
+    return tree->getValue(time_key);
+}
+
 Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & inputs, const std::map<String, TableBlocks> & tables,
     std::string_view name)
 {
@@ -70,6 +81,8 @@ Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & in
 
     for (const auto & [key, value] : *tree)
     {
+        if (key == time_key && std::holds_alternative<Int64>(value))
+            continue;
         const auto * partitions = std::get_if<CursorTreeNodePtr>(&value);
         if (!partitions || !cursor.contains(key))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "The {} has key {}, which is not the UUID of a table of the query", name, key);
@@ -93,7 +106,10 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
             bound = blocks.getCommittedEnd(partition_id, bound);
         std::erase_if(partitions, [](const auto & partition) { return partition.second <= 0; });
     }
-    return makeCursorTree(frontier);
+    auto tree = makeCursorTree(frontier);
+    if (clock_input)
+        tree->setValue(time_key, std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    return tree;
 }
 
 }

@@ -10833,9 +10833,15 @@ The sign column of the inputs of `deltaQuery` and of `REFRESH ... INCREMENTAL` v
 
 A query without aggregates returns the weight of each row in a column of this name, for a `CollapsingMergeTree` target. A query with aggregates over signed inputs returns sums for a [SummingMergeTree](/reference/engines/table-engines/mergetree-family/summingmergetree) target. It supports only `count`, `sum`, their `-If` forms and `exponentialMovingAverageState`, and their results become signed. Sums of `UInt64` become `Int128`. The moving average of a group is as of the latest time of any of its rows, including retracted rows. The query can set this setting in its `SETTINGS` clause. A nonempty value also makes a query over one table follow the rules of delta queries over joins, and a query without aggregates over unsigned inputs returns weight 1.
 
+A query with this setting can also have `LEFT`, `SEMI`, `ANTI` and `ASOF` joins of a table by `ON` with an equality of columns, and filters by `now()` in `WHERE` over the columns of one table. The result of such a join changes for every left row of the join keys of a new right row, and the result of such a filter changes as time passes. So their deltas retract rows, and the target must be a `CollapsingMergeTree` or a `SummingMergeTree`.
+
 The empty string, the default, makes no input signed.
 )", EXPERIMENTAL, \
         {"26.11", "", "", "New setting for delta queries over inputs whose rows have signs."}) \
+    DECLARE(String, delta_query_lookup_tables, "", R"(
+A comma-separated list of input tables of `deltaQuery` and of `REFRESH ... INCREMENTAL` views whose new rows don't change earlier results. Each name is a table name or `database.table`. A delta joins the new rows of the other inputs with the latest rows of a lookup table, and the new rows of a lookup table join with nothing. So each result row stays as it was when its other rows arrived, like a lookup join, and the delta skips the term of the lookup table, which is usually its most expensive one. A query needs an input that isn't a lookup table.
+)", EXPERIMENTAL, \
+        {"26.11", "", "", "New setting for delta queries whose inputs include lookup tables."}) \
     DECLARE(Bool, allow_experimental_database_materialized_postgresql, false, R"(
 Allow to create database with Engine=MaterializedPostgreSQL(...).
 )", EXPERIMENTAL) \

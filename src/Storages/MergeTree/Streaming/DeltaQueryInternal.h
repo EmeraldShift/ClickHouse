@@ -2,11 +2,14 @@
 
 #include <Storages/MergeTree/Streaming/DeltaQuery.h>
 
+#include <Analyzer/IQueryTreeNode.h>
 #include <Core/Field.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/Streaming/Subscription/SubscriptionEnrichment.h>
 
+#include <functional>
 #include <map>
+#include <set>
 
 
 /// The types and helpers that the files of `DeltaQuery` share.
@@ -19,6 +22,8 @@ namespace ErrorCodes
 }
 
 class ASTSelectQuery;
+struct ASTTableExpression;
+class QueryNode;
 
 /// One table of the FROM clause of the query.
 struct DeltaQuery::Input
@@ -28,12 +33,33 @@ struct DeltaQuery::Input
     /// The key of the table in cursors: its UUID.
     String key;
     std::shared_ptr<MergeTreeData> storage;
+    /// Whether `delta_query_lookup_tables` names the table. Its new rows then have no term, and the other terms read its
+    /// rows below the new cursor.
+    bool lookup = false;
+    bool is_signed = false;
+    /// The columns of the table in the equalities of the ON clause, if the table is the right side of a LEFT, SEMI, ANTI or
+    /// ASOF join. Such a join isn't linear in the table. A new row of the table changes the result for every left row of
+    /// its join keys, see `buildDelta`.
+    Names join_keys = {};
+    /// The columns of such a table that the query reads.
+    Names columns = {};
+};
+
+/// An equality `from.from_column = to.to_column` between join keys of two inputs.
+struct DeltaQuery::SemiJoinEdge
+{
+    size_t from;
+    String from_column;
+    size_t to;
+    String to_column;
 };
 
 namespace DeltaQueryInternal
 {
 
 using Input = DeltaQuery::Input;
+
+using SemiJoinEdge = DeltaQuery::SemiJoinEdge;
 
 /// Table UUID -> partition ID -> first excluded block number.
 using Cursor = std::map<String, std::map<String, Int64>>;
@@ -43,6 +69,9 @@ constexpr std::string_view linear_queries = "delta queries";
 
 /// The name of the sign column of the deltas of a query without `delta_query_sign_column`.
 constexpr auto internal_sign_column = "__delta_query_sign";
+
+/// The factor of the weights of queries whose deltas have terms that retract rows, see `DeltaQuery::buildDelta`.
+constexpr auto term_sign_name = "__term_sign";
 
 Int64 getBound(const std::map<String, Int64> & partitions, const String & partition_id);
 
@@ -114,16 +143,82 @@ bool isInvertibleAggregate(const String & name);
 /// pass the condition of an `-If` form, and `minIf` or `maxIf` then returns 0. So only `sum` and `count` take `-If`.
 bool isMergeableAggregate(const String & name);
 
+/// The table identifier, table function or subquery of `expression`.
+ASTPtr & getTable(ASTTableExpression & expression);
+
+/// The table expression in FROM of `select` whose table passes `matches`, or null.
+ASTTableExpression * findTable(const ASTSelectQuery & select, const std::function<bool(const IAST & table)> & matches);
+
+/// The table expression in FROM of `select` of the table with alias `alias`.
+ASTTableExpression & findAliasedTable(const ASTSelectQuery & select, const String & alias);
+
+/// Replaces the table of `expression` by `table`, a table identifier, a table function or a subquery.
+void setTable(ASTTableExpression & expression, ASTPtr table);
+
+void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts);
+
+ASTPtr makeSelectWithUnion(ASTPtr select);
+
+/// `query_1 UNION ALL ...` over selects and unions of selects. The unions of delta queries are UNION ALL, so the selects of
+/// the unions in `queries` become selects of the result.
+ASTPtr makeUnionAll(const ASTs & queries);
+
+/// `(query)` for a select or a union.
+ASTPtr makeSubquery(ASTPtr query);
+
+/// The FROM clause of `table`, a table identifier, a table function or a subquery.
+ASTPtr makeTables(ASTPtr table);
+
+/// `SELECT columns FROM table WHERE where GROUP BY group_by HAVING having`, without the clauses that are null or empty.
+ASTPtr makeSelect(ASTs columns, ASTPtr table, ASTPtr where = nullptr, ASTs group_by = {}, ASTPtr having = nullptr);
+
+/// `ast AS alias`.
+ASTPtr withAlias(ASTPtr ast, const String & alias);
+
+ASTs makeIdentifiers(const Names & names);
+
 /// `qualifier.column`, or `column` for an empty qualifier.
 ASTPtr makeColumn(const String & qualifier, const String & column);
+
+/// The one element of `elements`, or else `tuple(elements...)`.
+ASTPtr makeTuple(ASTs elements);
 
 /// `c_1 AND ...`, or `1` without conjuncts.
 ASTPtr makeConjunction(ASTs conjuncts);
 
+ASTs cloneAll(const ASTs & asts);
+
+/// `base`, or else `base_1`, `base_2` and so on, whichever `taken` doesn't have first.
+String makeUniqueName(const String & base, const NameSet & taken);
+
+/// Replaces the identifier `__term_sign` by `sign` and the calls of now() by `time`.
+void bindTerm(IAST & ast, std::optional<Int64> sign, std::optional<Int64> time);
+
+bool callsNow(const IAST & ast);
+
+/// The columns that `ast` reads by qualified identifiers, by qualifier.
+void collectColumns(const IAST & ast, std::map<String, std::set<String>> & columns);
+
 /// Adds `SETTINGS name = value` to `select`, keeping its other settings.
 void setSetting(ASTSelectQuery & select, std::string_view name, const Field & value);
 
+/// The rows of `table` that pass `where`, if not null, with the values `values` of the columns of `consolidate` and the
+/// weight `weight`.
+struct WeightedRows
+{
+    ASTPtr table;
+    ASTs values;
+    ASTPtr weight;
+    ASTPtr where = nullptr;
+};
+
+/// The rows of `sources` as rows of `columns` with sign 1 or -1 in column `sign`. Equal rows sum their weights first, so rows
+/// of opposite weights cancel.
+ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources);
+
 std::map<String, TableBlocks> snapshotTables(const std::vector<Input> & inputs);
+
+std::optional<Int64> getTime(const CursorTreeNodePtr & tree);
 
 /// Parses `tree` and removes the partitions that this server has no parts of and no parts in flight to. Reading such a
 /// partition returns no rows below any bound, so removing it changes no result. It also lets the partition start over
@@ -137,6 +232,13 @@ Cursor parseCursor(const CursorTreeNodePtr & tree, const std::vector<Input> & in
 /// Rows don't evaluate it.
 void addBounds(ASTs & conjuncts, const String & qualifier, const std::map<String, Int64> * lower,
     const std::map<String, Int64> & upper);
+
+/// Keeps the rows of `input` in `select` that pass `conjuncts`. The conjuncts go to `where`, the conjuncts of its WHERE,
+/// except for the right side of a LEFT, SEMI, ANTI or ASOF join, which needs its bounds before the join. In WHERE they
+/// would filter the joined rows, and a left row whose matches are all out of bounds would get no row instead of
+/// a row without a match. So the table of the right side becomes the subquery of those rows. Over a signed table the
+/// subquery sums the signs of equal rows, because the join must see which rows remain, not each insert and retraction.
+void setInput(ASTSelectQuery & select, const Input & input, ASTs conjuncts, ASTs & where, const String & sign_column);
 
 }
 

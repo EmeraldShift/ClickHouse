@@ -301,8 +301,8 @@ StorageMaterializedView::StorageMaterializedView(
         if (query.create_or_replace || query.replace_view)
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "CREATE OR REPLACE and REPLACE are not supported for `REFRESH ... INCREMENTAL` views");
-        /// Throws unless delta queries support the query.
         DeltaQuery delta_query(select.select_query, mv_db_context);
+        delta_query.checkResultSign();
     }
 
     storage_metadata.setSelectQuery(select);

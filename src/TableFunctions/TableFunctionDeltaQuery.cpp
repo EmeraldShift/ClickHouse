@@ -82,12 +82,14 @@ private:
     ColumnsDescription getActualTableStructure(ContextPtr context, bool /*is_insert_query*/) const override
     {
         DeltaQuery query(delta_query, context);
+        query.checkResultSign();
         return ColumnsDescription(query.getResultColumns());
     }
 
     StoragePtr executeImpl(const ASTPtr &, ContextPtr context, const String & table_name, ColumnsDescription cached_columns, bool) const override
     {
         DeltaQuery query(delta_query, context);
+        query.checkResultSign();
         ASTCreateQuery create;
         create.set(create.select, query.buildDelta(parseCursor(cursor_arguments[0], context), parseCursor(cursor_arguments[1], context)));
         /// Each term of the delta has the columns of the query. Analyzing the query once is much cheaper than analyzing every
@@ -145,7 +147,9 @@ A cursor has type `Map(String, Int64)`. Each key is a path `table_uuid.partition
 of the partition that the cursor excludes. An empty map is the cursor before any insert. Get the current cursor with `deltaQueryFrontier`.
 
 The tables must be `MergeTree` or `ReplicatedMergeTree` tables of Atomic databases with `enable_block_number_column = 1`, without
-mutations or lightweight updates. A query may use filters, `INNER` and `CROSS` joins, and `GROUP BY`.
+mutations or lightweight updates. A query may use filters, `INNER` and `CROSS` joins, `GROUP BY`, `LEFT`, `SEMI`, `ANTI` and `ASOF` joins of a table by `ON` with an equality of
+columns, and filters by `now()` in `WHERE` over the columns of one table. Their deltas retract rows. The cursors of a query
+with `now()` have the key `now`, the time of the snapshot.
 
 `target UNION ALL deltaQuery(query, cursor, frontier)` reads the result of a `REFRESH ... INCREMENTAL` view as of
 now, where `cursor` is the column of `system.view_refreshes` and `frontier` is the cursor that `deltaQueryFrontier` returns. Each of its result columns is
@@ -157,7 +161,9 @@ of sign -1 retracts an earlier row with the same values. A query without aggrega
 as a column of that name, for a `CollapsingMergeTree` target. A query with aggregates over signed tables supports only `count`, `sum`, their
 `-If` forms and `exponentialMovingAverageState`. The moving average of a group is as of the latest time of any of its rows,
 including retracted rows. The deltas sum to the result over the rows that remain, for a `SummingMergeTree`
-target. `deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows or expressions over aggregates.
+target. Without the setting, the delta of a query whose rows retract throws `BAD_ARGUMENTS`, because its rows have no sign column.
+`deltaQuery` doesn't support `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, windows or expressions over aggregates. Over
+rows that retract, it supports only the aggregates above.
 
 Besides the grants that `query` needs, `deltaQuery` needs `SELECT` on the virtual columns `_block_number`, `_partition_id` and `_part` of
 the tables of `query`.

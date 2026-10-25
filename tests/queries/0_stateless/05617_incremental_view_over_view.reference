@@ -1,4 +1,3 @@
-round 1	east	10
-round 1	west	5
-round 2	east	7
-round 2	west	5
+round 1		15
+round 2		5
+round 2	east	10

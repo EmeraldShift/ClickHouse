@@ -30,7 +30,7 @@ SELECT * FROM deltaQuery((WITH sum(v) AS s SELECT t.k, -s FROM t JOIN u ON t.k =
 SELECT * FROM deltaQueryFrontier((SELECT k FROM t WHERE k IN (SELECT k FROM u))); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM (SELECT k FROM t))); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT number FROM numbers(1))); -- { serverError NOT_IMPLEMENTED }
-SELECT * FROM deltaQueryFrontier((SELECT t.k FROM t LEFT JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
+SELECT * FROM deltaQuery((SELECT t.k FROM t LEFT JOIN u ON t.k = u.k), map(), map()); -- { serverError BAD_ARGUMENTS }
 SELECT * FROM deltaQueryFrontier((SELECT t.k FROM t ANY INNER JOIN u ON t.k = u.k)); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT t.k FROM t INNER JOIN u ON t.k = u.k SETTINGS join_default_strictness = 'ANY')); -- { serverError NOT_IMPLEMENTED }
 SELECT * FROM deltaQueryFrontier((SELECT k FROM t WHERE (k, v) IN u)); -- { serverError NOT_IMPLEMENTED }
