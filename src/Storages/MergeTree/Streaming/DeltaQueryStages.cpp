@@ -368,8 +368,10 @@ String DeltaQuery::getStageCreateQuery(const StorageID & table) const
             quoted.push_back(backQuote(name));
         return names.empty() ? String("tuple()") : "(" + joinNames(quoted) + ")";
     };
+    /// The deduplication log drops the blocks that the retry of a refresh inserts again.
     return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = {} ORDER BY {}{} "
-        "SETTINGS enable_block_number_column = 1, allow_nullable_key = 1", table.getFullTableName(), quoteString(toString(table.uuid)),
+        "SETTINGS enable_block_number_column = 1, allow_nullable_key = 1, non_replicated_deduplication_window = 100",
+        table.getFullTableName(), quoteString(toString(table.uuid)),
         joinNames(definitions), consolidates ? "SummingMergeTree(" + backQuote(sign_column) + ")" : "MergeTree", key(order),
         consolidates && !primary_key.empty() ? " PRIMARY KEY " + key(primary_key) : "");
 }

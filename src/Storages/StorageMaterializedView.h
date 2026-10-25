@@ -183,10 +183,16 @@ private:
     /// With `recompute`, such a refresh makes the target equal to the query as of the new cursor if it can, see
     /// `DeltaQuery::canCorrect`. It does that also when it finds that the delta from `stream_cursor` lost history.
     /// It sets `out_prepared_plan` to the plan of the INSERT's SELECT if later refreshes can reuse it.
+    /// With `persist_intent`, such a refresh from a cursor passes it the bounds of its inputs and the time before its
+    /// first write, and its INSERTs get deduplication tokens. `intent` has the bounds that an earlier attempt from the same
+    /// cursor passed. The refresh reads those bounds again. So a retry repeats the INSERTs of the failed attempt, and targets that
+    /// keep a deduplication log drop the blocks that it wrote. After `persist_intent` returns, the refresh sets
+    /// `out_snapshot_holds` to the guards of those bounds.
     std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
     prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
         const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds,
-        std::shared_ptr<PreparedSelectPlan> & out_prepared_plan, bool recompute) const;
+        std::shared_ptr<PreparedSelectPlan> & out_prepared_plan, bool recompute, const CursorTreeNodePtr & intent,
+        const std::function<void(const CursorTreeNodePtr &)> & persist_intent, std::vector<scope_guard> & out_snapshot_holds) const;
     std::optional<StorageID> exchangeTargetTable(StorageID fresh_table, ContextPtr refresh_context) const;
     void dropTempTable(StorageID table, ContextMutablePtr refresh_context, String & out_exception);
 

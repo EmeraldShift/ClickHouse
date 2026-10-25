@@ -609,7 +609,8 @@ String DeltaQuery::getIntegralCreateQuery(const StorageID & integral) const
     for (size_t i = 0; i < residual->num_keys; ++i)
         if (std::ranges::find(residual->partition_keys, i) == residual->partition_keys.end())
             order.push_back(backQuote(makeKeyName(i)));
-    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} SETTINGS allow_nullable_key = 1",
+    return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = AggregatingMergeTree ORDER BY {} "
+        "SETTINGS allow_nullable_key = 1, non_replicated_deduplication_window = 100",
         integral.getFullTableName(), quoteString(toString(integral.uuid)), joinNames(columns), order.empty() ? "tuple()" : "(" + joinNames(order) + ")");
 }
 

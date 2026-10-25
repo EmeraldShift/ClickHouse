@@ -24,6 +24,7 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterCreateQuery.h>
+#include <Interpreters/InsertDependenciesBuilder.h>
 #include <Interpreters/InterpreterDropQuery.h>
 #include <Interpreters/InterpreterInsertQuery.h>
 #include <Interpreters/InterpreterRenameQuery.h>
@@ -58,6 +59,7 @@
 #include <Common/randomSeed.h>
 #include <Core/UUID.h>
 #include <Common/SipHash.h>
+#include <IO/WriteBufferFromString.h>
 #include <Common/quoteString.h>
 
 #include <Backups/BackupEntriesCollector.h>
@@ -141,9 +143,34 @@ namespace
             StorageID(view_id.database_name, ".inner_delta." + uuid)};
     }
 
-    /// Runs `query` as an internal query of the refresh. The text of a delta can be deeper than the limits of the parser allow
-    /// for a query that a user writes.
-    void executeRefreshStep(const String & query, const ContextPtr & refresh_context)
+    /// Makes the INSERTs in `context` write one block with the deduplication token `token`. A retry of a refresh from the same
+    /// cursor reads the same snapshot, so it repeats each INSERT with the same token and the same rows. The target then drops
+    /// the block of the retry if the failed attempt wrote it, see `prepareRefresh`. Strict squashing names the block after it
+    /// squashes the rows, so the name doesn't depend on how the SELECT splits them. A trivial INSERT SELECT would read with the
+    /// size of the block as its block size.
+    void setRefreshInsertToken(Context & context, const String & token)
+    {
+        context.setSetting("insert_deduplication_token", token);
+        context.setSetting("deduplicate_insert_select", Field("force_enable"));
+        context.setSetting("use_strict_insert_block_limits", Field(true));
+        context.setSetting("min_insert_block_size_rows", Field(std::numeric_limits<UInt64>::max()));
+        context.setSetting("min_insert_block_size_bytes", Field(std::numeric_limits<UInt64>::max()));
+        context.setSetting("max_insert_block_size", Field(std::numeric_limits<UInt64>::max()));
+        context.setSetting("max_insert_block_size_bytes", Field(UInt64{0}));
+        context.setSetting("optimize_trivial_insert_select", Field(false));
+    }
+
+    /// The token of the INSERT into `table` of a refresh with the token `token`, or empty without a token.
+    String getRefreshInsertToken(const String & token, const StorageID & table)
+    {
+        if (token.empty())
+            return {};
+        return token + ":" + (table.hasUUID() ? toString(table.uuid) : table.getFullTableName());
+    }
+
+    /// Runs `query` as an internal query of the refresh. With `token`, its INSERT writes one block with that token. The text
+    /// of a delta can be deeper than the limits of the parser allow for a query that a user writes.
+    void executeRefreshStep(const String & query, const ContextPtr & refresh_context, const String & token = {})
     {
         auto context = Context::createCopy(refresh_context);
         context->makeQueryContext();
@@ -151,6 +178,8 @@ namespace
         context->setStreamingCursor(nullptr);
         /// The key types of the integral are those of the query, which the user could create.
         context->setSetting("allow_suspicious_low_cardinality_types", true);
+        if (!token.empty())
+            setRefreshInsertToken(*context, token);
         QueryScope query_scope;
         if (!CurrentThread::getGroup())
             query_scope = QueryScope::create(context);
@@ -162,14 +191,86 @@ namespace
     /// The other queries of the refresh read them as of the same bounds, so the stages and the view see one snapshot.
     using RefreshSnapshot = std::map<String, std::variant<Int64, CursorTreeNodePtr>>;
 
+    CursorTreeNodePtr snapshotToTree(const RefreshSnapshot & snapshot)
+    {
+        auto tree = std::make_shared<CursorTreeNode>();
+        for (const auto & [key, value] : snapshot)
+        {
+            if (const auto * node = std::get_if<CursorTreeNodePtr>(&value))
+                tree->setSubtree(key, *node);
+            else
+                tree->setValue(key, std::get<Int64>(value));
+        }
+        return tree;
+    }
+
+    /// Whether `cursor` has `value` at `key`.
+    bool cursorHas(const CursorTreeNodePtr & cursor, const String & key, const std::variant<Int64, CursorTreeNodePtr> & value)
+    {
+        if (!cursor)
+            return false;
+        if (const auto * node = std::get_if<CursorTreeNodePtr>(&value))
+            return cursor->hasSubtree(key) && cursorTreeToMap(cursor->getSubtree(key)) == cursorTreeToMap(*node);
+        return cursor->hasValue(key) && cursor->getValue(key) == std::get<Int64>(value);
+    }
+
+    /// Adds to `snapshot` the bounds as of now of the inputs of `delta_query` and of its stages that aren't stage tables, and
+    /// the time, unless `snapshot` has them. Holds the bounds of `snapshot` with `out_snapshot_holds`. It creates the stage
+    /// tables, because the frontiers read them. Returns whether a bound that it adds differs from `old_cursor`, or a stage
+    /// has no cursor.
+    bool collectRefreshSnapshot(DeltaQuery & delta_query, const CursorTreeNodePtr & old_cursor, const ContextMutablePtr & refresh_context,
+        RefreshSnapshot & snapshot, std::vector<scope_guard> & out_snapshot_holds)
+    {
+        bool changed = !old_cursor;
+        std::set<String> stage_keys;
+        for (const auto & stage : delta_query.getStages())
+        {
+            executeRefreshStep(stage.query->getStageCreateQuery(stage.table), refresh_context);
+            stage_keys.insert(toString(stage.table.uuid));
+            const auto key = stage.getCursorKey();
+            changed |= collectRefreshSnapshot(*stage.query, old_cursor && old_cursor->hasSubtree(key) ? old_cursor->getSubtree(key) : nullptr,
+                refresh_context, snapshot, out_snapshot_holds);
+        }
+        delta_query.bindStageTables(refresh_context);
+        const auto own_cursor = stage_keys.empty() ? old_cursor : delta_query.restrictCursor(old_cursor);
+        const auto frontier = delta_query.getFrontier(own_cursor);
+        for (auto & [key, value] : *frontier)
+        {
+            if (stage_keys.contains(key))
+                continue;
+            const auto [it, added] = snapshot.try_emplace(key, value);
+            if (added)
+                changed |= !cursorHas(own_cursor, key, value);
+            value = it->second;
+        }
+        std::ranges::move(delta_query.holdCursor(frontier), std::back_inserter(out_snapshot_holds));
+        return changed;
+    }
+
+    /// The deduplication token of the INSERTs of a refresh of `view` that reads `snapshot` from `old_cursor`. Another query or
+    /// other settings make other INSERTs from the same snapshot.
+    String makeRefreshToken(const StorageID & view, UInt128 query_key, const CursorTreeNodePtr & old_cursor, const RefreshSnapshot & snapshot)
+    {
+        WriteBufferFromOwnString out;
+        writeFieldBinary(Field(cursorTreeToMap(old_cursor)), out);
+        writeFieldBinary(Field(cursorTreeToMap(snapshotToTree(snapshot))), out);
+        SipHash hash;
+        hash.update(view.uuid);
+        hash.update(query_key);
+        hash.update(out.str());
+        return getHexUIntLowercase(hash.get128());
+    }
+
     /// The rows that make `target` follow `delta_query` from `old_cursor` to the new cursor, which goes to `new_cursor`. The
     /// stages of `delta_query` first insert their rows into their stage tables. The hidden tables of the residual of a query
     /// follow from `owner`, which is the view or the stage table. With `out_bounds`, the delta of a query without a residual
-    /// reads the bounds with `__deltaQueryBound`, and `out_bounds` gets them, see `DeltaQuery::buildDelta`.
+    /// reads the bounds with `__deltaQueryBound`, and `out_bounds` gets them, see `DeltaQuery::buildDelta`. With `token`, the
+    /// INSERTs of a delta from a cursor get tokens, and `out_tokened` tells whether the caller inserts the rows with one. The
+    /// INSERTs of the rows that make a table equal to a query read that table, so a retry of them inserts nothing twice.
     ASTPtr buildIncrementalRefresh(DeltaQuery & delta_query, const StorageID & owner, const StorageID & target,
         const CursorTreeNodePtr & old_cursor, CursorTreeNodePtr & new_cursor, bool recompute, const ContextMutablePtr & refresh_context,
-        RefreshSnapshot & snapshot, std::optional<StorageID> & out_temp_table_id, std::vector<scope_guard> & out_cursor_holds,
-        std::vector<scope_guard> & out_refresh_holds, DeltaQueryBounds * out_bounds)
+        RefreshSnapshot & snapshot, const String & token, bool & out_tokened, std::optional<StorageID> & out_temp_table_id,
+        std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds, DeltaQueryBounds * out_bounds)
     {
         std::map<String, CursorTreeNodePtr> stage_cursors;
         std::set<String> stage_keys;
@@ -187,14 +288,19 @@ namespace
         {
             const auto key = stage.getCursorKey();
             std::optional<StorageID> stage_delta;
+            bool stage_tokened = false;
             auto rows = buildIncrementalRefresh(*stage.query, stage.table, stage.table,
                 old_cursor && old_cursor->hasSubtree(key) ? old_cursor->getSubtree(key) : nullptr, stage_cursors[key], recompute,
-                refresh_context, snapshot, stage_delta, out_cursor_holds, out_refresh_holds, /*out_bounds=*/ nullptr);
+                refresh_context, snapshot, token, stage_tokened, stage_delta, out_cursor_holds, out_refresh_holds, /*out_bounds=*/ nullptr);
             Strings columns;
             for (const auto & column : stage.query->getResultColumns())
                 columns.push_back(backQuote(column.name));
+            /// The first refresh of a stage streams all of its rows without a token. An earlier attempt could have inserted some.
+            if (!old_cursor || !old_cursor->hasSubtree(key))
+                executeRefreshStep(fmt::format("TRUNCATE TABLE {}", stage.table.getFullTableName()), refresh_context);
             executeRefreshStep(fmt::format("INSERT INTO {0} ({1}) SELECT {1} FROM ({2})", stage.table.getFullTableName(),
-                fmt::join(columns, ", "), rows->formatWithSecretsOneLine()), refresh_context);
+                fmt::join(columns, ", "), rows->formatWithSecretsOneLine()), refresh_context,
+                stage_tokened ? getRefreshInsertToken(token, stage.table) : String{});
             if (stage_delta)
                 executeRefreshStep(fmt::format("DROP TABLE IF EXISTS {}", stage_delta->getFullTableName()), refresh_context);
         }
@@ -227,6 +333,10 @@ namespace
         if (correct)
             select_query = delta_query.hasResidual() ? delta_query.buildDelta(nullptr, new_cursor)
                                                      : delta_query.buildCorrection(new_cursor, target);
+        /// The first refresh streams its rows without a token, because one block of all of them could be too big. The steps
+        /// of a recursive query read the target as of now. After the INSERT of a failed attempt, a retry computes other rows,
+        /// and the token drops them.
+        out_tokened = !token.empty() && own_cursor && !correct;
         /// If no input has new rows and the time of the snapshot is the same, the residual equals the target. The refresh then
         /// inserts nothing and skips the hidden tables.
         const bool unchanged = own_cursor && cursorTreeToMap(own_cursor) == cursorTreeToMap(new_cursor);
@@ -242,8 +352,8 @@ namespace
         else if (delta_query.hasResidual())
         {
             /// The integral absorbs the delta of the core, and the refresh inserts the rows that make the target equal to
-            /// the residual over the integral. A failure after the integral absorbs the delta and before the cursor persists
-            /// makes the next refresh add the delta again.
+            /// the residual over the integral. A retry after the integral absorbs the delta inserts it again with the same
+            /// token, which the integral drops.
             auto [integral_id, delta_id] = getResidualTableIds(owner);
             const bool append_only = delta_query.isAppendOnly();
             if (!append_only)
@@ -256,15 +366,15 @@ namespace
                         "the view started, so the view must be created again", owner.getNameForLogs());
                 executeRefreshStep(delta_query.getIntegralCreateQuery(integral_id), refresh_context);
                 /// The integral absorbs the delta from the empty cursor. A failure before the target takes the residual makes the
-                /// next refresh recompute again.
-                if (correct)
+                /// next refresh recompute again. The first refresh empties the integral too, in case an earlier attempt filled it.
+                if (correct || !own_cursor)
                     executeRefreshStep(fmt::format("TRUNCATE TABLE {}", integral_id.getFullTableName()), refresh_context);
             }
             executeRefreshStep(fmt::format("CREATE OR REPLACE TABLE {} ENGINE = Memory AS {}", delta_id.getFullTableName(),
                 select_query->formatWithSecretsOneLine()), refresh_context);
             if (!append_only)
                 executeRefreshStep(fmt::format("INSERT INTO {} SELECT * FROM {}", integral_id.getFullTableName(),
-                    delta_id.getFullTableName()), refresh_context);
+                    delta_id.getFullTableName()), refresh_context, out_tokened ? getRefreshInsertToken(token, integral_id) : String{});
             auto delta_rows = DatabaseCatalog::instance().getTable(delta_id, refresh_context)->totalRows(refresh_context).value_or(0);
             /// Recomputing many touched keys costs more than recomputing all keys, because the filters by the touched keys read
             /// most granules anyway and add a set lookup per row. The integral counts rows of parts that haven't merged yet.
@@ -1119,7 +1229,8 @@ std::vector<StreamSubscriptionPtr> StorageMaterializedView::subscribeToInputComm
 std::tuple<boost::intrusive_ptr<ASTInsertQuery>, QueryScope>
 StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refresh_context, std::optional<StorageID> & out_temp_table_id,
     const CursorTreeNodePtr & stream_cursor, std::vector<scope_guard> & out_cursor_holds, std::vector<scope_guard> & out_refresh_holds,
-    std::shared_ptr<PreparedSelectPlan> & out_prepared_plan, bool recompute) const
+    std::shared_ptr<PreparedSelectPlan> & out_prepared_plan, bool recompute, const CursorTreeNodePtr & intent,
+    const std::function<void(const CursorTreeNodePtr &)> & persist_intent, std::vector<scope_guard> & out_snapshot_holds) const
 {
     const bool append = mode != RefreshMode::Replace;
     const bool incremental = mode == RefreshMode::AppendIncremental;
@@ -1159,9 +1270,28 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
                 getStorageID().database_name);
         CursorTreeNodePtr new_cursor;
         RefreshSnapshot snapshot;
+        /// The refresh fixes its snapshot before its first write and records it with `persist_intent`. A retry from the same
+        /// cursor reads the same snapshot, so its INSERTs repeat those of the failed attempt with the same tokens.
+        String token;
+        if (persist_intent && stream_cursor)
+        {
+            if (intent)
+                for (const auto & [key, value] : *intent)
+                    snapshot.emplace(key, value);
+            const auto size = snapshot.size();
+            std::vector<scope_guard> snapshot_holds;
+            const bool changed = collectRefreshSnapshot(delta_query, stream_cursor, refresh_context, snapshot, snapshot_holds);
+            /// A refresh that finds no new rows writes nothing, unless it recomputes. `persist_intent` records that it
+            /// recomputes too, because a retry of a correction can't switch back to a delta.
+            if (intent ? snapshot.size() > size || recompute : changed || recompute)
+                persist_intent(snapshotToTree(snapshot));
+            out_snapshot_holds = std::move(snapshot_holds);
+            token = makeRefreshToken(getStorageID(), getRefreshCacheKey(*select_query, refresh_context), stream_cursor, snapshot);
+        }
+        bool tokened = false;
         auto bounds = std::make_shared<DeltaQueryBounds>();
         select_query = buildIncrementalRefresh(delta_query, getStorageID(), inner_table_id, stream_cursor, new_cursor, recompute,
-            refresh_context, snapshot, out_temp_table_id, out_cursor_holds, out_refresh_holds, bounds.get());
+            refresh_context, snapshot, token, tokened, out_temp_table_id, out_cursor_holds, out_refresh_holds, bounds.get());
         /// Without bounds, the delta is a correction, or no input has new rows.
         const bool bound = !bounds->slots.empty();
         refresh_context->setDeltaQueryBounds(std::move(bounds));
@@ -1184,6 +1314,10 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
 
         if (bound && !recompute && delta_query.hasReusableDeltas())
             out_prepared_plan = refresh_cache->getPlan(select_query, delta_query, refresh_context);
+        /// The token changes in each refresh, so set it after `getPlan` computes the key of the plan. A target without a
+        /// deduplication log gets no token, because it would only pay for the one block.
+        if (tokened && InsertDependenciesBuilder::storageDeduplicatesBlocksOnInsert(getTargetTable()))
+            setRefreshInsertToken(*refresh_context, getRefreshInsertToken(token, inner_table_id));
     }
 
     if (!append)

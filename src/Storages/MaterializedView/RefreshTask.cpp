@@ -5,6 +5,7 @@
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Databases/DatabaseReplicated.h>
+#include <Disks/LocalDirectorySyncGuard.h>
 #include <IO/Operators.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromString.h>
@@ -177,6 +178,26 @@ std::vector<StorageID> parseRefreshDependencies(const ASTRefreshStrategy & strat
     return deps;
 }
 
+/// Replaces the file at `path` with `cursor`. After a crash the file has either the old or the new cursor.
+void writeCursorFile(const String & path, const CursorTreeNodePtr & cursor)
+{
+    fs::create_directories(fs::path(path).parent_path());
+    const String temp_path = path + ".tmp";
+    {
+        WriteBufferFromFile out(temp_path);
+        writeFieldBinary(Field(cursorTreeToMap(cursor)), out);
+        out.finalize();
+        out.sync();
+    }
+    fs::rename(temp_path, path);
+    LocalDirectorySyncGuard(fs::path(path).parent_path()).sync();
+}
+
+CursorTreeNodePtr readCursor(ReadBuffer & in)
+{
+    return buildCursorTree(readFieldBinary(in).safeGet<Map>());
+}
+
 }
 
 RefreshTask::RefreshTask(
@@ -291,12 +312,16 @@ RefreshTask::RefreshTask(
         if (isDelta() && view_id.hasUUID())
         {
             cursor_path = fs::path(context->getPath()) / "refresh_cursors" / (toString(view_id.uuid) + ".bin");
+            intent_path = fs::path(context->getPath()) / "refresh_cursors" / (toString(view_id.uuid) + ".intent.bin");
             if (!attach)
+            {
                 fs::remove(cursor_path);
+                fs::remove(intent_path);
+            }
             else if (fs::exists(cursor_path))
             {
                 ReadBufferFromFile in(cursor_path);
-                coordination.root_znode.cursor = buildCursorTree(readFieldBinary(in).safeGet<Map>());
+                coordination.root_znode.cursor = readCursor(in);
             }
         }
     }
@@ -425,6 +450,7 @@ void RefreshTask::shutdown()
         interruptExecution();
         commit_subscriptions.clear();
         cursor_holds.clear();
+        intent_holds.clear();
     }
 
     /// If we're in DatabaseReplicated, interrupt replicated CREATE/EXCHANGE/DROP queries in refresh task.
@@ -481,7 +507,10 @@ void RefreshTask::drop(ContextPtr context, bool is_shared_db)
     if (!coordination.coordinated)
     {
         if (!cursor_path.empty())
+        {
             fs::remove(cursor_path);
+            fs::remove(intent_path);
+        }
         return;
     }
 
@@ -501,6 +530,9 @@ void RefreshTask::drop(ContextPtr context, bool is_shared_db)
     String paused_path = coordination.path + "/paused";
     if (zookeeper->exists(paused_path))
         ops.emplace_back(zkutil::makeRemoveRequest(paused_path, -1));
+    String intent_path_in_keeper = coordination.path + "/intent";
+    if (zookeeper->exists(intent_path_in_keeper))
+        ops.emplace_back(zkutil::makeRemoveRequest(intent_path_in_keeper, -1));
     String running_path = coordination.path + "/running";
     if (zookeeper->exists(running_path))
     {
@@ -1488,6 +1520,9 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     std::vector<scope_guard> new_cursor_holds;
     /// Keep merges from losing the inputs as of the old cursor until the refresh ends.
     std::vector<scope_guard> refresh_holds;
+    /// Keep merges from losing the inputs as of the snapshot that the refresh recorded, see `prepareRefresh`.
+    std::vector<scope_guard> snapshot_holds;
+    bool recompute = false;
 
     try
     {
@@ -1517,6 +1552,30 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             refresh_context->setStreamingCursor(std::move(cursor));
         }
 
+        /// The snapshot of a failed attempt from the same cursor. This attempt reads it again, and recomputes if that attempt
+        /// did. A recompute reads the inputs only as of the snapshot. So after a recompute loses history, merges lost the
+        /// inputs as of the snapshot, and the next attempt reads a new one. A stage that can't correct can then get rows twice.
+        CursorTreeNodePtr intent;
+        std::function<void(const CursorTreeNodePtr &)> persist_intent;
+        recompute = execution.history_lost;
+        if (isDelta() && stream_cursor && (coordination.coordinated || !intent_path.empty()))
+        {
+            if (auto recorded = loadRefreshIntent(refresh_context); recorded && recorded->hasSubtree("cursor") && recorded->hasSubtree("snapshot")
+                && cursorTreeToMap(recorded->getSubtree("cursor")) == cursorTreeToMap(stream_cursor) && !execution.snapshot_lost)
+            {
+                intent = recorded->getSubtree("snapshot");
+                recompute |= recorded->hasValue("recompute") && recorded->getValue("recompute") != 0;
+            }
+            persist_intent = [this, stream_cursor, refresh_context, root_znode_version, recompute](const CursorTreeNodePtr & snapshot)
+            {
+                auto record = std::make_shared<CursorTreeNode>();
+                record->setSubtree("cursor", stream_cursor);
+                record->setSubtree("snapshot", snapshot);
+                record->setValue("recompute", recompute);
+                persistRefreshIntent(record, refresh_context, root_znode_version);
+            };
+        }
+
         syncDependenciesForRefresh(deps, refresh_context);
 
         if (!isAppend())
@@ -1534,7 +1593,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             QueryScope query_scope;
             std::shared_ptr<PreparedSelectPlan> prepared_plan;
             std::tie(refresh_query, query_scope) = view->prepareRefresh(refresh_mode, refresh_context, table_to_drop, stream_cursor,
-                new_cursor_holds, refresh_holds, prepared_plan, execution.history_lost);
+                new_cursor_holds, refresh_holds, prepared_plan, recompute, intent, persist_intent, snapshot_holds);
             new_table_id = refresh_query->table_id;
 
             /// Add the query to system.processes and allow it to be killed with KILL QUERY.
@@ -1661,11 +1720,19 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
             normalized_query_hash = normalizedQueryHash(query_for_logging, false);
             table_to_drop = view->exchangeTargetTable(new_table_id, refresh_context);
         }
+
+        /// The refresh succeeds once a restart resumes from its cursor. A retry from the previous cursor would read another
+        /// snapshot, and the tokens of its INSERTs would differ from those of this refresh.
+        if (!cursor_path.empty() && !cursor_persisted_by_target)
+            if (auto cursor = refresh_context->getStreamingCursor(); cursor && cursor->tree
+                && (!stream_cursor || cursorTreeToMap(stream_cursor) != cursorTreeToMap(cursor->tree)))
+                writeCursorFile(cursor_path, cursor->tree);
     }
     catch (...)
     {
         ProfileEvents::increment(ProfileEvents::RefreshableViewRefreshFailed);
         execution.history_lost = getCurrentExceptionCode() == ErrorCodes::DELTA_QUERY_HISTORY_LOST;
+        execution.snapshot_lost = execution.history_lost && recompute;
 
         bool cancelled = execution.interrupt_execution.load();
 
@@ -1691,11 +1758,18 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
         else
             out_error_message = getCurrentExceptionMessage(true);
 
+        /// A failure before the refresh records its snapshot keeps the guards of the snapshot that an earlier attempt recorded.
+        if (!snapshot_holds.empty())
+        {
+            std::lock_guard guard(mutex);
+            std::swap(intent_holds, snapshot_holds);
+        }
         return std::nullopt;
     }
 
     ProfileEvents::increment(ProfileEvents::RefreshableViewRefreshSuccess);
     execution.history_lost = false;
+    execution.snapshot_lost = false;
 
     if (table_to_drop.has_value())
         view->dropTempTable(table_to_drop.value(), refresh_context, out_error_message);
@@ -1706,6 +1780,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
         if (auto cursor = refresh_context->getStreamingCursor())
             out_cursor = cursor->tree;
 
+    std::vector<scope_guard> previous_intent_holds;
     /// An insert after the cursor requests a refresh, like `SYSTEM REFRESH VIEW`. Requests coalesce while one is pending.
     {
         bool on_insert;
@@ -1743,30 +1818,47 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
         commit_subscriptions = std::move(subscriptions);
         /// The previous guards go out of scope after the lock.
         std::swap(cursor_holds, new_cursor_holds);
-    }
-
-    /// A failure leaves the previous cursor in the file, so the first refresh after a restart repeats the rows since then.
-    if (!cursor_path.empty() && out_cursor)
-    {
-        try
-        {
-            fs::create_directories(fs::path(cursor_path).parent_path());
-            const String temp_path = cursor_path + ".tmp";
-            {
-                WriteBufferFromFile out(temp_path);
-                writeFieldBinary(Field(cursorTreeToMap(out_cursor)), out);
-                out.finalize();
-                out.sync();
-            }
-            fs::rename(temp_path, cursor_path);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger(), "Failed to persist the cursor of the refresh");
-        }
+        std::swap(intent_holds, previous_intent_holds);
     }
 
     return new_table_id.uuid;
+}
+
+CursorTreeNodePtr RefreshTask::loadRefreshIntent(const ContextPtr & context) const
+{
+    if (coordination.coordinated)
+    {
+        String data;
+        if (!context->getZooKeeper()->tryGet(coordination.path + "/intent", data))
+            return nullptr;
+        ReadBufferFromString in(data);
+        return readCursor(in);
+    }
+    if (intent_path.empty() || !fs::exists(intent_path))
+        return nullptr;
+    ReadBufferFromFile in(intent_path);
+    return readCursor(in);
+}
+
+void RefreshTask::persistRefreshIntent(const CursorTreeNodePtr & intent, const ContextPtr & context, int32_t root_znode_version) const
+{
+    if (coordination.coordinated)
+    {
+        WriteBufferFromOwnString out;
+        writeFieldBinary(Field(cursorTreeToMap(intent)), out);
+        auto zookeeper = context->getZooKeeper();
+        const String path = coordination.path + "/intent";
+        Coordination::Requests ops;
+        if (root_znode_version != -1)
+            ops.emplace_back(zkutil::makeCheckRequest(coordination.path, root_znode_version));
+        if (zookeeper->exists(path))
+            ops.emplace_back(zkutil::makeSetRequest(path, out.str(), -1));
+        else
+            ops.emplace_back(zkutil::makeCreateRequest(path, out.str(), zkutil::CreateMode::Persistent));
+        zookeeper->multi(ops);
+    }
+    else if (!intent_path.empty())
+        writeCursorFile(intent_path, intent);
 }
 
 void RefreshTask::notifyDependentsIfNeeded(std::unique_lock<std::mutex> & lock)

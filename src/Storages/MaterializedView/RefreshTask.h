@@ -334,6 +334,8 @@ private:
         /// Whether the last refresh failed with `DELTA_QUERY_HISTORY_LOST`. The delta of a query over `Distributed` tables
         /// finds that on the shards as it runs. The next refresh then recomputes the view, see `prepareRefresh`.
         bool history_lost = false;
+        /// Whether the last refresh failed with `DELTA_QUERY_HISTORY_LOST` while it recomputed the view.
+        bool snapshot_lost = false;
     };
 
     struct SchedulingState
@@ -379,6 +381,9 @@ private:
     /// The guards that keep merges from losing the inputs as of the cursor of the latest refresh of a
     /// `REFRESH ... INCREMENTAL` view.
     std::vector<scope_guard> cursor_holds;
+    /// The guards that keep merges from losing the inputs as of the snapshot of a failed refresh of a
+    /// `REFRESH ... INCREMENTAL` view. The retry reads that snapshot again.
+    std::vector<scope_guard> intent_holds;
     std::vector<StorageID> initial_dependencies;
     const RefreshMode refresh_mode;
     bool isAppend() const { return refresh_mode != RefreshMode::Replace; }
@@ -401,6 +406,9 @@ private:
     /// The file that keeps the cursor of an uncoordinated `REFRESH ... INCREMENTAL` view across DETACH and restarts, or
     /// empty.
     String cursor_path;
+    /// The file that keeps the intent of the latest refresh of an uncoordinated `REFRESH ... INCREMENTAL` view, see
+    /// `loadRefreshIntent`.
+    String intent_path;
     ExecutionState execution;
     SchedulingState scheduling;
 
@@ -439,6 +447,14 @@ private:
     /// Perform an actual refresh: create new table, run INSERT SELECT, exchange tables, drop old table.
     /// Mutex must be unlocked.
     std::optional<UUID> executeRefreshUnlocked(int32_t root_znode_version, std::vector<StorageID> deps, const String & log_comment, String & out_error_message, CursorTreeNodePtr & out_cursor);
+
+    /// The intent of the latest refresh of a `REFRESH ... INCREMENTAL` view that recorded one before its first write: its
+    /// cursor under the key `cursor` and the bounds of its inputs under the key `snapshot`, see
+    /// `StorageMaterializedView::prepareRefresh`. A coordinated view keeps it in Keeper, so a retry on another replica finds
+    /// it.
+    CursorTreeNodePtr loadRefreshIntent(const ContextPtr & context) const;
+    /// Fails if the root znode no longer has `root_znode_version`, because another replica took over the refresh.
+    void persistRefreshIntent(const CursorTreeNodePtr & intent, const ContextPtr & context, int32_t root_znode_version) const;
 
     DependencyRefreshInfo getInfoForDependentViewsLocked(const std::unique_lock<std::mutex> &) const;
 
