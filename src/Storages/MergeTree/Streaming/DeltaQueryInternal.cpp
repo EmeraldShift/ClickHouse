@@ -5,6 +5,7 @@
 #include <Analyzer/FunctionNode.h>
 #include <Interpreters/NormalizeSelectWithUnionQueryVisitor.h>
 #include <Interpreters/addTypeConversionToAST.h>
+#include <Parsers/ASTAsterisk.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
@@ -15,6 +16,7 @@
 #include <Parsers/ASTSetQuery.h>
 #include <Parsers/ASTSubquery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
+#include <Parsers/ASTWithElement.h>
 #include <Parsers/ParserSelectWithUnionQuery.h>
 #include <Parsers/parseQuery.h>
 
@@ -80,6 +82,11 @@ bool isAggregate(const IAST & ast)
     return function && !function->isWindowFunction() && AggregateFunctionFactory::instance().isAggregateFunctionName(function->name);
 }
 
+bool hasAggregates(const IAST & ast)
+{
+    return isAggregate(ast) || std::ranges::any_of(ast.children, [](const auto & child) { return hasAggregates(*child); });
+}
+
 ASTPtr & getTable(ASTTableExpression & expression)
 {
     if (expression.table_function)
@@ -118,6 +125,24 @@ void setTable(ASTTableExpression & expression, ASTPtr table)
     auto & field = table->as<ASTTableIdentifier>() ? expression.database_and_table_name
         : table->as<ASTFunction>() ? expression.table_function : expression.subquery;
     expression.setOrReplace(field, std::move(table));
+}
+
+std::function<bool(const IAST & table)> isTableNamed(const String & name)
+{
+    return [name](const IAST & table)
+    {
+        const auto * identifier = table.as<ASTTableIdentifier>();
+        return identifier && identifier->name() == name;
+    };
+}
+
+size_t countTableReferences(const IAST & ast, const String & name)
+{
+    const auto * expression = ast.as<ASTTableExpression>();
+    size_t count = expression && expression->database_and_table_name && isTableNamed(name)(*expression->database_and_table_name) ? 1 : 0;
+    for (const auto & child : ast.children)
+        count += countTableReferences(*child, name);
+    return count;
 }
 
 void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts)
@@ -223,6 +248,17 @@ void addArrayJoin(ASTSelectQuery & select, ASTPtr expression)
     element->array_join = array_join;
     element->children.push_back(std::move(array_join));
     select.tables()->children.push_back(std::move(element));
+}
+
+ASTPtr makeRecursiveSelect(ASTPtr element)
+{
+    auto select = makeSelect({make_intrusive<ASTAsterisk>()}, make_intrusive<ASTTableIdentifier>(element->as<ASTWithElement &>().name));
+    auto & select_query = select->as<ASTSelectQuery &>();
+    auto with = make_intrusive<ASTExpressionList>();
+    with->children.push_back(std::move(element));
+    select_query.setExpression(ASTSelectQuery::Expression::WITH, std::move(with));
+    select_query.recursive_with = true;
+    return makeSelectWithUnion(std::move(select));
 }
 
 ASTPtr withAlias(ASTPtr ast, const String & alias)

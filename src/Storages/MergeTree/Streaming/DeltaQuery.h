@@ -45,6 +45,12 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// the integral whose keys the delta touched, and diffs the result with the rows that the target has for those keys. The
 /// rows of the diff have the sign column, so the target can be a `CollapsingMergeTree`.
 ///
+/// A query can also be `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r`, where each step reads `r` once in
+/// FROM through inner joins. The steps are linear in `r`, so the delta of `r` is the least fixed point of `d = d_0 + step(d)`.
+/// Here `d_0` is the delta of the base plus the delta of each step over the rows of `r` at the old cursor, and `step(d)` reads
+/// the inputs at the new cursor. The rows of `r` at the old cursor come from `delta_query_recursion_table`, which a
+/// `REFRESH ... INCREMENTAL` view sets to its target. The weights of the rows make this hold for retractions too.
+///
 /// A cursor is a `CursorTree` with the layout of a `STREAM` cursor under one more level for the table:
 /// table UUID -> partition ID -> `block_number`. The value is the first block number that the cursor excludes. So the
 /// table as of a cursor is the rows with `_block_number` below the value, and a missing partition or table has no rows.
@@ -112,8 +118,8 @@ public:
         bool all_keys = false) const;
 
     /// Whether rows can make a target that holds the deltas of the query equal to the query as of a cursor. A signed query
-    /// allows that. A query with an append-only residual doesn't, nor does a query with aggregates that aren't all
-    /// sums. For a query with a residual, `buildResidualDelta` over all keys returns those rows after the integral absorbs
+    /// allows that. A recursive query doesn't, nor does a query with an append-only residual or with aggregates that aren't
+    /// all sums. For a query with a residual, `buildResidualDelta` over all keys returns those rows after the integral absorbs
     /// the delta from the empty cursor. For the others, `buildCorrection` returns them.
     bool canCorrect() const;
 
@@ -130,14 +136,19 @@ public:
 
     /// Whether a row of the deltas can have a sign other than 1. A residual retracts rows, and so do signed inputs, LEFT,
     /// SEMI and ANTI joins, filters by now() and lightweight updates.
-    bool retractsRows() const { return residual || has_signs; }
+    bool retractsRows() const { return residual || recursion || has_signs; }
 
     struct Input;
     struct SemiJoinEdge;
     struct AsofJoin;
     struct Residual;
+    struct Recursion;
 
 private:
+    /// Returns false unless `query` is `WITH RECURSIVE r AS (...) SELECT * FROM r`, see `Recursion`. Otherwise analyzes it into
+    /// `recursion`.
+    bool analyzeRecursion(const ASTPtr & query, const ContextPtr & context);
+
     /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
     /// fills `split` and returns its core instead, which the caller analyzes.
     ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
@@ -151,6 +162,15 @@ private:
     /// declare other types, like UInt64 for a count that the deltas weigh as Int64.
     ASTs castToResultTypes(const Names & columns) const;
 
+    /// The entries of `tree` for the inputs of this query, and its time.
+    CursorTreeNodePtr restrictCursor(const CursorTreeNodePtr & tree) const;
+
+    /// The delta of a recursive query, see `Recursion`.
+    ASTPtr buildRecursiveDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const;
+
+    /// The query of a step of a recursive query at `new_cursor`, which reads CTE `cte` instead of the input of key `key`.
+    ASTPtr buildRecursiveTerm(const CursorTreeNodePtr & new_cursor, const String & key, const String & cte) const;
+
     /// The resolved query, whose tables have unique aliases. For a query with a residual, its core.
     ASTPtr query;
     std::vector<Input> inputs;
@@ -158,6 +178,7 @@ private:
     /// The ASOF joins whose deltas read only the rows near the time of the changes, see `delta_query_asof_lookback`.
     std::vector<AsofJoin> asof_joins;
     std::shared_ptr<const Residual> residual;
+    std::shared_ptr<const Recursion> recursion;
     /// Whether the rows of the deltas have a sign other than 1, see `retractsRows`.
     bool has_signs = false;
     String sign_column;

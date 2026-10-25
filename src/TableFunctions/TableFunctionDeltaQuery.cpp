@@ -415,6 +415,12 @@ tables of `ReplicatedMergeTree` don't support them. A merge that writes later up
 the cursor, loses the table as of the cursor, and the delta throws `DELTA_QUERY_HISTORY_LOST`. The delta throws `UNFINISHED` until
 the mutations below its cursors are done.
 
+A query can be `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r` without aggregates, where each step reads `r` once in
+`FROM` through inner joins. The setting `delta_query_recursion_table` names the table that holds `r` as of `old_cursor`. The delta joins
+the new rows of the inputs with the rows of that table, and then repeats the steps over the rows it found until a step returns no rows.
+A `REFRESH ... INCREMENTAL` view over such a query keeps `r` in its target, so the target must be a `MergeTree` with
+`enable_block_number_column = 1`, with the sign column if the query sets `delta_query_sign_column`. A second view can read the target to aggregate `r`.
+
 A query can also read `Distributed` tables of one cluster. Each shard then runs the query over its local tables, as with
 `distributed_product_mode = 'local'`. So the rows that the query joins must be on the same shard. Each shard reads the other tables
 of the query itself, and `delta_query_lookup_tables` names local tables. The server that runs `deltaQuery` analyzes the query over

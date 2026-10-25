@@ -156,8 +156,38 @@ DataPartsVector getPatchParts(const MergeTreeData & storage, const std::map<Stri
     return patches;
 }
 
+CursorTreeNodePtr DeltaQuery::restrictCursor(const CursorTreeNodePtr & tree) const
+{
+    if (!tree)
+        return nullptr;
+    auto result = std::make_shared<CursorTreeNode>();
+    for (const auto & input : inputs)
+        if (tree->hasSubtree(input.key))
+            result->setSubtree(input.key, tree->getSubtree(input.key));
+    if (tree->hasValue(time_key))
+        result->setValue(time_key, tree->getValue(time_key));
+    return result;
+}
+
 CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
 {
+    /// The cursor has the inputs of the base and of the steps, but not the table that holds `r`.
+    if (recursion)
+    {
+        recursion->checkTable();
+        auto tree = recursion->base->getFrontier(recursion->base->restrictCursor(from));
+        for (const auto & step : recursion->steps)
+            for (const auto & [key, value] : *step->getFrontier(step->restrictCursor(from)))
+            {
+                if (key == recursion->key || tree->hasSubtree(key) || tree->hasValue(key))
+                    continue;
+                if (const auto * node = std::get_if<CursorTreeNodePtr>(&value))
+                    tree->setSubtree(key, *node);
+                else
+                    tree->setValue(key, std::get<Int64>(value));
+            }
+        return tree;
+    }
     if (!cluster.empty())
     {
         auto tree = from ? from->clone() : std::make_shared<CursorTreeNode>();
@@ -192,6 +222,14 @@ CursorTreeNodePtr DeltaQuery::getFrontier(const CursorTreeNodePtr & from) const
 
 std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTreeNodePtr & cursor, std::function<void()> callback) const
 {
+    if (recursion)
+    {
+        recursion->checkTable();
+        auto subscriptions = recursion->base->subscribeToCommits(recursion->base->restrictCursor(cursor), callback);
+        for (const auto & step : recursion->steps)
+            std::ranges::move(step->subscribeToCommits(step->restrictCursor(cursor), callback), std::back_inserter(subscriptions));
+        return subscriptions;
+    }
     if (!cluster.empty())
         return {};
     const auto tables = snapshotTables(inputs);
@@ -219,6 +257,13 @@ std::vector<StreamSubscriptionPtr> DeltaQuery::subscribeToCommits(const CursorTr
 
 std::vector<scope_guard> DeltaQuery::holdCursor(const CursorTreeNodePtr & cursor) const
 {
+    if (recursion)
+    {
+        auto guards = recursion->base->holdCursor(recursion->base->restrictCursor(cursor));
+        for (const auto & step : recursion->steps)
+            std::ranges::move(step->holdCursor(step->restrictCursor(cursor)), std::back_inserter(guards));
+        return guards;
+    }
     if (!cluster.empty())
         return {};
     const auto tables = snapshotTables(inputs);

@@ -140,6 +140,21 @@ struct DeltaQuery::Residual
     ASTPtr buildPartitionFilter(const Names & columns, const StorageID & delta) const;
 };
 
+/// The base and the steps of a query `WITH RECURSIVE r AS (base UNION ALL step ...) SELECT * FROM r`. Each step reads the
+/// table of `delta_query_recursion_table` instead of `r`, as a lookup table. Its delta then joins the new rows of its other
+/// inputs with the rows of `r` at the old cursor.
+struct DeltaQuery::Recursion
+{
+    std::unique_ptr<DeltaQuery> base;
+    /// Empty without `delta_query_recursion_table`. Such a query can only give the columns of its deltas.
+    std::vector<std::unique_ptr<DeltaQuery>> steps;
+    /// The key of the table of `delta_query_recursion_table`.
+    String key;
+
+    /// Throws without `delta_query_recursion_table`.
+    void checkTable() const;
+};
+
 namespace DeltaQueryInternal
 {
 
@@ -252,6 +267,8 @@ bool isMergeableAggregate(const String & name);
 
 bool isAggregate(const IAST & ast);
 
+bool hasAggregates(const IAST & ast);
+
 /// The table identifier, table function or subquery of `expression`.
 ASTPtr & getTable(ASTTableExpression & expression);
 
@@ -263,6 +280,11 @@ ASTTableExpression & findAliasedTable(const ASTSelectQuery & select, const Strin
 
 /// Replaces the table of `expression` by `table`, a table identifier, a table function or a subquery.
 void setTable(ASTTableExpression & expression, ASTPtr table);
+
+std::function<bool(const IAST & table)> isTableNamed(const String & name);
+
+/// The number of table expressions in `ast` that read table `name`.
+size_t countTableReferences(const IAST & ast, const String & name);
 
 void splitConjuncts(const QueryTreeNodePtr & node, QueryTreeNodes & conjuncts);
 
@@ -286,6 +308,9 @@ ASTPtr makeSelect(ASTs columns, ASTPtr table, ASTPtr where = nullptr, ASTs group
 
 /// Adds `ARRAY JOIN expression` to the FROM clause of `select`.
 void addArrayJoin(ASTSelectQuery & select, ASTPtr expression);
+
+/// `WITH RECURSIVE r AS (...) SELECT * FROM r` for the CTE `element`.
+ASTPtr makeRecursiveSelect(ASTPtr element);
 
 /// `ast AS alias`.
 ASTPtr withAlias(ASTPtr ast, const String & alias);

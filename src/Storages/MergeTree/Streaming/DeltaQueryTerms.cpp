@@ -192,6 +192,8 @@ void setInput(ASTSelectQuery & select, const Input & input, ASTPtr table, ASTs c
 
 bool DeltaQuery::canCorrect() const
 {
+    if (recursion)
+        return false;
     if (residual)
         return !residual->append_only;
     return !consolidated_columns.empty() || !summed_columns.empty();
@@ -595,6 +597,8 @@ struct DeltaQuery::DeltaTerms
 /// the old cursor, and it is the difference of the query at the new and at the old time over the rows whose filter changed.
 ASTPtr DeltaQuery::buildDelta(const CursorTreeNodePtr & old_cursor, const CursorTreeNodePtr & new_cursor) const
 {
+    if (recursion)
+        return buildRecursiveDelta(old_cursor, new_cursor);
     if (!cluster.empty())
         return parseSelect(readShards(cluster, "*", fmt::format("SELECT * FROM deltaQuery(({}), {}, {})",
             shard_query->formatWithSecretsOneLine(), makeShardCursor(old_cursor), makeShardCursor(new_cursor))));

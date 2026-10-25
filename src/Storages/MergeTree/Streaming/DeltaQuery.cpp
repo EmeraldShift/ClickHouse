@@ -525,13 +525,15 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
     auto context = Context::createCopy(context_);
     InterpreterSetQuery::applySettingsFromQuery(query_, context);
     /// The deltas weigh their rows by a sign column. Without `delta_query_sign_column`, no input has a sign column, and the
-    /// sign column of the deltas has an internal name.
+    /// sign column of the deltas has an internal name. The parts of a recursive CTE get the same name.
     String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
     if (sign_column_setting.empty())
     {
         sign_column_setting = internal_sign_column;
         context->setSetting("delta_query_sign_column", sign_column_setting);
     }
+    if (analyzeRecursion(query_, context))
+        return;
     checkNoSubqueries(*query_);
     shard_query = readLocalTables(query_, context, cluster);
     analysis_context = context;
@@ -550,6 +552,13 @@ DeltaQuery::~DeltaQuery() = default;
 
 void DeltaQuery::checkResultSign() const
 {
+    if (recursion)
+    {
+        recursion->base->checkResultSign();
+        for (const auto & step : recursion->steps)
+            step->checkResultSign();
+        return;
+    }
     if (sign_column == internal_sign_column && getResultColumns().contains(sign_column))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "The delta query retracts rows, like the rows of LEFT, SEMI and ANTI joins, of lightweight updates, of filters by now() "
@@ -776,6 +785,8 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
 
 ASTPtr DeltaQuery::getQuery() const
 {
+    if (recursion)
+        return recursion->base->getQuery();
     /// The weights of the query read `__term_sign`, which each term of a delta binds. The query itself is one term of sign 1.
     auto result = (residual ? residual->output_query : query)->clone();
     bindTerm(*result, 1, {});
@@ -784,6 +795,8 @@ ASTPtr DeltaQuery::getQuery() const
 
 NamesAndTypesList DeltaQuery::getResultColumns() const
 {
+    if (recursion)
+        return recursion->base->getResultColumns();
     if (residual)
         return residual->output_columns;
     /// The passes after resolution keep the types of the result columns. Resolution alone finds them.
