@@ -18,3 +18,9 @@ SELECT * FROM deltaQuery((SELECT l.k AS k, l.__weight AS __weight, l.__count AS 
     r.__delta_column_0 AS __delta_column_0 FROM l LEFT JOIN r ON l.k = r.k),
     (SELECT cursor FROM cursors WHERE round = 0), (SELECT cursor FROM cursors WHERE round = 1))
 ORDER BY ALL SETTINGS delta_query_sign_column = 'sign';
+
+-- The union of the terms of an aggregation names its columns apart from the aliases of the query.
+SELECT * FROM deltaQuery((SELECT l.k AS __delta_column_1, sum(l.__index) AS s FROM l INNER JOIN r ON l.k = r.k
+    GROUP BY __delta_column_1), (SELECT cursor FROM cursors WHERE round = 0), (SELECT cursor FROM cursors WHERE round = 1))
+ORDER BY ALL;
+

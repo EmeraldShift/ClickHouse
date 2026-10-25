@@ -125,7 +125,8 @@ ASTPtr makeWeightedAggregate(const ASTFunction & function, const FunctionNode & 
 /// Appends the tables of the join tree in order, the ON expressions of its joins, and its joins that are linear only in
 /// their left side. Throws unless each join is an inner join, which is linear in both sides, or a LEFT, SEMI, ANTI or ASOF
 /// join of a table by ON.
-void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, QueryTreeNodes & keyed_joins)
+void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, QueryTreeNodes & join_conditions,
+    QueryTreeNodes & keyed_joins)
 {
     switch (node->getNodeType())
     {
@@ -133,7 +134,7 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
             tables.push_back(node);
             return;
         case QueryTreeNodeType::ARRAY_JOIN:
-            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables, keyed_joins);
+            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables, join_conditions, keyed_joins);
             return;
         case QueryTreeNodeType::CROSS_JOIN:
         {
@@ -141,7 +142,7 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
             if (std::ranges::any_of(join.getJoinTypes(), [](const auto & type) { return type.locality == JoinLocality::Global; }))
                 throwUnsupported("GLOBAL joins");
             for (const auto & table : join.getTableExpressions())
-                collectJoinTree(table, tables, keyed_joins);
+                collectJoinTree(table, tables, join_conditions, keyed_joins);
             return;
         }
         case QueryTreeNodeType::JOIN:
@@ -161,8 +162,10 @@ void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables, Que
             const auto right_type = join.getRightTableExpressionNode()->getNodeType();
             if (is_keyed && (right_type != QueryTreeNodeType::TABLE || !join.isOnJoinExpression()))
                 throwUnsupported("LEFT, SEMI, ANTI or ASOF joins whose right side isn't a table joined by ON");
-            collectJoinTree(join.getLeftTableExpressionNode(), tables, keyed_joins);
-            collectJoinTree(join.getRightTableExpressionNode(), tables, keyed_joins);
+            collectJoinTree(join.getLeftTableExpressionNode(), tables, join_conditions, keyed_joins);
+            collectJoinTree(join.getRightTableExpressionNode(), tables, join_conditions, keyed_joins);
+            if (join.isOnJoinExpression())
+                join_conditions.push_back(join.getJoinExpression());
             if (is_keyed)
                 keyed_joins.push_back(node);
             return;
@@ -300,9 +303,8 @@ void checkSignColumnNotRead(const IQueryTreeNode & node, const std::unordered_se
 
 /// The edges of the top-level conjuncts `a.x = b.y` of `conditions` that equate columns of two different inputs.
 ///
-/// The delta of a LEFT, SEMI, ANTI or ASOF join reads the right rows of the join keys of the changes with
-/// `b.y IN (SELECT x FROM a ...)`, see `buildDelta`. `IN` casts `b.y` to the type of `x` and looks it up by its binary
-/// representation. That lookup can disagree with `=`. For example, `-0.0 = 0.0` is true and
+/// The semi-join reduction rewrites `a.x = b.y` into `b.y IN (SELECT x FROM a ...)`. `IN` casts `b.y` to the type of `x`
+/// and looks it up by its binary representation. That lookup can disagree with `=`. For example, `-0.0 = 0.0` is true and
 /// `-0.0 IN (SELECT 0.0)` is false. So only columns of one type whose equal values have one representation count as join
 /// keys, like integers, strings, UUIDs and decimals. Floats don't.
 std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions, const InputIndexes & input_indexes)
@@ -330,8 +332,8 @@ std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions
             || !(type->isValueRepresentedByInteger() || isStringOrFixedString(type) || isUUID(type) || isDecimal(type)
                 || isDateTime64(type) || isIPv4(type) || isIPv6(type)))
             continue;
-        edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName()});
-        edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName()});
+        edges.push_back({a_input->second, a->getColumnName(), b_input->second, b->getColumnName(), a->getColumnType()->getName()});
+        edges.push_back({b_input->second, b->getColumnName(), a_input->second, a->getColumnName(), b->getColumnType()->getName()});
     }
     return edges;
 }
@@ -442,8 +444,9 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
         throwUnsupported("UNION");
 
     QueryTreeNodes tables;
+    QueryTreeNodes conditions;
     QueryTreeNodes keyed_joins;
-    collectJoinTree(query_node->getJoinTreeNode(), tables, keyed_joins);
+    collectJoinTree(query_node->getJoinTreeNode(), tables, conditions, keyed_joins);
     InputIndexes input_indexes;
     std::set<String> lookup_tables;
     std::vector<std::string> names;
@@ -475,13 +478,19 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
 
     /// A SEMI or ANTI join returns each left row at most once, whatever the signs of its matches.
     std::unordered_set<size_t> existence_joins;
+    /// The equalities of the ON of each such join, toward its right table.
+    std::vector<SemiJoinEdge> keyed_edges;
     for (const auto & node : keyed_joins)
     {
         const auto & join = node->as<JoinNode &>();
         const size_t right = input_indexes.at(join.getRightTableExpressionNode().get());
         for (const auto & edge : collectSemiJoinEdges({join.getJoinExpression()}, input_indexes))
+        {
+            if (edge.to == right)
+                keyed_edges.push_back(edge);
             if (edge.from == right && std::ranges::find(inputs[right].join_keys, edge.from_column) == inputs[right].join_keys.end())
                 inputs[right].join_keys.push_back(edge.from_column);
+        }
         if (inputs[right].join_keys.empty())
             throwUnsupported("LEFT, SEMI, ANTI or ASOF joins without an equality of join keys of both sides in ON");
         if (join.getStrictness() == JoinStrictness::Semi || join.getStrictness() == JoinStrictness::Anti)
@@ -516,6 +525,20 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     checkLinearClauses(*query_node);
     checkResultColumns(*query_node, !signs.empty());
 
+    if (query_node->hasWhere())
+        conditions.push_back(query_node->getWhere());
+    semi_join_edges = collectSemiJoinEdges(conditions, input_indexes);
+    /// A reduction of the right table of a LEFT, SEMI, ANTI or ASOF join by an equality outside its ON could remove the match
+    /// of a left row, which would then join with default values instead.
+    std::erase_if(semi_join_edges, [&](const auto & edge)
+    {
+        return !inputs[edge.to].join_keys.empty() && !std::ranges::contains(keyed_edges, edge);
+    });
+    for (auto & edge : semi_join_edges)
+        edge.to_left_side = std::ranges::any_of(keyed_edges, [&](const auto & keyed)
+        {
+            return keyed.from == edge.to && keyed.from_column == edge.to_column && keyed.to == edge.from && keyed.to_column == edge.from_column;
+        });
     query = query_tree->toAST(ast_options);
 
     auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();

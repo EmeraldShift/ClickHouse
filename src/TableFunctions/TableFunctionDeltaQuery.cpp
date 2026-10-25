@@ -151,6 +151,12 @@ mutations or lightweight updates. A query may use filters, `INNER` and `CROSS` j
 columns, and filters by `now()` in `WHERE` over the columns of one table. Their deltas retract rows. The cursors of a query
 with `now()` have the key `now`, the time of the snapshot.
 
+The delta of a join reads each input other than the new rows by its join key, with `key IN (subquery)`. That read takes a range of
+the primary key if the sorting key of the input starts with the join key, or if the input has a commit-order projection like
+`PROJECTION p (SELECT *, _block_number ORDER BY key)` with `allow_commit_order_projection = 1`. Otherwise it reads the whole input.
+Inserts don't write commit-order projections, so `OPTIMIZE TABLE ... FINAL` writes the projection for the existing parts, and the
+deltas read the parts that haven't merged yet in full.
+
 `target UNION ALL deltaQuery(query, cursor, frontier)` reads the result of a `REFRESH ... INCREMENTAL` view as of
 now, where `cursor` is the column of `system.view_refreshes` and `frontier` is the cursor that `deltaQueryFrontier` returns. Each of its result columns is
 either free of aggregates or one call of `sum`, `count`, their `-If` forms, `min`, `max`, `any`, `groupBitOr`, `groupBitAnd`, `groupBitXor`,

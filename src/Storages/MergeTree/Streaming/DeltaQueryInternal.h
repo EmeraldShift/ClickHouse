@@ -45,13 +45,20 @@ struct DeltaQuery::Input
     Names columns = {};
 };
 
-/// An equality `from.from_column = to.to_column` between join keys of two inputs.
+/// An equality `from.from_column = to.to_column` between join keys of two inputs. The semi-join reduction follows it from
+/// input `from` to input `to`.
 struct DeltaQuery::SemiJoinEdge
 {
     size_t from;
     String from_column;
     size_t to;
     String to_column;
+    /// The type of `from_column` in the query.
+    String from_type;
+    /// Whether the equality is in the ON of a LEFT, SEMI, ANTI or ASOF join with `from` on the right and `to` on the left.
+    bool to_left_side = false;
+
+    bool operator==(const SemiJoinEdge &) const = default;
 };
 
 namespace DeltaQueryInternal
@@ -143,6 +150,8 @@ bool isInvertibleAggregate(const String & name);
 /// pass the condition of an `-If` form, and `minIf` or `maxIf` then returns 0. So only `sum` and `count` take `-If`.
 bool isMergeableAggregate(const String & name);
 
+bool isAggregate(const IAST & ast);
+
 /// The table identifier, table function or subquery of `expression`.
 ASTPtr & getTable(ASTTableExpression & expression);
 
@@ -188,6 +197,9 @@ ASTPtr makeConjunction(ASTs conjuncts);
 
 ASTs cloneAll(const ASTs & asts);
 
+/// The names of the identifiers and the aliases in `ast`.
+void collectNames(const IAST & ast, NameSet & names);
+
 /// `base`, or else `base_1`, `base_2` and so on, whichever `taken` doesn't have first.
 String makeUniqueName(const String & base, const NameSet & taken);
 
@@ -201,6 +213,12 @@ void collectColumns(const IAST & ast, std::map<String, std::set<String>> & colum
 
 /// Adds `SETTINGS name = value` to `select`, keeping its other settings.
 void setSetting(ASTSelectQuery & select, std::string_view name, const Field & value);
+
+using Visit = std::function<ASTPtr(const ASTPtr & node)>;
+
+/// Calls `visit` on the nodes of the expression `node` of `parent` top-down. A node that `visit` returns replaces `node`,
+/// and its children aren't visited. Neither are the identifiers of lambda parameters.
+void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::multiset<String> & lambda_parameters);
 
 /// The rows of `table` that pass `where`, if not null, with the values `values` of the columns of `consolidate` and the
 /// weight `weight`.

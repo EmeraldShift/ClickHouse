@@ -62,7 +62,7 @@ public:
     struct SemiJoinEdge;
 
 private:
-    /// Analyzes `query_` into `query` and `inputs`.
+    /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`.
     void analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column);
 
     struct DeltaTerms;
@@ -70,6 +70,7 @@ private:
     /// The resolved query, whose tables have unique aliases.
     ASTPtr query;
     std::vector<Input> inputs;
+    std::vector<SemiJoinEdge> semi_join_edges;
     String sign_column;
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;

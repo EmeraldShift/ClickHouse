@@ -68,6 +68,12 @@ bool isMergeableAggregate(const String & name)
     return suffixes.empty() && without_if.contains(base);
 }
 
+bool isAggregate(const IAST & ast)
+{
+    const auto * function = ast.as<ASTFunction>();
+    return function && !function->isWindowFunction() && AggregateFunctionFactory::instance().isAggregateFunctionName(function->name);
+}
+
 ASTPtr & getTable(ASTTableExpression & expression)
 {
     if (expression.table_function)
@@ -236,6 +242,16 @@ ASTs cloneAll(const ASTs & asts)
     return result;
 }
 
+void collectNames(const IAST & ast, NameSet & names)
+{
+    if (const auto * identifier = ast.as<ASTIdentifier>())
+        names.insert(identifier->name_parts.begin(), identifier->name_parts.end());
+    if (const auto & alias = ast.tryGetAlias(); !alias.empty())
+        names.insert(alias);
+    for (const auto & child : ast.children)
+        collectNames(*child, names);
+}
+
 String makeUniqueName(const String & base, const NameSet & taken)
 {
     String name = base;
@@ -285,6 +301,37 @@ void setSetting(ASTSelectQuery & select, std::string_view name, const Field & va
     set_query.is_standalone = false;
     set_query.changes.setSetting(name, value);
     select.setExpression(ASTSelectQuery::Expression::SETTINGS, std::move(settings));
+}
+
+using Visit = std::function<ASTPtr(const ASTPtr & node)>;
+
+void visitExpression(ASTPtr & node, IAST & parent, const Visit & visit, std::multiset<String> & lambda_parameters)
+{
+    if (const auto * identifier = node->as<ASTIdentifier>(); identifier && lambda_parameters.contains(identifier->name()))
+        return;
+    if (auto replacement = visit(node))
+    {
+        const IAST * old = node.get();
+        node = std::move(replacement);
+        parent.updatePointerToChild(old, node);
+        return;
+    }
+    if (auto * function = node->as<ASTFunction>(); function && function->isLambdaFunction())
+    {
+        auto & arguments = function->arguments->children;
+        Names names;
+        for (const auto & parameter : arguments.at(0)->as<ASTFunction &>().arguments->children)
+            names.push_back(parameter->as<ASTIdentifier &>().name());
+        for (const auto & name : names)
+            lambda_parameters.insert(name);
+        visitExpression(arguments.at(1), *function->arguments, visit, lambda_parameters);
+        for (const auto & name : names)
+            lambda_parameters.erase(lambda_parameters.find(name));
+        return;
+    }
+    for (auto & child : node->children)
+        if (child)
+            visitExpression(child, *node, visit, lambda_parameters);
 }
 
 ASTPtr consolidate(const Names & columns, const String & sign, std::vector<WeightedRows> sources)
