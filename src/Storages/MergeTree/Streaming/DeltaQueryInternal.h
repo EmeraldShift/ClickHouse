@@ -61,6 +61,26 @@ struct DeltaQuery::SemiJoinEdge
     bool operator==(const SemiJoinEdge &) const = default;
 };
 
+/// An ASOF join `... ON l.k_1 = r.k_1 AND ... AND l.t >= r.t` whose ON has only those conjuncts, where input `left` has
+/// every column on the left. The match of a left row is the latest right row of its keys at or before its time. For `<=`
+/// and `<` it is the earliest one at or after its time.
+struct DeltaQuery::AsofJoin
+{
+    size_t left = 0;
+    size_t right = 0;
+    /// The columns of the equalities, in the same order for both inputs.
+    Names left_keys;
+    Names right_keys;
+    String left_time;
+    String right_time;
+    /// Whether the match is at or before the time of the left row, for `>=` and `>`.
+    bool backward = true;
+    /// Whether the match can't have the time of the left row, for `>` and `<`.
+    bool strict = false;
+    /// The lookback, see `makeAsofLookback`.
+    ASTPtr lookback;
+};
+
 namespace DeltaQueryInternal
 {
 

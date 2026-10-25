@@ -46,6 +46,7 @@ namespace ErrorCodes
 
 namespace Setting
 {
+    extern const SettingsFloat delta_query_asof_lookback;
     extern const SettingsString delta_query_lookup_tables;
     extern const SettingsString delta_query_sign_column;
 }
@@ -338,6 +339,91 @@ std::vector<SemiJoinEdge> collectSemiJoinEdges(const QueryTreeNodes & conditions
     return edges;
 }
 
+/// Returns `lookback`, see `delta_query_asof_lookback`, as an amount to add to or subtract from a value of `type`. Returns
+/// null for other types and for a lookback too large for an Int64.
+ASTPtr makeAsofLookback(const DataTypePtr & type, Float64 lookback)
+{
+    WhichDataType which(type);
+    const Float64 amount = std::ceil(which.isDateTime64() ? lookback * 1e6 : lookback);
+    if (!(amount < 1e18))
+        return nullptr;
+    auto literal = make_intrusive<ASTLiteral>(Field(static_cast<Int64>(amount)));
+    if (which.isDateTime64())
+        return makeASTFunction("toIntervalMicrosecond", std::move(literal));
+    if (which.isDateTime())
+        return makeASTFunction("toIntervalSecond", std::move(literal));
+    /// An Int64 keeps `t - lookback` from wrapping around for unsigned columns.
+    if (which.isNativeInt() || which.isNativeUInt())
+        return makeASTFunction("toInt64", std::move(literal));
+    return nullptr;
+}
+
+/// The ASOF join of the right input `right` by `join`, unless its ON has other conjuncts or its time columns have a type
+/// without a lookback, see `makeAsofLookback`. The equalities must be between join keys of `right`.
+std::optional<DeltaQuery::AsofJoin> makeAsofJoin(const JoinNode & join, size_t right, const DeltaQuery::Input & right_input,
+    const InputIndexes & input_indexes, Float64 lookback)
+{
+    QueryTreeNodes conjuncts;
+    splitConjuncts(join.getJoinExpression(), conjuncts);
+    DeltaQuery::AsofJoin asof;
+    asof.right = right;
+    std::optional<size_t> left;
+    bool has_time = false;
+    for (const auto & conjunct : conjuncts)
+    {
+        const auto * function = conjunct->as<FunctionNode>();
+        if (!function || function->getArguments().getNodes().size() != 2)
+            return {};
+        const auto * a = function->getArguments().getNodes()[0]->as<ColumnNode>();
+        const auto * b = function->getArguments().getNodes()[1]->as<ColumnNode>();
+        if (!a || !b)
+            return {};
+        auto a_input = input_indexes.find(a->getColumnSourceOrNull().get());
+        auto b_input = input_indexes.find(b->getColumnSourceOrNull().get());
+        if (a_input == input_indexes.end() || b_input == input_indexes.end())
+            return {};
+        String name = function->getFunctionName();
+        if (a_input->second == right)
+        {
+            std::swap(a, b);
+            std::swap(a_input, b_input);
+            static const std::map<String, String> flipped = {{"equals", "equals"}, {"greaterOrEquals", "lessOrEquals"},
+                {"greater", "less"}, {"lessOrEquals", "greaterOrEquals"}, {"less", "greater"}};
+            auto it = flipped.find(name);
+            if (it == flipped.end())
+                return {};
+            name = it->second;
+        }
+        if (b_input->second != right || a_input->second == right || (left && *left != a_input->second))
+            return {};
+        left = a_input->second;
+        if (name == "equals")
+        {
+            if (!std::ranges::contains(right_input.join_keys, b->getColumnName()))
+                return {};
+            asof.left_keys.push_back(a->getColumnName());
+            asof.right_keys.push_back(b->getColumnName());
+            continue;
+        }
+        if (has_time || (name != "greaterOrEquals" && name != "greater" && name != "lessOrEquals" && name != "less"))
+            return {};
+        has_time = true;
+        asof.left_time = a->getColumnName();
+        asof.right_time = b->getColumnName();
+        asof.backward = name.starts_with("greater");
+        asof.strict = !name.ends_with("OrEquals");
+        const auto type = removeLowCardinality(a->getColumnType());
+        auto amount = makeAsofLookback(type, lookback);
+        if (!type->equals(*removeLowCardinality(b->getColumnType())) || !amount)
+            return {};
+        asof.lookback = std::move(amount);
+    }
+    if (!left || !has_time || asof.left_keys.empty())
+        return {};
+    asof.left = *left;
+    return asof;
+}
+
 /// Rewrites the resolved `select` of `query` to carry the weights of its rows, the product of the signs of the signed
 /// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, unless it has no signs and
 /// not `unit_sign`. A query with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
@@ -416,6 +502,8 @@ void DeltaQuery::checkResultSign() const
 void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_)
 {
     inputs.clear();
+    asof_joins.clear();
+    const auto asof_lookback = static_cast<Float64>(context->getSettingsRef()[Setting::delta_query_asof_lookback]);
     clock_input.reset();
     clock_conjuncts.clear();
     consolidated_columns.clear();
@@ -495,6 +583,9 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
             throwUnsupported("LEFT, SEMI, ANTI or ASOF joins without an equality of join keys of both sides in ON");
         if (join.getStrictness() == JoinStrictness::Semi || join.getStrictness() == JoinStrictness::Anti)
             existence_joins.insert(right);
+        if (join.getStrictness() == JoinStrictness::Asof && asof_lookback > 0)
+            if (auto asof = makeAsofJoin(join, right, inputs[right], input_indexes, asof_lookback))
+                asof_joins.push_back(std::move(*asof));
     }
     /// The delta of a join that isn't linear in a table, or of a filter by now(), retracts rows of the result.
     const bool retracts = has_clock
@@ -521,6 +612,13 @@ void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, cons
     if (retracts)
         signs.push_back(make_intrusive<ASTIdentifier>(term_sign_name));
     checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
+    /// The rows of a signed right input near a time can cancel, so their existence there says nothing about the match. A
+    /// left input with join keys is itself the right side of a join. Its terms read all the rows of the touched keys and not
+    /// just the changes, and the defaults that pad it don't pass its conjuncts.
+    std::erase_if(asof_joins, [&](const auto & asof)
+    {
+        return inputs[asof.right].is_signed || !inputs[asof.left].join_keys.empty();
+    });
     checkExpressions(*query_tree, input_indexes);
     checkLinearClauses(*query_node);
     checkResultColumns(*query_node, !signs.empty());

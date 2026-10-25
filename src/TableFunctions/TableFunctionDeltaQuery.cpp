@@ -157,6 +157,12 @@ the primary key if the sorting key of the input starts with the join key, or if 
 Inserts don't write commit-order projections, so `OPTIMIZE TABLE ... FINAL` writes the projection for the existing parts, and the
 deltas read the parts that haven't merged yet in full.
 
+The delta of an `ASOF` join reads every right row of the keys it touches. With the setting `delta_query_asof_lookback`, it reads only
+the right rows from that distance before the earliest time of the change on, or up to that distance after the latest time for `<=`
+and `<`. It reads every right row only of the keys without a right row between that time and the change. The lookback is in seconds
+for `DateTime` and `DateTime64` and in the units of the column for integers. It changes what the delta reads, not its result. It
+applies to right tables that aren't signed, and to left tables that aren't the right side of a `LEFT`, `SEMI`, `ANTI` or `ASOF` join.
+
 `target UNION ALL deltaQuery(query, cursor, frontier)` reads the result of a `REFRESH ... INCREMENTAL` view as of
 now, where `cursor` is the column of `system.view_refreshes` and `frontier` is the cursor that `deltaQueryFrontier` returns. Each of its result columns is
 either free of aggregates or one call of `sum`, `count`, their `-If` forms, `min`, `max`, `any`, `groupBitOr`, `groupBitAnd`, `groupBitXor`,

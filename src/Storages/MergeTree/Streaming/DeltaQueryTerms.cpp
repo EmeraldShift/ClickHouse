@@ -240,17 +240,67 @@ struct DeltaQuery::DeltaTerms
             rows == Rows::Old ? old_bounds.at(key) : new_bounds.at(key));
     }
 
+    /// The conjuncts of each input that narrow the ASOF joins in a term that reads rows `rows[j]` of each input j, after the
+    /// changes of input `from`, its rows that pass `change`, see `AsofJoin`. For a backward join, a change at time s changes
+    /// only the matches of the left rows from s on. The match of such a row is at or after the latest right row of its keys
+    /// at or before s. So the right input reads the rows of a key from s minus the lookback on if the key has a row from
+    /// there to s, and all the rows of the key otherwise. Here s is the earliest time of the change. A forward join mirrors
+    /// that.
+    std::vector<ASTs> narrowAsof(const std::vector<Rows> & rows, size_t from, const ASTs & change) const
+    {
+        std::vector<ASTs> extra(inputs.size());
+        for (const auto & asof : query.asof_joins)
+        {
+            if (from != asof.left && from != asof.right)
+                continue;
+            const auto & left = inputs[asof.left];
+            const auto & right = inputs[asof.right];
+            auto changes = [&] { return makeConjunction(cloneAll(change)); };
+            const auto & time = from == asof.left ? asof.left_time : asof.right_time;
+            const auto & keys = from == asof.left ? asof.left_keys : asof.right_keys;
+            /// The comparisons `t >= b` and `t < s` or `t <= s` of a backward join. A forward join mirrors them.
+            const auto * after = asof.backward ? "greaterOrEquals" : "lessOrEquals";
+            const auto * before = asof.backward ? (asof.strict ? "less" : "lessOrEquals") : (asof.strict ? "greater" : "greaterOrEquals");
+            auto start = [&]
+            {
+                return makeSubquery(makeSelect({makeASTFunction(asof.backward ? "min" : "max", make_intrusive<ASTIdentifier>(time))},
+                    makeSemiJoinSubquery(inputs[from], {time}, changes())));
+            };
+            auto limit = [&] { return makeASTFunction(asof.backward ? "minus" : "plus", start(), asof.lookback->clone()); };
+            auto right_keys = [&] { return makeTuple(makeColumns(right, asof.right_keys)); };
+            auto right_time = [&] { return makeColumn(right.alias, asof.right_time); };
+            auto touched = [&] { return makeSemiJoinSubquery(inputs[from], keys, changes()); };
+            /// The touched keys that have a right row from the limit to s, in the rows of the right input in the term.
+            ASTs near_conjuncts;
+            addRows(near_conjuncts, asof.right, rows[asof.right]);
+            near_conjuncts.push_back(makeASTFunction(after, right_time(), limit()));
+            near_conjuncts.push_back(makeASTFunction(before, right_time(), start()));
+            near_conjuncts.push_back(makeASTFunction("in", right_keys(), touched()));
+            auto near = makeSelect({right_keys()}, withAlias(makeTable(right), right.alias),
+                makeConjunction(std::move(near_conjuncts)));
+            auto far = makeSelect(makeIdentifiers(keys), touched(),
+                makeASTFunction("notIn", makeTuple(makeIdentifiers(keys)), makeSubquery(std::move(near))));
+            extra[asof.right].push_back(makeASTFunction("or", makeASTFunction(after, right_time(), limit()),
+                makeASTFunction("in", right_keys(), makeSubquery(std::move(far)))));
+            if (from == asof.right)
+                extra[asof.left].push_back(makeASTFunction(after, makeColumn(left.alias, asof.left_time), start()));
+        }
+        return extra;
+    }
+
     /// Adds the term that reads rows `rows[j]` of each input j, and of input `from` only those that also pass `own`. The
     /// reduction starts from the rows of input `from` that pass `change`, or without it from its rows in the term. The rows
-    /// of the term have weight `sign` times their weight in the query, and now() is `time`.
+    /// of the term have weight `sign` times their weight in the query, and now() is `time`. Input j also gets `extra[j]`.
     void addTerm(const std::vector<Rows> & rows, std::optional<size_t> from, ASTs own, const ASTs & change, Int64 sign,
-        std::optional<Int64> time)
+        std::optional<Int64> time, std::vector<ASTs> extra = {})
     {
         std::vector<ASTs> conjuncts(inputs.size());
         for (size_t j = 0; j < inputs.size(); ++j)
             addRows(conjuncts[j], j, rows[j]);
         if (from)
             std::ranges::move(own, std::back_inserter(conjuncts[*from]));
+        for (size_t j = 0; j < extra.size(); ++j)
+            std::ranges::move(extra[j], std::back_inserter(conjuncts[j]));
 
         std::vector<bool> reached(inputs.size());
         /// The subquery of the conjunct `column IN subquery` that the reduction gave each input, by column.
@@ -316,14 +366,14 @@ struct DeltaQuery::DeltaTerms
         if (inputs[i].join_keys.empty())
         {
             rows[i] = Rows::Delta;
-            addTerm(rows, i, {}, {}, 1, time);
+            addTerm(rows, i, {}, {}, 1, time, narrowAsof(rows, i, change));
             return;
         }
         auto keys = makeJoinKeysIn(inputs[i], makeSemiJoinSubquery(inputs[i], inputs[i].join_keys, makeConjunction(cloneAll(change))));
         for (auto [own_rows, sign] : {std::pair{Rows::New, Int64{1}}, std::pair{Rows::Old, Int64{-1}}})
         {
             rows[i] = own_rows;
-            addTerm(rows, i, {keys->clone()}, change, sign, time);
+            addTerm(rows, i, {keys->clone()}, change, sign, time, narrowAsof(rows, i, change));
         }
         has_pairs = true;
     }

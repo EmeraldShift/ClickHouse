@@ -10838,6 +10838,10 @@ A query with this setting can also have `LEFT`, `SEMI`, `ANTI` and `ASOF` joins 
 The empty string, the default, makes no input signed.
 )", EXPERIMENTAL, \
         {"26.11", "", "", "New setting for delta queries over inputs whose rows have signs."}) \
+    DECLARE(Float, delta_query_asof_lookback, 0, R"(
+How far before the time of its changes a delta of `deltaQuery` or of a `REFRESH ... INCREMENTAL` view first looks for the matches of an `ASOF` join `... ON l.k = r.k AND l.t >= r.t`. It is in seconds for `DateTime` and `DateTime64` columns, and in the units of the column for integer columns. With 0, a delta reads every row of the right table for each key that it touches. Otherwise it reads the rows of a key from that far back, and every row of the keys that have no row there. Both give the same result. A change of the right table then also only recomputes the left rows from its time on. For `<=` and `<`, the delta looks ahead instead. The `deltaQuery` documentation lists the joins that it narrows.
+)", EXPERIMENTAL, \
+        {"26.11", 0, 0, "New setting for delta queries over ASOF joins."}) \
     DECLARE(String, delta_query_lookup_tables, "", R"(
 A comma-separated list of input tables of `deltaQuery` and of `REFRESH ... INCREMENTAL` views whose new rows don't change earlier results. Each name is a table name or `database.table`. A delta joins the new rows of the other inputs with the latest rows of a lookup table, and the new rows of a lookup table join with nothing. So each result row stays as it was when its other rows arrived, like a lookup join, and the delta skips the term of the lookup table, which is usually its most expensive one. A query needs an input that isn't a lookup table.
 )", EXPERIMENTAL, \

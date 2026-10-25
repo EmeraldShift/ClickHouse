@@ -60,6 +60,7 @@ public:
 
     struct Input;
     struct SemiJoinEdge;
+    struct AsofJoin;
 
 private:
     /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`.
@@ -71,6 +72,8 @@ private:
     ASTPtr query;
     std::vector<Input> inputs;
     std::vector<SemiJoinEdge> semi_join_edges;
+    /// The ASOF joins whose deltas read only the rows near the time of the changes, see `delta_query_asof_lookback`.
+    std::vector<AsofJoin> asof_joins;
     String sign_column;
     /// The input that the filters by now() read, and those filters, which are conjuncts of WHERE.
     std::optional<size_t> clock_input;
