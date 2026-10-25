@@ -1449,10 +1449,11 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     {
         refresh_context = view->createRefreshContext(log_comment);
 
-        const bool incremental = isIncremental();
+        const bool incremental = isIncremental() || isDelta();
 
         /// For incremental refresh, resume the source stream from the last persisted cursor and attach a
         /// holder that the reading source fills with the new cursor (read back after the query succeeds).
+        /// For a delta view, `prepareRefresh` fills it.
         CursorTreeNodePtr stream_cursor;
         if (incremental)
         {
@@ -1650,7 +1651,7 @@ std::optional<UUID> RefreshTask::executeRefreshUnlocked(int32_t root_znode_versi
     if (table_to_drop.has_value())
         view->dropTempTable(table_to_drop.value(), refresh_context, out_error_message);
 
-    /// Persist the cursor the streaming source advanced to. A transactional target already committed it
+    /// Persist the cursor that the refresh advanced to. A transactional target already committed it
     /// with its data, so the znode cursor stays empty for it.
     if (!cursor_persisted_by_target)
         if (auto cursor = refresh_context->getStreamingCursor())

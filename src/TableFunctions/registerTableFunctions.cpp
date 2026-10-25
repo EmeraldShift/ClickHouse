@@ -54,6 +54,7 @@ void registerTableFunctions()
 
     registerTableFunctionView(factory);
     registerTableFunctionViewIfPermitted(factory);
+    registerTableFunctionDeltaQuery(factory);
 
     registerTableFunctionObfuscate(factory);
 

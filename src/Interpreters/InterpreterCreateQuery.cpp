@@ -45,6 +45,7 @@
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTQualifiedAsterisk.h>
+#include <Parsers/ASTRefreshStrategy.h>
 #include <Parsers/ASTSelectIntersectExceptQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ExpressionListParsers.h>
@@ -53,6 +54,7 @@
 #include <Storages/MaterializedView/RefreshSet.h>
 #include <Storages/MaterializedView/RefreshTask.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/Streaming/DeltaQuery.h>
 #include <Storages/StorageAlias.h>
 #include <Storages/StorageFactory.h>
 #include <Storages/StorageProxy.h>
@@ -215,6 +217,18 @@ namespace fs = std::filesystem;
 
 namespace
 {
+
+/// The query whose rows a materialized view inserts into its target. A `REFRESH ... INCREMENTAL` view inserts
+/// the deltas of its query. `DeltaQuery` can add a sign column to the deltas and change the types of their aggregates.
+ASTPtr getInsertedQuery(const ASTCreateQuery & create, const ContextPtr & context)
+{
+    if (create.refresh_strategy && create.refresh_strategy->isDelta())
+    {
+        DeltaQuery delta_query(create.select->clone(), context);
+        return delta_query.getQuery()->clone();
+    }
+    return create.select->clone();
+}
 
 /// How many tables a single `CREATE` adds to the database. Usually one, but the engines with
 /// hidden inner tables (`MaterializedView`, `TimeSeries`) issue nested internal `CREATE`s from
@@ -1207,7 +1221,7 @@ InterpreterCreateQuery::TableProperties InterpreterCreateQuery::getTableProperti
             select_context = mv_context;
         }
 
-        SharedHeader as_select_sample = InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(),
+        SharedHeader as_select_sample = InterpreterSelectQueryAnalyzer::getSampleBlock(getInsertedQuery(create, select_context),
             select_context,
             SelectQueryOptions{}.analyze().checkSubqueryTableAccess());
 
@@ -1374,7 +1388,7 @@ void InterpreterCreateQuery::validateMaterializedViewColumnsAndEngine(const ASTC
                 if (create.refresh_strategy)
                     context->setCurrentDatabaseUnchecked(create.getDatabase());
 
-                input_block = InterpreterSelectQueryAnalyzer::getSampleBlock(create.select->clone(),
+                input_block = InterpreterSelectQueryAnalyzer::getSampleBlock(getInsertedQuery(create, context),
                     context,
                     SelectQueryOptions{}.analyze().createView().checkSubqueryTableAccess());
             }

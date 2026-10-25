@@ -3323,7 +3323,7 @@ REFRESH [EVERY|AFTER interval [OFFSET interval]]
 [RANDOMIZE FOR interval]
 [DEPENDS ON [db.]name [, [db.]name [, ...]]]
 [SETTINGS name = value [, name = value [, ...]]]
-[APPEND [INCREMENTAL]]
+[APPEND [INCREMENTAL] | INCREMENTAL]
 [TO[db.]name] [(columns)] [ENGINE = engine]
 [EMPTY]
 [DEFINER = { user | CURRENT_USER }] [SQL SECURITY { DEFINER | NONE }]
@@ -3340,11 +3340,12 @@ The `REFRESH` clause must specify at least one of `EVERY`, `AFTER`, or `DEPENDS 
 Periodically runs the corresponding query and stores its result into a table.
 * If `APPEND` is specified, each refresh inserts rows into the table without deleting existing rows. The insert is not atomic, just like a regular `INSERT INTO ... SELECT` query.
 * If `APPEND INCREMENTAL` is specified, each refresh runs the query over only the rows committed to the source table since the previous refresh, and appends the result.
+* If `INCREMENTAL` is specified without `APPEND`, each refresh appends what the result gains from the rows committed to the source tables since the previous refresh. For each table occurrence, it appends the new rows of the occurrence joined with the rows of the other occurrences, like the `deltaQuery` table function. The refresh also reads the virtual columns `_block_number`, `_partition_id` and `_part` of the source tables, so with column-level grants the definer of the view needs `SELECT` on them.
 * Otherwise, each refresh atomically replaces the table's previous contents.
 
 Differences from regular non-refreshable materialized views:
 * No insert trigger. When new data is inserted into the table specified in `SELECT`, it's *not* automatically pushed to the refreshable materialized view. Instead, data insertion only takes place during the periodic or manual refresh runs.
-* No restrictions on the `SELECT` query. Table functions (e.g. `url()`), views, UNION, JOIN, are all allowed. `APPEND INCREMENTAL` is the one exception: it requires a single plain `MergeTree` source table with `enable_block_number_column = 1` and `enable_block_offset_column = 1`, and rejects `JOIN`, `UNION`, subqueries, views, and table functions.
+* No restrictions on the `SELECT` query. Table functions (e.g. `url()`), views, UNION, JOIN, are all allowed. `APPEND INCREMENTAL` is the one exception: it requires a single plain `MergeTree` source table with `enable_block_number_column = 1` and `enable_block_offset_column = 1`, and rejects `JOIN`, `UNION`, subqueries, views, and table functions. `INCREMENTAL` without `APPEND` is an exception too. It reads `MergeTree` or `ReplicatedMergeTree` tables with `enable_block_number_column = 1`, and rejects `UNION`, subqueries, views, table functions, `HAVING`, `ORDER BY`, `LIMIT`, `DISTINCT`, and window functions. Its aggregates are partial and merge in the target, so they are `sum`, `count`, their `-If` forms, `min`, `max`, `any`, `groupBitOr`, `groupBitAnd`, `groupBitXor`, and `-State` aggregates. Rows of sign -1 in the source tables retract earlier rows, where the setting `delta_query_sign_column` in the `SETTINGS` of the query names the sign column. The target of a view without aggregates then has the sign column, and can be a `CollapsingMergeTree`. A view of aggregates weighs the retractions in its aggregates, so its target can be a `SummingMergeTree` without a sign column.
 
 <Note>
 The settings in the `REFRESH ... SETTINGS` part of the query are refresh settings (e.g. `refresh_retries`), distinct from regular settings (e.g. `max_threads`). Regular settings can be specified using `SETTINGS` at the end of the query.

@@ -119,7 +119,8 @@ public:
         AllDependenciesInfo last_success_dependencies;
 
         /// Per-partition cursor of the last successfully processed snapshot, for incremental refresh
-        /// (`REFRESH ... APPEND INCREMENTAL`). Null when the view is not incremental or nothing has been processed yet.
+        /// (`REFRESH ... APPEND INCREMENTAL`), or the `DeltaQuery` cursor of a `REFRESH ... INCREMENTAL` view.
+        /// Null for other views or when nothing has been processed yet.
         CursorTreeNodePtr cursor;
 
         /// Znode version. Not serialized.
@@ -371,6 +372,7 @@ private:
     const RefreshMode refresh_mode;
     bool isAppend() const { return refresh_mode != RefreshMode::Replace; }
     bool isIncremental() const { return refresh_mode == RefreshMode::AppendIncremental; }
+    bool isDelta() const { return refresh_mode == RefreshMode::Delta; }
     /// Start with refreshing paused. Used for the temporary view of CREATE OR REPLACE, which is
     /// resumed after the rename so it cannot refresh the target before the replacement is committed.
     const bool start_paused;

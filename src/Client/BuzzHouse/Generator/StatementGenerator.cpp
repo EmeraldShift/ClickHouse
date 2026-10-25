@@ -557,9 +557,9 @@ void StatementGenerator::generateNextRefreshableView(RandomGenerator & rg, const
         SetViewInterval(rg, rv->mutable_randomize());
     }
     rv->set_append(rg.nextBool());
-    /// `INCREMENTAL` only parses after `APPEND`. The server also requires a single plain streaming
-    /// source, which is only known once the SELECT is generated, so many draws are still rejected.
-    if (rv->append() && allow_incremental && rg.nextSmallNumber() < 4)
+    /// `APPEND INCREMENTAL` and `INCREMENTAL` alone are different modes. The server also requires source tables that
+    /// suit the mode, which are only known once the SELECT is generated, so many draws are still rejected.
+    if (allow_incremental && rg.nextSmallNumber() < 4)
     {
         rv->set_incremental(true);
     }

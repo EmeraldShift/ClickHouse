@@ -1,0 +1,414 @@
+#include <Storages/MergeTree/Streaming/DeltaQuery.h>
+#include <Storages/MergeTree/Streaming/DeltaQueryInternal.h>
+
+#include <Analyzer/AggregationUtils.h>
+#include <Analyzer/ArrayJoinNode.h>
+#include <Analyzer/ColumnNode.h>
+#include <Analyzer/FunctionNode.h>
+#include <Analyzer/JoinNode.h>
+#include <Analyzer/QueryNode.h>
+#include <Analyzer/TableNode.h>
+#include <Analyzer/createUniqueAliasesIfNecessary.h>
+#include <Core/Joins.h>
+#include <Core/Settings.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/DatabaseCatalog.h>
+#include <Interpreters/InterpreterSelectQueryAnalyzer.h>
+#include <Interpreters/InterpreterSetQuery.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTSubquery.h>
+#include <Parsers/ASTTablesInSelectQuery.h>
+#include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/StorageProxy.h>
+
+#include <unordered_map>
+#include <unordered_set>
+
+
+namespace DB
+{
+
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+    extern const int NOT_IMPLEMENTED;
+}
+
+namespace Setting
+{
+    extern const SettingsString delta_query_sign_column;
+}
+
+namespace MergeTreeSetting
+{
+    extern const MergeTreeSettingsBool enable_block_number_column;
+}
+
+using namespace DeltaQueryInternal;
+
+namespace
+{
+
+/// The inputs by their nodes in the query tree.
+using InputIndexes = std::unordered_map<const IQueryTreeNode *, size_t>;
+
+/// `value * weight`, where `argument` is the node of `value` in the query tree.
+ASTPtr makeWeightedValue(const ASTPtr & value, const QueryTreeNodePtr & argument, const ASTPtr & weight)
+{
+    /// The product of an unsigned integer and a signed weight has the signed type of the same width. That type can't hold
+    /// every value of the unsigned type. So the value is first converted to the signed type of twice the width.
+    auto weighted = value;
+    WhichDataType type(removeLowCardinalityAndNullable(argument->getResultType()));
+    if (type.isUInt64())
+        weighted = makeASTFunction("toInt128", weighted);
+    else if (type.isUInt128())
+        weighted = makeASTFunction("toInt256", weighted);
+    else if (type.isUInt256())
+        throwUnsupported("aggregates of UInt256 over signed inputs");
+    return makeASTFunction("multiply", weighted, weight->clone());
+}
+
+/// The aggregate `function` with each row weighted by `weight`. `isInvertibleAggregate` must accept `function`, and `node`
+/// is its node in the query tree. The result over rows of weight 1 and -1 is the result of `function` over the rows of
+/// weight 1 that no row of weight -1 cancels.
+ASTPtr makeWeightedAggregate(const ASTFunction & function, const FunctionNode & node, const ASTPtr & weight)
+{
+    const auto [base, suffixes] = splitCombinators(function.name);
+    ASTs arguments = function.arguments ? function.arguments->children : ASTs{};
+    const auto & argument_nodes = node.getArguments().getNodes();
+    if (base == "exponentialMovingAverage")
+    {
+        /// The state is a sum of the values decayed to the latest time of its rows. A row of weight -1 cancels the term of
+        /// its row of weight 1. The latest time stays the same, so the average is as of the latest time of any row of the
+        /// group, including canceled rows.
+        auto result = function.clone();
+        auto & result_arguments = result->as<ASTFunction &>().arguments->children;
+        result_arguments.at(0) = makeWeightedValue(result_arguments.at(0), argument_nodes.at(0), weight);
+        return result;
+    }
+
+    ASTs conditions;
+    if (!suffixes.empty() && !arguments.empty())
+    {
+        conditions.push_back(arguments.back());
+        arguments.pop_back();
+    }
+    ASTPtr value;
+    if (base == "sum" && arguments.size() == 1)
+        value = makeWeightedValue(arguments[0], argument_nodes.at(0), weight);
+    else if (base == "count" && arguments.size() <= 1)
+    {
+        value = weight->clone();
+        if (!arguments.empty())
+            conditions.insert(conditions.begin(), makeASTFunction("isNotNull", arguments[0]));
+    }
+    else
+        throwUnsupported(fmt::format("aggregate function {} with {} arguments over signed inputs", function.name, arguments.size()));
+
+    if (conditions.empty())
+        return makeASTFunction("sum", std::move(value));
+    auto condition = conditions.size() == 1 ? conditions[0] : makeASTFunction("and", std::move(conditions));
+    return makeASTFunction("sumIf", std::move(value), std::move(condition));
+}
+
+/// Appends the tables of the join tree in order. Throws unless each join is an inner join, which is linear in both sides.
+void collectJoinTree(const QueryTreeNodePtr & node, QueryTreeNodes & tables)
+{
+    switch (node->getNodeType())
+    {
+        case QueryTreeNodeType::TABLE:
+            tables.push_back(node);
+            return;
+        case QueryTreeNodeType::ARRAY_JOIN:
+            collectJoinTree(node->as<ArrayJoinNode &>().getTableExpressionNode(), tables);
+            return;
+        case QueryTreeNodeType::CROSS_JOIN:
+        {
+            auto & join = node->as<CrossJoinNode &>();
+            if (std::ranges::any_of(join.getJoinTypes(), [](const auto & type) { return type.locality == JoinLocality::Global; }))
+                throwUnsupported("GLOBAL joins");
+            for (const auto & table : join.getTableExpressions())
+                collectJoinTree(table, tables);
+            return;
+        }
+        case QueryTreeNodeType::JOIN:
+        {
+            /// Resolution has replaced an unspecified strictness by `join_default_strictness`.
+            const auto & join = node->as<JoinNode &>();
+            if (join.getKind() != JoinKind::Inner || join.getStrictness() != JoinStrictness::All)
+                throwUnsupported("joins other than INNER ALL, CROSS and comma joins");
+            if (join.getLocality() == JoinLocality::Global)
+                throwUnsupported("GLOBAL joins");
+            collectJoinTree(join.getLeftTableExpressionNode(), tables);
+            collectJoinTree(join.getRightTableExpressionNode(), tables);
+            return;
+        }
+        default:
+            throwUnsupported("table functions or subqueries in FROM");
+    }
+}
+
+/// Throws unless the table has block numbers that order its rows by insert, and its merges keep its rows.
+Input makeInput(const TableNode & table)
+{
+    if (const auto & modifiers = table.getTableExpressionModifiers();
+        modifiers && (modifiers->hasSampleSizeRatio() || modifiers->hasStream()))
+        throwUnsupported("SAMPLE or STREAM");
+
+    auto storage = castStorage<MergeTreeData>(table.getStorage(), DeferredTable::Load);
+    if (!storage)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries read only MergeTree tables, but {} has engine {}",
+            table.getStorageID().getNameForLogs(), table.getStorage()->getName());
+    const auto table_id = storage->getStorageID();
+    if (storage->merging_params.mode != MergeTreeData::MergingParams::Ordinary)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, whose merges rewrite rows",
+            table_id.getNameForLogs());
+    if (!(*storage->getSettings())[MergeTreeSetting::enable_block_number_column])
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Delta queries require table {} to set enable_block_number_column = 1",
+            table_id.getNameForLogs());
+    if (!table_id.hasUUID())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries require table {} to have a UUID, as tables of Atomic databases do",
+            table_id.getNameForLogs());
+    /// The bounds read the virtual columns `_part` and `_partition_id`, which columns of the same names would shadow.
+    for (const auto * virtual_column : {"_part", "_partition_id"})
+        if (table.getStorageSnapshot()->metadata->getColumns().has(virtual_column))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Delta queries do not support table {}, whose column {} shadows a virtual column",
+                table_id.getNameForLogs(), virtual_column);
+
+    return {.alias = table.getAlias(), .key = toString(table_id.uuid), .storage = std::move(storage)};
+}
+
+/// Rejects subqueries, which could read tables that the cursors do not cover. Resolution replaces scalar subqueries by
+/// their values, so this check runs on the AST.
+void checkNoSubqueries(const IAST & ast)
+{
+    for (const auto & child : ast.children)
+    {
+        if (child->as<ASTSubquery>())
+            throwUnsupported("subqueries");
+        checkNoSubqueries(*child);
+    }
+}
+
+/// Rejects tables outside FROM, like in `k IN t`, which the cursors do not cover, and window functions, whose result over
+/// the union of the terms differs from the union of their results.
+void checkExpressions(const IQueryTreeNode & node, const InputIndexes & input_indexes)
+{
+    for (const auto & child : node.getChildren())
+    {
+        if (!child)
+            continue;
+        auto type = child->getNodeType();
+        if (type == QueryTreeNodeType::TABLE && !input_indexes.contains(child.get()))
+            throwUnsupported("IN over tables");
+        if (const auto * function = child->as<FunctionNode>(); function && function->isWindowFunction())
+            throwUnsupported(fmt::format("window functions in {}", linear_queries));
+        checkExpressions(*child, input_indexes);
+    }
+}
+
+/// Checks the clauses whose result over the union of the terms of a linear query differs from the union of their results.
+void checkLinearClauses(const QueryNode & query)
+{
+    if (query.isDistinct())
+        throwUnsupported(fmt::format("DISTINCT in {}", linear_queries));
+    if (query.isGroupByWithTotals() || query.isGroupByWithRollup() || query.isGroupByWithCube() || query.isGroupByWithGroupingSets())
+        throwUnsupported(fmt::format("WITH TOTALS, ROLLUP, CUBE or GROUPING SETS in {}", linear_queries));
+    if (query.hasHaving())
+        throwUnsupported(fmt::format("HAVING in {}", linear_queries));
+    if (query.hasOrderBy() || query.hasLimit() || query.hasOffset() || query.hasLimitByLimit() || query.hasLimitAfter()
+        || query.hasLimitUntil())
+        throwUnsupported(fmt::format("ORDER BY, LIMIT or LIMIT BY in {}", linear_queries));
+    if (query.hasWindow() || query.hasQualify())
+        throwUnsupported(fmt::format("WINDOW or QUALIFY in {}", linear_queries));
+}
+
+/// Checks that each result column of a linear query is either an aggregate whose deltas merge or free of aggregates. Over
+/// signed inputs the aggregate must also be invertible. Resolution inlines aliases, so `sum(v) AS s, s + 1` fails too. The
+/// query tree skips optimizations, which move arithmetic out of aggregates and would make `sum(v * 2)` fail.
+void checkResultColumns(const QueryNode & query, bool is_signed)
+{
+    for (const auto & column : query.getProjection().getNodes())
+    {
+        if (const auto * function = column->as<FunctionNode>(); function && function->isAggregateFunction())
+        {
+            const auto & name = function->getFunctionName();
+            if (is_signed && !isInvertibleAggregate(name))
+                throwUnsupported(fmt::format("aggregate function {} over signed inputs, use count, sum, their -If forms or exponentialMovingAverageState instead", name));
+            if (!is_signed && !isMergeableAggregate(name))
+                throwUnsupported(fmt::format("aggregate function {} in {}, use its -State form instead", name, linear_queries));
+        }
+        else if (hasAggregateFunctionNodes(column))
+            throwUnsupported(fmt::format("expressions over aggregates in {}, select each aggregate as its own column", linear_queries));
+    }
+}
+
+/// Whether the table has the sign column. Throws if that column isn't an ordinary column of a signed integer type.
+bool hasSignColumn(const TableNode & table, const String & sign_column)
+{
+    const auto & columns = table.getStorageSnapshot()->metadata->getColumns();
+    if (!columns.has(sign_column))
+        return false;
+    auto column = columns.tryGetPhysical(sign_column);
+    if (!column || !WhichDataType(column->type).isNativeInt())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "Column {} of table {} must be an ordinary column of type Int8, Int16, Int32 or Int64 to be the sign column of delta queries",
+            sign_column, table.getStorageID().getNameForLogs());
+    return true;
+}
+
+/// Rejects reading the sign column of a signed table. The deltas turn the signs into weights, and the query can't see them.
+void checkSignColumnNotRead(const IQueryTreeNode & node, const std::unordered_set<const IQueryTreeNode *> & signed_tables,
+    const String & sign_column)
+{
+    for (const auto & child : node.getChildren())
+    {
+        if (!child)
+            continue;
+        if (const auto * column = child->as<ColumnNode>(); column && column->getColumnName() == sign_column)
+            if (auto source = column->getColumnSourceOrNull(); source && signed_tables.contains(source.get()))
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                    "Delta queries do not support reading the sign column {}, which their deltas compute. List the other columns instead of *",
+                    sign_column);
+        checkSignColumnNotRead(*child, signed_tables, sign_column);
+    }
+}
+
+/// Rewrites the resolved `select` of `query` to carry the weights of its rows, the product of the signs of the signed
+/// inputs. A query without aggregates or GROUP BY returns the weight of each row as `sign_column`, unless it has no signs and
+/// not `unit_sign`. A query with aggregates weighs the rows in its aggregates, and is unchanged without signed inputs.
+void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & signs, const String & sign_column, bool unit_sign)
+{
+    const auto & nodes = query.getProjection().getNodes();
+    const auto & columns = query.getProjectionColumns();
+    auto & projection = select.select()->children;
+    chassert(projection.size() == nodes.size() && columns.size() == nodes.size());
+
+    ASTPtr weight = signs.empty() ? make_intrusive<ASTLiteral>(Field(Int64{1})) : signs[0];
+    for (size_t i = 1; i < signs.size(); ++i)
+        weight = makeASTFunction("multiply", weight, signs[i]);
+
+    if (!query.hasGroupBy() && !std::ranges::any_of(nodes, hasAggregateFunctionNodes))
+    {
+        if (std::ranges::any_of(columns, [&](const auto & column) { return column.name == sign_column; }))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "The delta query returns column {}, which delta_query_sign_column names", sign_column);
+        if (signs.empty() && !unit_sign)
+            return;
+        auto sign = makeASTFunction("toInt8", weight);
+        sign->setAlias(sign_column);
+        projection.push_back(std::move(sign));
+        return;
+    }
+    if (signs.empty())
+        return;
+
+    bool has_aggregates = false;
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        const auto * function = nodes[i]->as<FunctionNode>();
+        if (!function || !function->isAggregateFunction())
+            continue;
+        /// The alias keeps the name of the result column.
+        projection[i] = makeWeightedAggregate(projection[i]->as<ASTFunction &>(), *function, weight);
+        projection[i]->setAlias(columns[i].name);
+        has_aggregates = true;
+    }
+    /// A group of the target table would stay after its last row is retracted.
+    if (!has_aggregates)
+        throwUnsupported("GROUP BY without aggregates over signed inputs, add count() to see which groups have rows");
+}
+
+}
+
+DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_)
+{
+    /// The query can set `delta_query_sign_column` in its SETTINGS, as the query of a view does.
+    auto context = Context::createCopy(context_);
+    InterpreterSetQuery::applySettingsFromQuery(query_, context);
+    /// The deltas weigh their rows by a sign column. Without `delta_query_sign_column`, no input has a sign column, and the
+    /// sign column of the deltas has an internal name.
+    String sign_column_setting = context->getSettingsRef()[Setting::delta_query_sign_column];
+    if (sign_column_setting.empty())
+    {
+        sign_column_setting = internal_sign_column;
+        context->setSetting("delta_query_sign_column", sign_column_setting);
+    }
+    checkNoSubqueries(*query_);
+    analysis_context = context;
+
+    analyze(query_, context, sign_column_setting);
+}
+
+DeltaQuery::~DeltaQuery() = default;
+
+void DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_)
+{
+    inputs.clear();
+    sign_column = sign_column_;
+
+    InterpreterSelectQueryAnalyzer interpreter(query_, context, SelectQueryOptions().analyze().ignoreASTOptimizations());
+    auto query_tree = interpreter.getQueryTree()->clone();
+
+    /// Aliases and columns of the query can shadow the names of its tables. So the bounds qualify the columns of each table
+    /// by its unique alias `__tableN`.
+    createUniqueAliasesIfNecessary(query_tree, context);
+    const auto * query_node = query_tree->as<QueryNode>();
+    if (!query_node)
+        throwUnsupported("UNION");
+
+    QueryTreeNodes tables;
+    collectJoinTree(query_node->getJoinTreeNode(), tables);
+    InputIndexes input_indexes;
+    for (const auto & table : tables)
+    {
+        input_indexes.emplace(table.get(), inputs.size());
+        inputs.push_back(makeInput(table->as<TableNode &>()));
+    }
+
+    /// The deltas must merge into the query over the union of the inputs.
+    ASTs signs;
+    std::unordered_set<const IQueryTreeNode *> signed_tables;
+    for (size_t i = 0; i < tables.size(); ++i)
+    {
+        if (!hasSignColumn(tables[i]->as<TableNode &>(), sign_column))
+            continue;
+        signed_tables.insert(tables[i].get());
+        signs.push_back(makeColumn(inputs[i].alias, sign_column));
+    }
+    checkSignColumnNotRead(*query_tree, signed_tables, sign_column);
+    checkExpressions(*query_tree, input_indexes);
+    checkLinearClauses(*query_node);
+    checkResultColumns(*query_node, !signs.empty());
+
+    query = query_tree->toAST();
+
+    auto & select = query->as<ASTSelectWithUnionQuery &>().list_of_selects->children.at(0)->as<ASTSelectQuery &>();
+    /// Without GROUP BY, a delta that reads no rows still returns one row by default, with 0 for `min` and `max`.
+    if (!select.groupBy())
+        setSetting(select, "empty_result_for_aggregation_by_empty_set", true);
+    /// The rows for a target with a sign column have a sign even if no input has one.
+    addWeights(select, *query_node, signs, sign_column, sign_column != internal_sign_column);
+
+    /// Resolution checks only that the user can see the tables. Building the plan checks the grants on the columns that
+    /// the query reads.
+    interpreter.getSampleBlock();
+}
+
+ASTPtr DeltaQuery::getQuery() const
+{
+    return query->clone();
+}
+
+NamesAndTypesList DeltaQuery::getResultColumns() const
+{
+    /// The passes after resolution keep the types of the result columns. Resolution alone finds them.
+    InterpreterSelectQueryAnalyzer interpreter(getQuery(), analysis_context, SelectQueryOptions().analyze().ignoreASTOptimizations());
+    const auto & columns = interpreter.getQueryTree()->as<const QueryNode &>().getProjectionColumns();
+    return NamesAndTypesList(columns.begin(), columns.end());
+}
+
+}

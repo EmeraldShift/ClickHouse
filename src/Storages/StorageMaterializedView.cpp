@@ -40,6 +40,7 @@
 #include <Storages/VirtualColumnUtils.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
+#include <Storages/MergeTree/Streaming/DeltaQuery.h>
 
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
@@ -293,6 +294,15 @@ StorageMaterializedView::StorageMaterializedView(
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "CREATE OR REPLACE and REPLACE are not supported for incremental refreshable materialized views");
         validateIncrementalDefinition(select.select_query, mv_db_context);
+    }
+    if (query.refresh_strategy && query.refresh_strategy->isDelta() && is_fresh_definition)
+    {
+        /// A replacement builds a fresh cursor, so the next refresh would replay the inputs and duplicate rows.
+        if (query.create_or_replace || query.replace_view)
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "CREATE OR REPLACE and REPLACE are not supported for `REFRESH ... INCREMENTAL` views");
+        /// Throws unless delta queries support the query.
+        DeltaQuery delta_query(select.select_query, mv_db_context);
     }
 
     storage_metadata.setSelectQuery(select);
@@ -761,6 +771,7 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
 {
     const bool append = mode != RefreshMode::Replace;
     const bool incremental = mode == RefreshMode::AppendIncremental;
+    const bool delta = mode == RefreshMode::Delta;
 
     auto inner_table_id = getTargetTableId();
     StorageID target_table = inner_table_id;
@@ -777,6 +788,25 @@ StorageMaterializedView::prepareRefresh(RefreshMode mode, ContextMutablePtr refr
 
         /// Re-assert after applySettingsFromQuery so a view's own SETTINGS cannot disable what the STREAM source needs.
         refresh_context->setSetting("enable_streaming_queries", Field(UInt64{1}));
+        refresh_context->setSetting("enable_parallel_replicas", Field(UInt64{0}));
+        refresh_context->setSetting("parallel_replicas_for_non_replicated_merge_tree", Field(UInt64{0}));
+        refresh_context->setSetting("allow_insert_into_iceberg", Field(UInt64{1}));
+        /// A transactional target commits the whole round in one snapshot with the cursor, so it must be a single writer.
+        refresh_context->setSetting("max_insert_threads", Field(UInt64{1}));
+    }
+
+    if (delta)
+    {
+        DeltaQuery delta_query(select_query, refresh_context);
+        auto new_cursor = delta_query.getFrontier(stream_cursor);
+        select_query = delta_query.buildDelta(stream_cursor, new_cursor);
+        {
+            /// `RefreshTask` persists this cursor after the refresh succeeds. A transactional target commits it with the data.
+            auto holder = refresh_context->getStreamingCursor();
+            std::lock_guard lock(holder->mutex);
+            holder->tree = std::move(new_cursor);
+        }
+
         refresh_context->setSetting("enable_parallel_replicas", Field(UInt64{0}));
         refresh_context->setSetting("parallel_replicas_for_non_replicated_merge_tree", Field(UInt64{0}));
         refresh_context->setSetting("allow_insert_into_iceberg", Field(UInt64{1}));
@@ -1020,7 +1050,7 @@ void StorageMaterializedView::checkAlterIsPossible(const AlterCommands & command
             const auto metadata = IStorage::getInMemoryMetadataPtr(local_context, /*bypass_metadata_cache=*/ false);
             const auto * refresh_strategy = metadata->refresh ? metadata->refresh->as<ASTRefreshStrategy>() : nullptr;
             /// The incremental cursor is keyed to the current source, so changing the query would leave it stale.
-            if (refresh_strategy && refresh_strategy->isIncremental())
+            if (refresh_strategy && (refresh_strategy->isIncremental() || refresh_strategy->isDelta()))
                 throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                     "MODIFY QUERY is not supported for incremental refreshable materialized views");
             continue;

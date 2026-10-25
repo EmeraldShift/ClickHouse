@@ -1772,11 +1772,12 @@ void QueryFuzzer::fuzzRefreshStrategy(ASTRefreshStrategy & strategy, bool allow_
         strategy.set(strategy.spread, std::move(spread));
     }
 
-    /// Fuzz the refresh mode. `AppendIncremental` is the last of the three, so dropping it leaves
-    /// `Replace` and `AppendFull`. Where the caller cannot introduce it, one that is already there is
-    /// kept rather than rewritten: only transitions into it are suppressed.
-    if (fuzz_rand() % 10 == 0 && (allow_incremental || strategy.mode != RefreshMode::AppendIncremental))
-        strategy.mode = static_cast<RefreshMode>(fuzz_rand() % (allow_incremental ? 3 : 2));
+    /// Fuzz the refresh mode. `AppendIncremental` and `Delta` are the last two of the four, so dropping them leaves
+    /// `Replace` and `AppendFull`. Where the caller cannot introduce them, one that is already there is
+    /// kept rather than rewritten: only transitions into them are suppressed.
+    if (fuzz_rand() % 10 == 0
+        && (allow_incremental || (strategy.mode != RefreshMode::AppendIncremental && strategy.mode != RefreshMode::Delta)))
+        strategy.mode = static_cast<RefreshMode>(fuzz_rand() % (allow_incremental ? 4 : 2));
 
     /// Toggle schedule kind between EVERY and AFTER
     if (strategy.schedule_kind != RefreshScheduleKind::UNKNOWN && fuzz_rand() % 10 == 0)

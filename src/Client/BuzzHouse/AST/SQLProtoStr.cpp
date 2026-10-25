@@ -4061,10 +4061,10 @@ CONV_FN(RefreshableView, rv)
     if (rv.append())
     {
         ret += " APPEND";
-        if (rv.incremental())
-        {
-            ret += " INCREMENTAL";
-        }
+    }
+    if (rv.incremental())
+    {
+        ret += " INCREMENTAL";
     }
 }
 

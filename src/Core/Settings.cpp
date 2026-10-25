@@ -10828,6 +10828,14 @@ Intersections of 256 or more tokens always use leapfrog.
 On server startup, prevent scheduling of refreshable materialized views, as if with SYSTEM STOP VIEWS. You can manually start them with `SYSTEM START VIEWS` or `SYSTEM START VIEW <name>` afterwards. Also applies to newly created views. Has no effect on non-refreshable materialized views.
 )", EXPERIMENTAL) \
     \
+    DECLARE(String, delta_query_sign_column, "", R"(
+The sign column of the inputs of `deltaQuery` and of `REFRESH ... INCREMENTAL` views. Each input table that has a column of this name is signed. A row with sign 1 inserts the row, and a row with sign -1 retracts an earlier row with the same values. [CollapsingMergeTree](/reference/engines/table-engines/mergetree-family/collapsingmergetree) tables use signs the same way. The weight of a joined row is the product of the signs of its signed inputs. The query can't read the sign column.
+
+A query without aggregates returns the weight of each row in a column of this name, for a `CollapsingMergeTree` target. A query with aggregates over signed inputs returns sums for a [SummingMergeTree](/reference/engines/table-engines/mergetree-family/summingmergetree) target. It supports only `count`, `sum`, their `-If` forms and `exponentialMovingAverageState`, and their results become signed. Sums of `UInt64` become `Int128`. The moving average of a group is as of the latest time of any of its rows, including retracted rows. The query can set this setting in its `SETTINGS` clause. A nonempty value also makes a query over one table follow the rules of delta queries over joins, and a query without aggregates over unsigned inputs returns weight 1.
+
+The empty string, the default, makes no input signed.
+)", EXPERIMENTAL, \
+        {"26.11", "", "", "New setting for delta queries over inputs whose rows have signs."}) \
     DECLARE(Bool, allow_experimental_database_materialized_postgresql, false, R"(
 Allow to create database with Engine=MaterializedPostgreSQL(...).
 )", EXPERIMENTAL) \
