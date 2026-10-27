@@ -64,11 +64,17 @@ std::pair<String, std::vector<String>> splitCombinators(const String & name)
     return {AggregateFunctionFactory::instance().getCanonicalNameIfAny(base), std::move(suffixes)};
 }
 
-bool isInvertibleAggregate(const String & name)
+bool isSum(const String & name)
 {
     const auto [base, suffixes] = splitCombinators(name);
-    if (base == "sum" || base == "count")
-        return suffixes.empty() || suffixes == std::vector<String>{"If"};
+    return (base == "sum" || base == "count") && (suffixes.empty() || suffixes == std::vector<String>{"If"});
+}
+
+bool isInvertibleAggregate(const String & name)
+{
+    if (isSum(name))
+        return true;
+    const auto [base, suffixes] = splitCombinators(name);
     return base == "exponentialMovingAverage" && suffixes == std::vector<String>{"State"};
 }
 

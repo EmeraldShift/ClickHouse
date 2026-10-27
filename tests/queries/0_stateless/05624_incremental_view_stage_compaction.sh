@@ -40,3 +40,39 @@ $CLICKHOUSE_CLIENT -q "
     INSERT INTO signed SELECT 1, number, 1 FROM numbers(200);
     SYSTEM REFRESH VIEW keys; SYSTEM WAIT VIEW keys;
     SELECT 'keys', count(), sum(sign), max(abs(sign)) FROM keys;"
+
+# The stage table of a linear stage adds up the partial sums of each account. After OPTIMIZE FINAL, it holds one row per
+# account. The view stays equal to its query when only the rates change, and after a mutation corrects the stage table.
+$CLICKHOUSE_CLIENT -q "
+    CREATE TABLE facts (grp UInt64, amt Int64) ENGINE = MergeTree ORDER BY grp SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+    CREATE TABLE rates (grp UInt64, w Float64, sign Int8) ENGINE = MergeTree ORDER BY grp
+        SETTINGS enable_block_number_column = 1, enable_block_offset_column = 0;
+    INSERT INTO rates VALUES (0, 1, 1), (1, 1, 1);
+    CREATE MATERIALIZED VIEW total REFRESH EVERY 10 YEAR INCREMENTAL ENGINE = MergeTree ORDER BY tuple() EMPTY AS
+        SELECT sum(p.q * m.w) AS total, sum(p.n) AS n
+        FROM (SELECT grp, sum(amt) AS q, count() AS n FROM facts GROUP BY grp) AS p JOIN rates AS m ON p.grp = m.grp
+        SETTINGS delta_query_sign_column = 'sign';"
+
+refresh_total() { $CLICKHOUSE_CLIENT -q "SYSTEM REFRESH VIEW total; SYSTEM WAIT VIEW total;"; }
+check_total() {
+    $CLICKHOUSE_CLIENT -q "
+        SELECT '$1', sum(total), sum(n) FROM total;
+        SELECT '$1 expected', sum(p.q * m.w), sum(p.n) FROM (SELECT grp, sum(amt) AS q, count() AS n FROM facts GROUP BY grp) AS p
+            JOIN (SELECT grp, w FROM rates GROUP BY grp, w HAVING sum(sign) > 0) AS m ON p.grp = m.grp;"
+}
+
+for r in 1 2 3; do
+    $CLICKHOUSE_CLIENT -q "INSERT INTO facts VALUES (0, $r), (1, $((10 * r)))"
+    refresh_total
+done
+stage=$($CLICKHOUSE_CLIENT -q "SELECT name FROM system.tables WHERE database = currentDatabase() AND name LIKE '.inner_stage.%' AND engine_full LIKE 'SummingMergeTree((%'")
+$CLICKHOUSE_CLIENT -q "OPTIMIZE TABLE \`$stage\` FINAL"
+$CLICKHOUSE_CLIENT -q "SELECT 'linear stage rows', count() FROM \`$stage\`"
+
+$CLICKHOUSE_CLIENT -q "INSERT INTO rates VALUES (0, 1, -1), (0, 2, 1)"
+refresh_total
+check_total 'new rate'
+
+$CLICKHOUSE_CLIENT -q "ALTER TABLE facts DELETE WHERE amt = 20 SETTINGS mutations_sync = 2"
+refresh_total
+check_total 'corrected'

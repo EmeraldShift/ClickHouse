@@ -271,6 +271,9 @@ std::shared_ptr<MergeTreeData> lockStorage(const DeltaQuery::Input & input);
 /// The name of the aggregate without its combinators, and the names of its combinators from the outermost.
 std::pair<String, std::vector<String>> splitCombinators(const String & name);
 
+/// `sum` and `count`, plain or with `-If`. The results over disjoint rows add up to the result over all of them.
+bool isSum(const String & name);
+
 /// Aggregates that `makeWeightedAggregate` rewrites. Their results are sums over rows. A row of weight -1 cancels its term.
 bool isInvertibleAggregate(const String & name);
 

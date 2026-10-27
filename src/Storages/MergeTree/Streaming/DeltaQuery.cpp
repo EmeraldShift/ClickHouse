@@ -545,12 +545,12 @@ void addWeights(ASTSelectQuery & select, const QueryNode & query, const ASTs & s
 }
 
 DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path)
-    : DeltaQuery(query_, context_, view, stage_path, nullptr)
+    : DeltaQuery(query_, context_, view, stage_path, nullptr, /*reads_linearly=*/ {})
 {
 }
 
 DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const StorageID & view, const String & stage_path,
-    const RecursionTable * recursion_table_)
+    const RecursionTable * recursion_table_, const ReadsLinearly & reads_linearly)
     : is_stage(!stage_path.empty())
 {
     /// The query can set `delta_query_sign_column` in its SETTINGS, as the query of a view does.
@@ -575,7 +575,7 @@ DeltaQuery::DeltaQuery(const ASTPtr & query_, const ContextPtr & context_, const
 
     Residual split;
     split.sign_column = sign_column_setting;
-    auto core = analyze(shard_query ? shard_query : rewritten, context, sign_column_setting, &split);
+    auto core = analyze(shard_query ? shard_query : rewritten, context, sign_column_setting, &split, reads_linearly);
     if (!core)
         return;
     if (shard_query)
@@ -601,7 +601,8 @@ void DeltaQuery::checkResultSign() const
             "of its result");
 }
 
-ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_, Residual * split)
+ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column_, Residual * split,
+    const ReadsLinearly & reads_linearly)
 {
     inputs.clear();
     asof_joins.clear();
@@ -666,9 +667,10 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
             if (num_stage_inputs == stages.size())
                 throwUnsupported("table functions in FROM");
             const auto & stage = stages[num_stage_inputs++];
-            /// The table of a stage whose rows never retract holds rows of sign 1, so the query reads it unsigned.
+            /// The table of a stage whose rows never retract holds rows of sign 1, and the table of a linear stage holds rows
+            /// without signs. So the query reads them unsigned.
             inputs.push_back({.alias = function->getAlias(), .key = toString(stage.table.uuid), .table_id = stage.table,
-                .storage = {}, .stage = true, .is_signed = stage.query->retractsRows()});
+                .storage = {}, .stage = true, .is_signed = stage.query->retractsRows() && !stage.query->linear});
             continue;
         }
         inputs.push_back(makeInput(table->as<TableNode &>()));
@@ -744,11 +746,30 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
     {
         return inputs[asof.right].is_signed || inputs[asof.right].updatable || !inputs[asof.left].join_keys.empty();
     });
+    /// The aggregates of a linear stage are sums of numbers, see `DeltaQuery`. A partial sum can be negative, so only a count
+    /// can be unsigned, see `getStageColumns`. SummingMergeTree reads a dotted name as a column of a Nested table.
+    NameSet aggregate_columns;
+    bool sums = true;
+    const auto projection_columns = query_node->getProjectionColumns();
+    for (size_t i = 0; i < projection_columns.size(); ++i)
+        if (const auto & node = query_node->getProjection().getNodes()[i]; hasAggregateFunctionNodes(node))
+        {
+            const auto * function = node->as<FunctionNode>();
+            const WhichDataType type(projection_columns[i].type);
+            sums = sums && function && function->isAggregateFunction() && isSum(function->getFunctionName()) && type.isNumber()
+                && (!type.isUInt() || splitCombinators(function->getFunctionName()).first == "count")
+                && !projection_columns[i].name.contains('.');
+            aggregate_columns.insert(projection_columns[i].name);
+        }
+    linear = reads_linearly && sums && !aggregate_columns.empty() && reads_linearly(aggregate_columns);
     /// The residual of a stage with aggregates makes each refresh replace the rows of the groups that it changes.
     const bool has_aggregates = query_node->hasGroupBy()
         || std::ranges::any_of(query_node->getProjection().getNodes(), hasAggregateFunctionNodes);
     has_signs = !signs.empty();
-    const bool has_residual = split && (needsResidual(*query_node, !signs.empty()) || (is_stage && has_aggregates));
+    const bool has_residual = split && (needsResidual(*query_node, !signs.empty()) || (is_stage && has_aggregates && !linear));
+    linear = linear && !has_residual;
+    /// The counts of a residual would count the rows of the partial sums of a linear stage, see `readsLinearly`.
+    chassert(!has_residual || std::ranges::none_of(stages, [](const auto & stage) { return stage.query->linear; }));
     checkExpressions(*query_tree, input_indexes, !has_residual);
     if (has_residual)
     {
@@ -805,10 +826,9 @@ ASTPtr DeltaQuery::analyze(const ASTPtr & query_, const ContextPtr & context, co
         for (const auto & column : query_node->getProjectionColumns())
             consolidated_columns.push_back(column.name);
     }
-    else if (!signs.empty())
+    else if (!signs.empty() || linear)
     {
         const auto & nodes = query_node->getProjection().getNodes();
-        const auto projection_columns = query_node->getProjectionColumns();
         for (size_t i = 0; i < nodes.size(); ++i)
         {
             const auto * function = nodes[i]->as<FunctionNode>();

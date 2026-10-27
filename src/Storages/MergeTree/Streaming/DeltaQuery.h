@@ -79,9 +79,12 @@ using DataPartsVector = std::vector<DataPartPtr>;
 /// The query of a `REFRESH ... INCREMENTAL` view can also read subqueries and CTEs in FROM. Each subquery and
 /// each CTE in FROM is a stage.
 /// A stage is a delta query of its own, and its deltas go to a hidden stage table of the view. The query reads the stage
-/// table as a signed input. A stage with aggregates has a residual even if its aggregates are sums. So a refresh retracts
-/// the old row of each group that it changes and inserts the new row. The stage table then holds the rows of the subquery
-/// with signs. The cursor of a query with stages has the cursor of each stage under the key of the stage, see `Stage`.
+/// table as a signed input. A stage with aggregates has a residual unless it is linear. So a refresh retracts the old row
+/// of each group that it changes and inserts the new row. The stage table then holds the rows of the subquery with signs.
+/// The aggregates of a linear stage are `sum` and `count` of numbers, and the query reads them only in sums that are
+/// linear in them, see `readsLinearly`. Then a group can be any number of rows whose aggregates add up to those of the
+/// group. So the deltas of a linear stage add rows of partial sums to its stage table, which the query reads unsigned. The
+/// cursor of a query with stages has the cursor of each stage under the key of the stage, see `Stage`.
 ///
 /// `deltaQuery` and `REFRESH ... INCREMENTAL` views use this class.
 class DeltaQuery
@@ -117,7 +120,8 @@ public:
     static std::vector<StorageID> getStageTables(const ASTPtr & query, const StorageID & view);
 
     /// `CREATE TABLE IF NOT EXISTS` of the stage table `table` of this stage. The stage table weighs its rows by an Int64
-    /// sign. Its merges sum the signs of equal rows unless a column can't be in a sorting key.
+    /// sign. Its merges sum the signs of equal rows unless a column can't be in a sorting key. The stage table of a linear
+    /// stage has no sign, and its merges add up the sums of the rows of each group instead.
     String getStageCreateQuery(const StorageID & table) const;
 
     /// Makes the inputs of the stages read the stage tables, which must exist. The frontier and the delta need them.
@@ -230,8 +234,12 @@ private:
         /// The columns of `table`. The table may not exist yet.
         String structure;
     };
+    /// Whether the query that reads a stage reads these aggregate columns of the stage only linearly, see `linear`.
+    using ReadsLinearly = std::function<bool(const NameSet & aggregate_columns)>;
+
+    /// A stage with `reads_linearly` can be linear.
     DeltaQuery(const ASTPtr & query, const ContextPtr & context, const StorageID & view, const String & stage_path,
-        const RecursionTable * recursion_table);
+        const RecursionTable * recursion_table, const ReadsLinearly & reads_linearly);
 
     /// Returns false unless `query` is `WITH RECURSIVE r AS (...) SELECT * FROM r`, see `Recursion`. Otherwise analyzes it into
     /// `recursion`.
@@ -243,8 +251,9 @@ private:
         const RecursionTable * recursion_table);
 
     /// Analyzes `query_` into `query`, `inputs` and `semi_join_edges`. With a non-null `split`, a query that has a residual
-    /// fills `split` and returns its core instead, which the caller analyzes.
-    ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split);
+    /// fills `split` and returns its core instead, which the caller analyzes. A stage with `reads_linearly` can be linear.
+    ASTPtr analyze(const ASTPtr & query_, const ContextPtr & context, const String & sign_column, Residual * split,
+        const ReadsLinearly & reads_linearly);
 
     /// Analyzes `core`, the core of a query with a residual, and sets `residual` to `split` with the types of the core.
     void analyzeResidual(Residual split, const ASTPtr & core, const ContextPtr & context);
@@ -274,6 +283,8 @@ private:
     std::optional<StorageID> recursion_table;
     /// Whether this query is a stage, see `Stage`.
     bool is_stage = false;
+    /// Whether this query is a linear stage, see `DeltaQuery`. Its stage table holds rows of partial sums without signs.
+    bool linear = false;
     /// Whether the rows of the deltas have a sign other than 1, see `retractsRows`.
     bool has_signs = false;
     String sign_column;
@@ -285,8 +296,8 @@ private:
     /// The result columns of a signed query without aggregates, without the sign column. A delta with pairs of terms sums
     /// the signs of equal rows.
     Names consolidated_columns;
-    /// The result columns of a query with aggregates over signed inputs that are all sums, like `count` and `sum`. The flag
-    /// marks the aggregates. The rows of a target with equal other columns add up.
+    /// The result columns of a query with aggregates over signed inputs, or of a linear stage, if its aggregates are all
+    /// sums, like `count` and `sum`. The flag marks the aggregates. The rows of a target with equal other columns add up.
     std::vector<std::pair<String, bool>> summed_columns;
     /// For a query over `Distributed` tables, their cluster and the query that each shard runs over its local tables. For a
     /// query with a residual, that is the core.

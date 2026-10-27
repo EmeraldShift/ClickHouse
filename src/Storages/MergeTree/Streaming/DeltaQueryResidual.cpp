@@ -446,7 +446,7 @@ ASTPtr splitResidual(const QueryNode & query, const ASTSelectQuery & select, boo
 
 void DeltaQuery::analyzeResidual(Residual split, const ASTPtr & core, const ContextPtr & context)
 {
-    analyze(core, context, split.sign_column, nullptr);
+    analyze(core, context, split.sign_column, nullptr, /*reads_linearly=*/ {});
     /// The deltas of the core bind the sign of each term. The sign doesn't change the types.
     auto get_core_columns = [&]
     {
@@ -477,7 +477,7 @@ void DeltaQuery::analyzeResidual(Residual split, const ASTPtr & core, const Cont
     }
     if (added_counts)
     {
-        analyze(core, context, split.sign_column, nullptr);
+        analyze(core, context, split.sign_column, nullptr, /*reads_linearly=*/ {});
         core_columns = get_core_columns();
     }
 

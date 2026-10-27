@@ -8,9 +8,11 @@
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Parsers/ASTAsterisk.h>
+#include <Parsers/ASTColumnsMatcher.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTQualifiedAsterisk.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTSelectWithUnionQuery.h>
 #include <Parsers/ASTSubquery.h>
@@ -57,6 +59,96 @@ void forEachSubqueryInFrom(const ASTSelectQuery & select, const std::function<vo
             if (expression.subquery)
                 f(expression, ++index);
         }
+}
+
+/// Whether `select` reads `columns` of the table expression `alias` in FROM only linearly: each aggregate of `select` is
+/// a `sum` of a product with one factor `alias.column`, and nothing else reads the columns. Then any rows whose sums add
+/// up to those of a group of a linear stage give the same result as the group, see `DeltaQuery`. Only inner and cross
+/// joins match each of those rows like the group. A bare name, an asterisk, or an alias of a factor could read the columns
+/// unseen, so `select` must not read the columns through them. A residual of `select` would count the rows of a group to
+/// see whether it exists, so `select` must not need one, see `needsResidual`.
+bool readsLinearly(const ASTSelectQuery & select, const String & alias, const NameSet & columns)
+{
+    if (alias.empty() || select.distinct || select.group_by_with_totals || select.group_by_with_rollup || select.group_by_with_cube
+        || select.group_by_with_grouping_sets || select.order_by_all || select.limit_by_all || select.limit_after_all || select.limit_with_ties)
+        return false;
+    const std::array clauses{select.with(), select.select(), select.tables(), select.prewhere(), select.where(), select.groupBy(), select.settings()};
+    if (!std::ranges::all_of(select.children, [&](const auto & child) { return std::ranges::contains(clauses, child); })
+        || std::ranges::any_of(select.select()->children, [](const auto & column) { return hasAggregates(*column) && !isAggregate(*column); }))
+        return false;
+    /// An expression over the alias of an aggregate is an expression over the aggregate.
+    NameSet aggregate_aliases;
+    std::function<void(const IAST &)> collect_aliases = [&](const IAST & ast)
+    {
+        if (!ast.tryGetAlias().empty() && hasAggregates(ast))
+            aggregate_aliases.insert(ast.tryGetAlias());
+        for (const auto & child : ast.children)
+            collect_aliases(*child);
+    };
+    for (const auto & child : select.children)
+        if (child != select.tables())
+            collect_aliases(*child);
+    size_t num_sums = 0;
+    std::function<bool(const IAST &)> check;
+    /// Whether `ast`, a factor of the product in a sum, reads `columns` only in factors, and in `num_factors` of them.
+    std::function<bool(const IAST &, size_t &)> check_factor = [&](const IAST & ast, size_t & num_factors)
+    {
+        if (!ast.tryGetAlias().empty())
+            return false;
+        const auto * function = ast.as<ASTFunction>();
+        if (function && (function->name == "multiply" || function->name == "negate") && function->arguments)
+            return std::ranges::all_of(function->arguments->children, [&](const auto & child) { return check_factor(*child, num_factors); });
+        const auto * identifier = ast.as<ASTIdentifier>();
+        if (!identifier || identifier->name_parts.size() != 2 || identifier->name_parts[0] != alias || !columns.contains(identifier->name_parts[1]))
+            return check(ast);
+        ++num_factors;
+        return true;
+    };
+    /// Whether `ast` reads `columns` only in the sums of `select`.
+    check = [&](const IAST & ast)
+    {
+        if (ast.as<ASTSubquery>() || ast.as<ASTAsterisk>() || ast.as<ASTQualifiedAsterisk>() || ast.as<ASTColumnsRegexpMatcher>()
+            || ast.as<ASTColumnsListMatcher>() || ast.as<ASTQualifiedColumnsRegexpMatcher>() || ast.as<ASTQualifiedColumnsListMatcher>()
+            || ast.tryGetAlias() == alias)
+            return false;
+        if (const auto * identifier = ast.as<ASTIdentifier>())
+        {
+            const auto & parts = identifier->name_parts;
+            return !columns.contains(parts.at(0)) && !(parts.size() > 1 && parts[0] == alias && columns.contains(parts[1]))
+                && !(parts.size() == 1 && aggregate_aliases.contains(parts[0]));
+        }
+        const auto * function = ast.as<ASTFunction>();
+        if (function && function->isWindowFunction())
+            return false;
+        if (function && isAggregate(*function))
+        {
+            ++num_sums;
+            size_t num_factors = 0;
+            return splitCombinators(function->name) == std::pair{String("sum"), std::vector<String>{}} && function->arguments
+                && function->arguments->children.size() == 1 && check_factor(*function->arguments->children[0], num_factors)
+                && num_factors == 1;
+        }
+        return std::ranges::all_of(ast.children, [&](const auto & child) { return check(*child); });
+    };
+
+    for (const auto & child : select.children)
+        if (child != select.tables() && !check(*child))
+            return false;
+    for (const auto & element : select.tables()->children)
+    {
+        const auto & table = element->as<ASTTablesInSelectQueryElement &>();
+        if (const auto * join = table.table_join ? &table.table_join->as<ASTTableJoin &>() : nullptr)
+        {
+            if ((join->kind != JoinKind::Inner && join->kind != JoinKind::Cross && join->kind != JoinKind::Comma)
+                || (join->strictness != JoinStrictness::Unspecified && join->strictness != JoinStrictness::All))
+                return false;
+            if ((join->on_expression && !check(*join->on_expression)) || (join->using_expression_list && !check(*join->using_expression_list)))
+                return false;
+        }
+        if (table.array_join && !check(*table.array_join))
+            return false;
+    }
+    return num_sums > 0;
 }
 
 /// The stage table of the stage of path `path` of `view`, see `DeltaQuery::Stage`. Its UUID follows from the UUID of the
@@ -250,7 +342,7 @@ bool DeltaQuery::analyzeRecursion(const ASTPtr & query_, const ContextPtr & cont
         setTable(expression, std::move(replacement));
 
         auto & part = *split->steps.emplace_back(std::unique_ptr<DeltaQuery>(new DeltaQuery(makeSelectWithUnion(std::move(step)), context,
-            StorageID::createEmpty(), stage_path, stage_table ? &*stage_table : nullptr)));
+            StorageID::createEmpty(), stage_path, stage_table ? &*stage_table : nullptr, /*reads_linearly=*/ {})));
         check_part(part);
         auto reads_table = [&](const Input & input) { return input.key == split->key; };
         auto input = std::ranges::find_if(part.inputs, reads_table);
@@ -281,13 +373,20 @@ ASTPtr DeltaQuery::analyzeStages(const ASTPtr & query_, const ContextPtr & conte
                 if (view.table_name.empty())
                     throwUnsupported("subqueries in FROM outside `REFRESH ... INCREMENTAL` views");
                 const auto path = is_stage ? fmt::format("{}.{}", stage_path, index) : toString(index);
+                const auto alias = expression.subquery->tryGetAlias();
+                /// A stage with aggregates that reads a stage has a residual unless it is linear itself, which its own reader
+                /// decides later. So only the query of the view reads stages linearly.
+                ReadsLinearly reads_linearly;
+                if (!is_stage)
+                    reads_linearly = [&](const NameSet & columns) { return readsLinearly(*select, alias, columns); };
                 auto & stage = stages.emplace_back(Stage{.path = path, .table = makeStageTableId(view, path),
-                    .query = std::make_unique<DeltaQuery>(expression.subquery->children.at(0), context, view, path)});
+                    .query = std::unique_ptr<DeltaQuery>(new DeltaQuery(expression.subquery->children.at(0), context, view, path, nullptr,
+                        reads_linearly))});
                 Strings structure;
                 for (const auto & column : stage.query->getStageColumns())
                     structure.push_back(fmt::format("{} {}", backQuote(column.name), column.type->getName()));
                 auto table = makeASTFunction("null", make_intrusive<ASTLiteral>(Field(joinNames(structure))));
-                table->setAlias(expression.subquery->tryGetAlias());
+                table->setAlias(alias);
                 setTable(expression, std::move(table));
             });
     /// A step of a recursive stage reads the stage table as `null` with its columns, like a query that reads a stage.
@@ -339,6 +438,9 @@ NamesAndTypesList DeltaQuery::getStageColumns() const
     for (auto & column : columns)
         if (column.name == sign_column)
             column.type = std::make_shared<DataTypeInt64>();
+        /// A partial count can be negative, like that of a correction, see `buildCorrection`. A count fits in Int64.
+        else if (linear && isUInt64(column.type) && std::ranges::contains(summed_columns, std::pair{column.name, true}))
+            column.type = std::make_shared<DataTypeInt64>();
     return columns;
 }
 
@@ -368,11 +470,26 @@ String DeltaQuery::getStageCreateQuery(const StorageID & table) const
             quoted.push_back(backQuote(name));
         return names.empty() ? String("tuple()") : "(" + joinNames(quoted) + ")";
     };
+    String engine = consolidates ? "SummingMergeTree(" + backQuote(sign_column) + ")" : "MergeTree";
+    /// The merges of the stage table of a linear stage add up the sums of the rows of each group. They drop the rows whose
+    /// sums are all 0.
+    if (linear)
+    {
+        Names keys;
+        Names sums;
+        for (const auto & [name, is_sum] : summed_columns)
+            (is_sum ? sums : keys).push_back(name);
+        if (std::ranges::all_of(columns, [&](const auto & column) { return std::ranges::contains(sums, column.name) || canBeInSortingKey(*column.type); }))
+        {
+            order = std::move(keys);
+            engine = "SummingMergeTree(" + key(sums) + ")";
+        }
+    }
     /// The deduplication log drops the blocks that the retry of a refresh inserts again.
     return fmt::format("CREATE TABLE IF NOT EXISTS {} UUID {} ({}) ENGINE = {} ORDER BY {}{} "
         "SETTINGS enable_block_number_column = 1, allow_nullable_key = 1, non_replicated_deduplication_window = 100",
         table.getFullTableName(), quoteString(toString(table.uuid)),
-        joinNames(definitions), consolidates ? "SummingMergeTree(" + backQuote(sign_column) + ")" : "MergeTree", key(order),
+        joinNames(definitions), engine, key(order),
         consolidates && !primary_key.empty() ? " PRIMARY KEY " + key(primary_key) : "");
 }
 

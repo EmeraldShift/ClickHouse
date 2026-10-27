@@ -2,3 +2,8 @@ stage rows	3	3
 histogram	[(3,2),(4,1)]
 expected	[(3,2),(4,1)]
 keys	200	200	1
+linear stage rows	2
+new rate	72	6
+new rate expected	72	6
+corrected	52	5
+corrected expected	52	5
