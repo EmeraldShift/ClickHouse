@@ -142,11 +142,25 @@ public:
         const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
         const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
 
+    /// The truth that `checkInHyperrectangle` returns the `mask()` of. An atom on a column the hyperrectangle does not have
+    /// counts as unknown.
+    Truth checkBoundsInHyperrectangle(
+        const Hyperrectangle & hyperrectangle,
+        const DataTypes & data_types,
+        const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
+
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
     /// `key_col_to_sparse_pos` maps key index to position in `sparse_hyperrectangle`, or -1 if not tracked.
     /// If some key column >= `key_col_to_sparse_pos`.size(), it is considered as not tracked.
     /// See the optimized overload of checkInRange for explanation of relevant parameters.
     BoolMask checkInHyperrectangle(
+        const std::vector<int> & key_col_to_sparse_pos,
+        const Hyperrectangle & sparse_hyperrectangle,
+        const DataTypes & sparse_data_types) const;
+
+    /// The truth that the optimized overload of `checkInHyperrectangle` returns the `mask()` of.
+    Truth checkBoundsInHyperrectangle(
         const std::vector<int> & key_col_to_sparse_pos,
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types) const;
@@ -164,6 +178,15 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types,
         BoolMask initial_mask = BoolMask(false, false),
+        const Hyperrectangle * key_bounds = nullptr) const;
+
+    /// The truth that `checkInRange` returns the `mask()` of. The check stops once its value covers `need`, see `Truth::covers`.
+    Truth checkBoundsInRange(
+        size_t key_size,
+        const FieldRef * left_keys,
+        const FieldRef * right_keys,
+        const DataTypes & data_types,
+        const Truth & need = {},
         const Hyperrectangle * key_bounds = nullptr) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
@@ -189,6 +212,16 @@ public:
         const DataTypes & sparse_data_types,
         const std::vector<UInt8> & equal_boundaries_mask,
         BoolMask initial_mask,
+        const Hyperrectangle * key_bounds = nullptr) const;
+
+    /// The truth that the optimized overload of `checkInRange` returns the `mask()` of.
+    Truth checkBoundsInRange(
+        const std::vector<size_t> & sparse_key_indices,
+        const FieldRef * sparse_left_keys,
+        const FieldRef * sparse_right_keys,
+        const DataTypes & sparse_data_types,
+        const std::vector<UInt8> & equal_boundaries_mask,
+        const Truth & need = {},
         const Hyperrectangle * key_bounds = nullptr) const;
 
     const KeyOrder & getKeyOrder() const { return key_order; }
@@ -372,7 +405,8 @@ public:
 
         Function function = FUNCTION_UNKNOWN;
 
-        /// Whether to relax the key condition (e.g., for LIKE queries without a perfect prefix).
+        /// Whether the check of the atom finds a superset of the rows where the atom is true. `LIKE` without a perfect
+        /// prefix is relaxed. See `Truth::relaxed`.
         bool relaxed = false;
 
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
@@ -418,11 +452,9 @@ public:
         /// columns. The group stands for the leaf as a single element, so the RPN keeps one element per leaf,
         /// as the skip-index disjunction machinery expects (see `mergePartialResultsForDisjunctions`).
         ///
-        /// Each atom's mask bounds the mask of the whole leaf: a component that an atom cannot decide is
-        /// reported as `true`, as for an atom that stands alone (for example, `can_be_false` of a relaxed
-        /// atom). So the leaf can be true, or false, only where all its atoms allow it, and the group's mask
-        /// is the intersection of the atoms' masks (see `BoolMask::intersect`). One exact atom keeps the
-        /// group exact, and an additional atom can only narrow the group's mask.
+        /// Each atom's truth is a check of the whole leaf. The leaf can have a value on some row of a range only if
+        /// no atom's truth has the value at `Never`. The group's truth is the `Truth::meet` of the atoms' truths. One
+        /// exact atom keeps the group exact, and an additional atom can only narrow the group's truth.
         std::vector<RPNElement> group_atoms;
 
         /// What functions are applied to the key column before doing the range/set/etc check.

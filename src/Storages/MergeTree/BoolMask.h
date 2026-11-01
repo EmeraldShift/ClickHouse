@@ -21,30 +21,16 @@ struct BoolMask
 
     bool operator==(const BoolMask & other) const { return can_be_true == other.can_be_true && can_be_false == other.can_be_false; }
 
-    /// Check if mask is no longer changeable under BoolMask::combine.
-    /// We use this condition to early-exit KeyConditions::checkInRange methods.
-    bool isComplete() const
-    {
-        return can_be_true && can_be_false;
-    }
-
     /// Combine check result in different hyperrectangles.
     static BoolMask combine(const BoolMask & left, const BoolMask & right)
     {
         return {left.can_be_true || right.can_be_true, left.can_be_false || right.can_be_false};
     }
 
-    /// Combine two checks of the same condition in the same hyperrectangle. A check may report a component
-    /// as possible although it is not, but never the other way around, so only what both allow is possible.
-    static BoolMask intersect(const BoolMask & left, const BoolMask & right)
-    {
-        return {left.can_be_true && right.can_be_true, left.can_be_false && right.can_be_false};
-    }
-
     /// The following two special constants are used to speed up
     /// KeyCondition::checkInRange. When used as an initial_mask argument, they
     /// effectively prevent calculation of discarded BoolMask component as it is
-    /// no longer changeable under BoolMask::combine (isComplete).
+    /// no longer changeable under BoolMask::combine.
     static const BoolMask consider_only_can_be_true;
     static const BoolMask consider_only_can_be_false;
 };

@@ -5205,7 +5205,7 @@ bool KeyCondition::extractAtomFromTree(const RPNBuilderTreeNode & node, const Bu
         return true;
     }
 
-    /// A group intersects the masks of its atoms (see `pushAtomGroupMask`), so each of them must be an atom
+    /// A group meets the truths of its atoms (see `pushAtomGroupTruth`). Each of them must be an atom
     /// or a constant.
     chassert(std::ranges::none_of(group.atoms, [](const RPNElement & atom)
     {
@@ -6617,7 +6617,7 @@ KeyCondition::Description KeyCondition::getDescription() const
         }
 
         /// Each atom bounds the whole predicate leaf. Intersect both components, as in
-        /// `pushAtomGroupMask`, so negation uses the same group semantics as evaluation.
+        /// `pushAtomGroupTruth`. Then negation uses the same group semantics as evaluation.
         for (size_t i = 0; i < element.group_atoms.size(); ++i)
         {
             const auto & atom = element.group_atoms[i];
@@ -6784,10 +6784,10 @@ KeyCondition::Description KeyCondition::getDescription() const
 
 /** For the range between tuples, determined by left_keys, left_bounded, right_keys, right_bounded,
   * invoke the callback on every hyperrectangle composing this range (see the description above),
-  * and returns the OR of the callback results (meaning if callback returned true on any part of the range).
+  * and returns the `Truth::hull` of the callback results. It stops once the hull covers `need`.
   */
 template <typename F>
-static BoolMask forAnyHyperrectangle(
+static Truth forAnyHyperrectangle(
     size_t key_size,
     const FieldRef * left_keys,
     const FieldRef * right_keys,
@@ -6797,7 +6797,7 @@ static BoolMask forAnyHyperrectangle(
     const DataTypes & data_types,
     const KeyOrder & key_order,
     size_t prefix_size,
-    BoolMask initial_mask,
+    const Truth & need,
     const Hyperrectangle * key_bounds,
     F && callback)
 {
@@ -6870,11 +6870,11 @@ static BoolMask forAnyHyperrectangle(
     for (size_t i = prefix_size + 1; i < key_size; ++i)
         hyperrectangle[i] = universe(i);
 
-    auto result = BoolMask::combine(initial_mask, callback(hyperrectangle));
+    auto result = callback(hyperrectangle);
 
     /// There are several early-exit conditions (like the one below) hereinafter.
     /// They provide significant speedup, which may be observed on merge_tree_huge_pk performance test.
-    if (result.isComplete())
+    if (result.covers(need))
         return result;
 
     /// [x1]       × [y1 .. +inf)
@@ -6882,13 +6882,13 @@ static BoolMask forAnyHyperrectangle(
     if (left_bounded)
     {
         hyperrectangle[prefix_size] = Range(left_keys[prefix_size]);
-        result = BoolMask::combine(
+        result = Truth::hull(
             result,
             forAnyHyperrectangle(
                 key_size, left_keys, right_keys, true, false, hyperrectangle, data_types, key_order,
-                prefix_size + 1, initial_mask, key_bounds, callback));
+                prefix_size + 1, need, key_bounds, callback));
 
-        if (result.isComplete())
+        if (result.covers(need))
             return result;
     }
 
@@ -6897,11 +6897,11 @@ static BoolMask forAnyHyperrectangle(
     if (right_bounded)
     {
         hyperrectangle[prefix_size] = Range(right_keys[prefix_size]);
-        result = BoolMask::combine(
+        result = Truth::hull(
             result,
             forAnyHyperrectangle(
                 key_size, left_keys, right_keys, false, true, hyperrectangle, data_types, key_order,
-                prefix_size + 1, initial_mask, key_bounds, callback));
+                prefix_size + 1, need, key_bounds, callback));
     }
 
     return result;
@@ -6909,7 +6909,7 @@ static BoolMask forAnyHyperrectangle(
 
 /** For the range between tuples, determined by sparse_left_keys, left_bounded, sparse_right_keys, right_bounded,
   * invoke the callback on every hyperrectangle composing this range (see the description above),
-  * and returns the OR of the callback results (meaning if callback returned true on any part of the range).
+  * and returns the `Truth::hull` of the callback results. It stops once the hull covers `need`.
   *
   * In the above implementation, notice that we will need to create `Range` objects many many times, especially for suffix of the
   * hyperrectangle. However, this is a problem if PK is very long but filter only uses few key columns only because creating
@@ -6930,7 +6930,7 @@ static BoolMask forAnyHyperrectangle(
   * sparse key column information.
   */
 template <typename F>
-static BoolMask forAnySparseHyperrectangle(
+static Truth forAnySparseHyperrectangle(
     const std::vector<size_t> & sparse_key_indices,
     const std::vector<int> & key_col_to_sparse_pos,
     const FieldRef * sparse_left_keys,
@@ -6943,7 +6943,7 @@ static BoolMask forAnySparseHyperrectangle(
     const DataTypes & sparse_data_types,
     const KeyOrder & key_order,
     size_t prefix_size,
-    BoolMask initial_mask,
+    const Truth & need,
     const Hyperrectangle * key_bounds,
     F && callback)
 {
@@ -7073,11 +7073,10 @@ static BoolMask forAnySparseHyperrectangle(
         sparse_hyperrectangle[sparse_pos] = universe(sparse_pos, key_index);
     }
 
-    auto result = BoolMask::combine(initial_mask, callback(sparse_hyperrectangle));
+    auto result = callback(sparse_hyperrectangle);
 
-    /// isComplete() means that both `can_be_true` = true and ``can_be_false` = true. No `result = BoolMask::combine(result, ...)`
-    /// can change `result` anymore. So, there is no need to continue.
-    if (result.isComplete())
+    /// No `Truth::hull` can change what the caller reads anymore.
+    if (result.covers(need))
         return result;
 
     /// [x1]       × [y1 .. +inf)
@@ -7089,7 +7088,7 @@ static BoolMask forAnySparseHyperrectangle(
             sparse_hyperrectangle[sparse_pos] = Range(sparse_left_keys[sparse_pos]);
         }
 
-        result = BoolMask::combine(
+        result = Truth::hull(
             result,
             forAnySparseHyperrectangle(
                 sparse_key_indices,
@@ -7104,11 +7103,11 @@ static BoolMask forAnySparseHyperrectangle(
                 sparse_data_types,
                 key_order,
                 prefix_size + 1,
-                initial_mask,
+                need,
                 key_bounds,
                 callback));
 
-        if (result.isComplete())
+        if (result.covers(need))
             return result;
     }
 
@@ -7121,7 +7120,7 @@ static BoolMask forAnySparseHyperrectangle(
             sparse_hyperrectangle[sparse_pos] = Range(sparse_right_keys[sparse_pos]);
         }
 
-        result = BoolMask::combine(
+        result = Truth::hull(
             result,
             forAnySparseHyperrectangle(
                 sparse_key_indices,
@@ -7136,7 +7135,7 @@ static BoolMask forAnySparseHyperrectangle(
                 sparse_data_types,
                 key_order,
                 prefix_size + 1,
-                initial_mask,
+                need,
                 key_bounds,
                 callback));
     }
@@ -7152,6 +7151,17 @@ BoolMask KeyCondition::checkInRange(
     BoolMask initial_mask,
     const Hyperrectangle * key_bounds) const
 {
+    return checkBoundsInRange(used_key_size, left_keys, right_keys, data_types, Truth::need(initial_mask), key_bounds).mask();
+}
+
+Truth KeyCondition::checkBoundsInRange(
+    size_t used_key_size,
+    const FieldRef * left_keys,
+    const FieldRef * right_keys,
+    const DataTypes & data_types,
+    const Truth & need,
+    const Hyperrectangle * key_bounds) const
+{
     chassert(key_order.compareTuples(left_keys, right_keys, used_key_size) <= 0);
 
     Hyperrectangle key_ranges;
@@ -7159,10 +7169,10 @@ BoolMask KeyCondition::checkInRange(
     for (size_t i = 0; i < used_key_size; ++i)
         key_ranges.push_back(Range::createWholeUniverseTypeAware(data_types[i]));
 
-    return forAnyHyperrectangle(used_key_size, left_keys, right_keys, true, true, key_ranges, data_types, key_order, 0, initial_mask, key_bounds,
+    return forAnyHyperrectangle(used_key_size, left_keys, right_keys, true, true, key_ranges, data_types, key_order, 0, need, key_bounds,
         [&] (const Hyperrectangle & key_ranges_hyperrectangle)
     {
-        return checkInHyperrectangle(key_ranges_hyperrectangle, data_types);
+        return checkBoundsInHyperrectangle(key_ranges_hyperrectangle, data_types);
     });
 }
 
@@ -7174,6 +7184,20 @@ BoolMask KeyCondition::checkInRange(
     const DataTypes & sparse_data_types,
     const std::vector<UInt8> & equal_boundaries_mask,
     BoolMask initial_mask,
+    const Hyperrectangle * key_bounds) const
+{
+    return checkBoundsInRange(
+        sparse_key_indices, sparse_left_keys, sparse_right_keys, sparse_data_types, equal_boundaries_mask,
+        Truth::need(initial_mask), key_bounds).mask();
+}
+
+Truth KeyCondition::checkBoundsInRange(
+    const std::vector<size_t> & sparse_key_indices,
+    const FieldRef * sparse_left_keys,
+    const FieldRef * sparse_right_keys,
+    const DataTypes & sparse_data_types,
+    const std::vector<UInt8> & equal_boundaries_mask,
+    const Truth & need,
     const Hyperrectangle * key_bounds) const
 {
     const size_t sparse_keys_size = sparse_key_indices.size();
@@ -7230,11 +7254,11 @@ BoolMask KeyCondition::checkInRange(
         sparse_data_types,
         key_order,
         /*prefix_size*/ 0,
-        initial_mask,
+        need,
         key_bounds,
         [&](const Hyperrectangle & key_ranges_hyperrectangle)
         {
-            return checkInHyperrectangle(key_col_to_sparse_pos, key_ranges_hyperrectangle, sparse_data_types);
+            return checkBoundsInHyperrectangle(key_col_to_sparse_pos, key_ranges_hyperrectangle, sparse_data_types);
         });
 }
 
@@ -7880,20 +7904,19 @@ bool rangeOfKeyColumnMayHoldNull(
         || (atomMayClaimNestedNullOrNaN(element) && keyTypeMayHoldNestedNullOrNaN(key_type));
 }
 
-/// Pushes the mask of an atom group, given `apply_element`, which pushes the mask of one atom. Each atom
-/// bounds the mask of the whole predicate leaf, so the group's mask is their intersection (see
-/// `KeyCondition::RPNElement::group_atoms`).
+/// Pushes the truth of an atom group. `apply_element` pushes the truth of one atom. Each atom bounds the truth
+/// of the whole predicate leaf, and the group's truth is their meet (see `KeyCondition::RPNElement::group_atoms`).
 template <typename ApplyElement, typename Stack>
-void pushAtomGroupMask(const KeyCondition::RPNElement & group, const ApplyElement & apply_element, Stack & rpn_stack)
+void pushAtomGroupTruth(const KeyCondition::RPNElement & group, const ApplyElement & apply_element, Stack & rpn_stack)
 {
-    BoolMask group_mask(true, true);
+    std::optional<Truth> group_truth;
     for (const auto & atom : group.group_atoms)
     {
         apply_element(atom);
-        group_mask = BoolMask::intersect(group_mask, rpn_stack.back());
+        group_truth = group_truth ? Truth::meet(*group_truth, rpn_stack.back()) : rpn_stack.back();
         rpn_stack.pop_back();
     }
-    rpn_stack.push_back(group_mask);
+    rpn_stack.push_back(*group_truth);
 }
 
 /// Whether the atom answers NULL - and hence "not true" to `WHERE` - for a NULL argument, instead of
@@ -7920,6 +7943,22 @@ bool atomIsNullForNullArgument(KeyCondition::RPNElement::Function function)
         case KeyCondition::RPNElement::ALWAYS_TRUE:
             return false;
     }
+}
+
+/// The truth of an atom on a range, from the check of its positive form. The positive form of `x NOT IN (1, 2)` is
+/// `x IN (1, 2)`.
+ALWAYS_INLINE Truth atomTruth(const KeyCondition::RPNElement & element, Truth range_check)
+{
+    using RPNElement = KeyCondition::RPNElement;
+
+    if (element.relaxed)
+        range_check = range_check.relaxed();
+
+    if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE || element.function == RPNElement::FUNCTION_NOT_IN_SET
+        || element.function == RPNElement::FUNCTION_IS_NULL)
+        return !range_check;
+
+    return range_check;
 }
 
 }
@@ -8012,7 +8051,22 @@ BoolMask KeyCondition::checkInHyperrectangle(
     const ColumnIndexToBloomFilter & column_index_to_column_bf,
     const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
 {
-    absl::InlinedVector<BoolMask, 16> rpn_stack;
+    return checkBoundsInHyperrectangle(hyperrectangle, data_types, column_index_to_column_bf, update_partial_disjunction_result_fn).mask();
+}
+
+Truth KeyCondition::checkBoundsInHyperrectangle(
+    const Hyperrectangle & hyperrectangle,
+    const DataTypes & data_types,
+    const ColumnIndexToBloomFilter & column_index_to_column_bf,
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
+{
+    absl::InlinedVector<Truth, 16> rpn_stack;
+
+    /// Pushes the truth of an atom from the check of its positive form, see `atomTruth`.
+    auto push_atom = [&](const RPNElement & element, BoolMask range_check) ALWAYS_INLINE
+    {
+        rpn_stack.push_back(atomTruth(element, Truth::check(range_check)));
+    };
 
     auto curve_type = [&](size_t key_column_pos)
     {
@@ -8032,12 +8086,12 @@ BoolMask KeyCondition::checkInHyperrectangle(
         {
             /// If a condition on argument of a space filling curve wasn't collapsed into FUNCTION_ARGS_IN_HYPERRECTANGLE,
             /// we cannot process it.
-            rpn_stack.emplace_back(true, true);
+            rpn_stack.emplace_back(Truth::unknown());
             return false;
         }
         if (element.function == RPNElement::FUNCTION_UNKNOWN)
         {
-            rpn_stack.emplace_back(true, true);
+            rpn_stack.emplace_back(Truth::unknown());
             return false;
         }
 
@@ -8047,7 +8101,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             size_t key_column = element.getKeyColumn();
             if (key_column >= hyperrectangle.size())
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::unknown());
                 return false;
             }
 
@@ -8082,7 +8136,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
                 if (!new_range)
                 {
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::check(true, true, true));
                     return false;
                 }
                 key_range_storage = *new_range;
@@ -8119,26 +8173,13 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 contains = false;
             }
 
-            rpn_stack.emplace_back(intersects, !contains);
+            BoolMask range_check(intersects, !contains);
 
             // we don't create bloom_filter_data if monotonic_functions_chain is present
-            if (rpn_stack.back().can_be_true && element.bloom_filter_data && element.monotonic_functions_chain.empty())
-            {
-                rpn_stack.back().can_be_true = mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf);
-            }
+            if (range_check.can_be_true && element.bloom_filter_data && element.monotonic_functions_chain.empty() && !mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf))
+                range_check = BoolMask(false, true);
 
-            /// If the condition is relaxed, the `can_be_false` branch is no longer reliable; it may have false negatives.
-            /// If `element.range` is relaxed (and thus wider) and contains `key_range`, then `can_be_false` becomes false.
-            /// However, in reality `can_be_false` may be true, because the actual range of element may be stricter than `element.range`.
-            /// For example, for `match(...)`, a false negative here (i.e. `can_be_false` is false) would make
-            /// `not match(...)` set `can_be_true = false`, causing us to skip the granule, which would be incorrect.
-            /// Therefore, we must set `can_be_false = true` to be safe.
-            /// Additionally, when `KeyCondition::isRelaxed()` is true, the caller should ignore `can_be_false` anyway.
-            if (element.relaxed)
-                rpn_stack.back().can_be_false = true;
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
-                rpn_stack.back() = !rpn_stack.back();
+            push_atom(element, range_check);
         }
         else if (element.function == RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE)
         {
@@ -8173,11 +8214,12 @@ BoolMask KeyCondition::checkInHyperrectangle(
             size_t key_column = element.getKeyColumn();
             if (key_column >= hyperrectangle.size())
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::unknown());
                 return false;
             }
 
             Range key_range = hyperrectangle[key_column];
+            BoolMask range_check(true, true);
 
             /// The only possible result type of a space filling curve is UInt64.
             /// We also only check bounded ranges.
@@ -8233,17 +8275,17 @@ BoolMask KeyCondition::checkInHyperrectangle(
                         }
                     }
 
-                    rpn_stack.emplace_back(mask);
+                    range_check = mask;
                 }
                 else
                 {
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::unknown());
                     return false;
                 }
             }
             else
             {
-                rpn_stack.emplace_back(true, true);
+                push_atom(element, BoolMask(true, true));
                 return false;
             }
 
@@ -8260,6 +8302,8 @@ BoolMask KeyCondition::checkInHyperrectangle(
               * This approach is generalizable to any functions, that have preimage of interval
               * represented by a set of hyperrectangles.
               */
+
+            push_atom(element, range_check);
         }
         else if (element.function == RPNElement::FUNCTION_POINT_IN_POLYGON)
         {
@@ -8284,7 +8328,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 /// The point is a whole key column of type Tuple of two coordinates (e.g. `Point`).
                 if (element.key_columns[0] >= hyperrectangle.size())
                 {
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::unknown());
                     return false;
                 }
 
@@ -8294,7 +8338,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             {
                 if (element.key_columns[0] >= hyperrectangle.size() || element.key_columns[1] >= hyperrectangle.size())
                 {
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::unknown());
                     return false;
                 }
 
@@ -8309,7 +8353,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
             if (unlikely(std::isnan(x_min) || std::isnan(x_max) || std::isnan(y_min) || std::isnan(y_max)))
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::check(true, true, true));
                 return false;
             }
 
@@ -8331,13 +8375,13 @@ BoolMask KeyCondition::checkInHyperrectangle(
             if (disjoint)
             {
                 // Indices box does not overlap with polygon bbox. So we can skip expensive `boost::geometry::intersects` call
-                rpn_stack.emplace_back(false, true);
+                push_atom(element, BoolMask(false, true));
                 return true;
             }
 
             /// Because the polygon may have a hole so the "can_be_false" should always be true.
             bool intersects = boost::geometry::intersects(index_box, element.polygon->ring);
-            rpn_stack.emplace_back(intersects, true);
+            push_atom(element, BoolMask(intersects, true));
         }
         else if (
             element.function == RPNElement::FUNCTION_IS_NULL
@@ -8346,7 +8390,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             size_t key_column = element.getKeyColumn();
             if (key_column >= hyperrectangle.size())
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::unknown());
                 return false;
             }
 
@@ -8356,13 +8400,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             bool intersects = element.range.intersectsRange(*key_range);
             bool contains = element.range.containsRange(*key_range);
 
-            rpn_stack.emplace_back(intersects, !contains);
-
-            if (element.relaxed)
-                rpn_stack.back().can_be_false = true;
-
-            if (element.function == RPNElement::FUNCTION_IS_NULL)
-                rpn_stack.back() = !rpn_stack.back();
+            push_atom(element, BoolMask(intersects, !contains));
         }
         else if (
             element.function == RPNElement::FUNCTION_IN_SET
@@ -8412,21 +8450,12 @@ BoolMask KeyCondition::checkInHyperrectangle(
             /// E.g. (20, 300, 1500) satisfies the second condition but not the first,
             /// but  (20, 150, 3000) satisfies the first condition but not the second.
 
-            rpn_stack.emplace_back(element.set_index->checkInRange(hyperrectangle, data_types, element.first_function_number, single_point));
+            BoolMask range_check = element.set_index->checkInRange(hyperrectangle, data_types, element.first_function_number, single_point);
 
-            if (rpn_stack.back().can_be_true && element.bloom_filter_data)
-            {
-                rpn_stack.back().can_be_true = mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf);
-            }
+            if (range_check.can_be_true && element.bloom_filter_data && !mayExistOnBloomFilter(*element.bloom_filter_data, column_index_to_column_bf))
+                range_check = BoolMask(false, true);
 
-            /// If the condition is relaxed, the `can_be_false` branch is no longer reliable; it may have false negatives.
-            /// Additionally, when `KeyCondition::isRelaxed()` is true, the caller should ignore `can_be_false` anyway.
-            /// Therefore, we must set `can_be_false = true` to be safe.
-            if (element.relaxed)
-                rpn_stack.back().can_be_false = true;
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
-                rpn_stack.back() = !rpn_stack.back();
+            push_atom(element, range_check);
         }
         else if (element.function == RPNElement::FUNCTION_NOT)
         {
@@ -8454,11 +8483,11 @@ BoolMask KeyCondition::checkInHyperrectangle(
         }
         else if (element.function == RPNElement::ALWAYS_FALSE)
         {
-            rpn_stack.emplace_back(false, true);
+            rpn_stack.emplace_back(Truth::check(BoolMask(false, true)));
         }
         else if (element.function == RPNElement::ALWAYS_TRUE)
         {
-            rpn_stack.emplace_back(true, false);
+            rpn_stack.emplace_back(Truth::check(BoolMask(true, false)));
         }
         else
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected function type in KeyCondition::RPNElement");
@@ -8473,14 +8502,14 @@ BoolMask KeyCondition::checkInHyperrectangle(
         bool evaluated = false;
         if (element.function == RPNElement::FUNCTION_ATOM_GROUP)
         {
-            /// The mask of a group intersects the masks of its atoms, so it claims something as soon as
-            /// one atom is evaluated.
+            /// The truth of a group is the meet of the truths of its atoms. The group's truth is narrower than
+            /// `Truth::unknown` as soon as one atom is evaluated.
             const auto apply_atom = [&](const RPNElement & atom)
             {
                 if (apply_element(atom))
                     evaluated = true;
             };
-            pushAtomGroupMask(element, apply_atom, rpn_stack);
+            pushAtomGroupTruth(element, apply_atom, rpn_stack);
         }
         else
         {
@@ -8488,14 +8517,14 @@ BoolMask KeyCondition::checkInHyperrectangle(
         }
 
         if (update_partial_disjunction_result_fn && element.position_in_filter_rpn)
-            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().can_be_true, !evaluated);
+            update_partial_disjunction_result_fn(*element.position_in_filter_rpn, rpn_stack.back().mask().can_be_true, !evaluated);
     }
 
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
 
-    if (unlikely(!rpn_stack[0].can_be_false && mayReadNullKeyValue(hyperrectangle, data_types)))
-        rpn_stack[0].can_be_false = true;
+    if (unlikely(rpn_stack[0].is_true.level() == Side::Always && mayReadNullKeyValue(hyperrectangle, data_types)))
+        rpn_stack[0] = rpn_stack[0].withNull();
 
     return rpn_stack[0];
 }
@@ -8505,13 +8534,27 @@ BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & sparse_hyperrectangle,
     const DataTypes & sparse_data_types) const
 {
-    absl::InlinedVector<BoolMask, 16> rpn_stack;
+    return checkBoundsInHyperrectangle(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types).mask();
+}
+
+Truth KeyCondition::checkBoundsInHyperrectangle(
+    const std::vector<int> & key_col_to_sparse_pos,
+    const Hyperrectangle & sparse_hyperrectangle,
+    const DataTypes & sparse_data_types) const
+{
+    absl::InlinedVector<Truth, 16> rpn_stack;
 
     auto get_sparse_info = [&](size_t key_column) -> std::pair<bool, size_t>
     {
         bool is_key_col_present = (key_column < key_col_to_sparse_pos.size() && key_col_to_sparse_pos[key_column] != -1);
         const size_t sparse_pos = is_key_col_present ? static_cast<size_t>(key_col_to_sparse_pos[key_column]) : 0;
         return {is_key_col_present, sparse_pos};
+    };
+
+    /// Pushes the truth of an atom from the check of its positive form, see `atomTruth`.
+    auto push_atom = [&](const RPNElement & element, BoolMask range_check) ALWAYS_INLINE
+    {
+        rpn_stack.push_back(atomTruth(element, Truth::check(range_check)));
     };
 
     auto curve_type = [&](size_t key_column_pos)
@@ -8529,11 +8572,11 @@ BoolMask KeyCondition::checkInHyperrectangle(
         {
             /// If a condition on argument of a space filling curve wasn't collapsed into FUNCTION_ARGS_IN_HYPERRECTANGLE,
             /// we cannot process it.
-            rpn_stack.emplace_back(true, true);
+            rpn_stack.emplace_back(Truth::unknown());
         }
         else if (element.function == RPNElement::FUNCTION_UNKNOWN)
         {
-            rpn_stack.emplace_back(true, true);
+            rpn_stack.emplace_back(Truth::unknown());
         }
         else if (element.function == RPNElement::FUNCTION_IN_RANGE
               || element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
@@ -8544,7 +8587,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
             if (!is_key_col_present)
             {
                 /// Column not represented – treat as unknown for index pruning.
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::unknown());
             }
             else
             {
@@ -8569,7 +8612,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 if (!new_range)
                 {
                     /// Cannot determine monotonicity on this range – unknown.
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::check(true, true, true));
                 }
                 else
                 {
@@ -8601,22 +8644,9 @@ BoolMask KeyCondition::checkInHyperrectangle(
                         contains = false;
                     }
 
-                    rpn_stack.emplace_back(intersects, !contains);
+                    push_atom(element, BoolMask(intersects, !contains));
                 }
             }
-
-            /// If the condition is relaxed, the `can_be_false` branch is no longer reliable; it may have false negatives.
-            /// If `element.range` is relaxed (and thus wider) and contains `key_range`, then `can_be_false` becomes false.
-            /// However, in reality `can_be_false` may be true, because the actual range of element may be stricter than `element.range`.
-            /// For example, for `match(...)`, a false negative here (i.e. `can_be_false` is false) would make
-            /// `not match(...)` set `can_be_true = false`, causing us to skip the granule, which would be incorrect.
-            /// Therefore, we must set `can_be_false = true` to be safe.
-            /// Additionally, when `KeyCondition::isRelaxed()` is true, the caller should ignore `can_be_false` anyway.
-            if (element.relaxed)
-                rpn_stack.back().can_be_false = true;
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE)
-                rpn_stack.back() = !rpn_stack.back();
         }
         else if (element.function == RPNElement::FUNCTION_ARGS_IN_HYPERRECTANGLE)
         {
@@ -8653,7 +8683,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
             if (!is_key_col_present)
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::unknown());
             }
             else
             {
@@ -8713,16 +8743,16 @@ BoolMask KeyCondition::checkInHyperrectangle(
                             }
                         }
 
-                        rpn_stack.emplace_back(mask);
+                        push_atom(element, mask);
                     }
                     else
                     {
-                        rpn_stack.emplace_back(true, true);
+                        push_atom(element, BoolMask(true, true));
                     }
                 }
                 else
                 {
-                    rpn_stack.emplace_back(true, true);
+                    push_atom(element, BoolMask(true, true));
                 }
             }
 
@@ -8765,7 +8795,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
                 if (!is_key_col_present)
                 {
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::unknown());
                     return;
                 }
 
@@ -8782,7 +8812,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 if (!is_x_key_col_present && !is_y_key_col_present)
                 {
                     /// Neither coordinate is available — nothing to prune on.
-                    rpn_stack.emplace_back(true, true);
+                    rpn_stack.emplace_back(Truth::unknown());
                     return;
                 }
 
@@ -8813,7 +8843,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
             if (unlikely(std::isnan(x_min) || std::isnan(x_max) || std::isnan(y_min) || std::isnan(y_max)))
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::check(true, true, true));
                 return;
             }
 
@@ -8835,13 +8865,13 @@ BoolMask KeyCondition::checkInHyperrectangle(
             if (disjoint)
             {
                 // Index box does not overlap with polygon bbox. So we can skip expensive `boost::geometry::intersects` call
-                rpn_stack.emplace_back(false, true);
+                push_atom(element, BoolMask(false, true));
                 return;
             }
 
             /// Because the polygon may have a hole so the "can_be_false" should always be true.
             bool intersects = boost::geometry::intersects(index_box, element.polygon->ring);
-            rpn_stack.emplace_back(intersects, true);
+            push_atom(element, BoolMask(intersects, true));
         }
         else if (element.function == RPNElement::FUNCTION_IS_NULL
               || element.function == RPNElement::FUNCTION_IS_NOT_NULL)
@@ -8851,7 +8881,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
 
             if (!is_key_col_present)
             {
-                rpn_stack.emplace_back(true, true);
+                rpn_stack.emplace_back(Truth::unknown());
             }
             else
             {
@@ -8861,13 +8891,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
                 bool intersects = element.range.intersectsRange(*key_range);
                 bool contains   = element.range.containsRange(*key_range);
 
-                rpn_stack.emplace_back(intersects, !contains);
-
-                if (element.relaxed)
-                    rpn_stack.back().can_be_false = true;
-
-                if (element.function == RPNElement::FUNCTION_IS_NULL)
-                    rpn_stack.back() = !rpn_stack.back();
+                push_atom(element, BoolMask(intersects, !contains));
             }
         }
         else if (element.function == RPNElement::FUNCTION_IN_SET
@@ -8917,17 +8941,10 @@ BoolMask KeyCondition::checkInHyperrectangle(
             /// E.g. (20, 300, 1500) satisfies the second condition but not the first,
             /// but  (20, 150, 3000) satisfies the first condition but not the second.
 
-            rpn_stack.emplace_back(element.set_index->checkInRange(
-                key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types, element.first_function_number, single_point));
-
-            /// If the condition is relaxed, the `can_be_false` branch is no longer reliable; it may have false negatives.
-            /// Additionally, when `KeyCondition::isRelaxed()` is true, the caller should ignore `can_be_false` anyway.
-            /// Therefore, we must set `can_be_false = true` to be safe.
-            if (element.relaxed)
-                rpn_stack.back().can_be_false = true;
-
-            if (element.function == RPNElement::FUNCTION_NOT_IN_SET)
-                rpn_stack.back() = !rpn_stack.back();
+            push_atom(
+                element,
+                element.set_index->checkInRange(
+                    key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types, element.first_function_number, single_point));
         }
         else if (element.function == RPNElement::FUNCTION_NOT)
         {
@@ -8957,11 +8974,11 @@ BoolMask KeyCondition::checkInHyperrectangle(
         }
         else if (element.function == RPNElement::ALWAYS_FALSE)
         {
-            rpn_stack.emplace_back(false, true);
+            rpn_stack.emplace_back(Truth::check(BoolMask(false, true)));
         }
         else if (element.function == RPNElement::ALWAYS_TRUE)
         {
-            rpn_stack.emplace_back(true, false);
+            rpn_stack.emplace_back(Truth::check(BoolMask(true, false)));
         }
         else
         {
@@ -8972,7 +8989,7 @@ BoolMask KeyCondition::checkInHyperrectangle(
     for (const auto & element : rpn)
     {
         if (element.function == RPNElement::FUNCTION_ATOM_GROUP)
-            pushAtomGroupMask(element, apply_element, rpn_stack);
+            pushAtomGroupTruth(element, apply_element, rpn_stack);
         else
             apply_element(element);
     }
@@ -8980,8 +8997,9 @@ BoolMask KeyCondition::checkInHyperrectangle(
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
 
-    if (unlikely(!rpn_stack[0].can_be_false && mayReadNullKeyValue(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types)))
-        rpn_stack[0].can_be_false = true;
+    if (unlikely(rpn_stack[0].is_true.level() == Side::Always
+                 && mayReadNullKeyValue(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types)))
+        rpn_stack[0] = rpn_stack[0].withNull();
 
     return rpn_stack[0];
 }
