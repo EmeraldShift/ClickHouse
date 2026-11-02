@@ -9277,8 +9277,7 @@ String KeyCondition::RPNElement::toString(const std::vector<String> & key_names)
 
 Truth KeyCondition::checkBoundsOnAnyRange() const
 {
-    /// `force_primary_key` counts every atom on the key as using the key, even a negated relaxed atom that never excludes
-    /// a range. Every atom on the key reads as exact here.
+    /// A negated relaxed atom excludes no range, and `force_primary_key` rejects it.
     std::vector<Truth> rpn_stack;
     const auto push_atom = [&](const RPNElement & element)
     {
@@ -9289,7 +9288,7 @@ Truth KeyCondition::checkBoundsOnAnyRange() const
         else if (element.function == RPNElement::ALWAYS_FALSE)
             rpn_stack.push_back(Truth::check(BoolMask(false, true)));
         else
-            rpn_stack.push_back(Truth::check(true, true, true));
+            rpn_stack.push_back(atomTruth(element, Truth::check(true, true, true)));
     };
 
     for (const auto & element : rpn)
