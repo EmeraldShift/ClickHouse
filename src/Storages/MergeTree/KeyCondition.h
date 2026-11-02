@@ -159,11 +159,13 @@ public:
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types) const;
 
-    /// The truth that the optimized overload of `checkInHyperrectangle` returns the `mask()` of.
+    /// An atom only on key columns from `num_refinable_key_columns` on is fixed (see `Truth::fixed`). The caller
+    /// gives those columns the same range on every call.
     Truth checkBoundsInHyperrectangle(
         const std::vector<int> & key_col_to_sparse_pos,
         const Hyperrectangle & sparse_hyperrectangle,
-        const DataTypes & sparse_data_types) const;
+        const DataTypes & sparse_data_types,
+        size_t num_refinable_key_columns) const;
 
     /// Whether the condition and its negation are (independently) feasible in the key range.
     /// left_key and right_key must contain all fields in the sort_descr in the appropriate order.
@@ -214,7 +216,8 @@ public:
         BoolMask initial_mask,
         const Hyperrectangle * key_bounds = nullptr) const;
 
-    /// The truth that the optimized overload of `checkInRange` returns the `mask()` of.
+    /// Atoms only on the constant coordinates are fixed (see `Truth::fixed`), and so are atoms only on columns
+    /// missing from `sparse_key_indices`.
     Truth checkBoundsInRange(
         const std::vector<size_t> & sparse_key_indices,
         const FieldRef * sparse_left_keys,
@@ -249,13 +252,6 @@ public:
     /// Impose an additional condition: the value in the column `column` must be in the range `range`.
     /// Returns whether there is such a column in the key.
     bool addCondition(const String & column, const Range & range);
-
-    /// Checks if the condition has unknown atoms.
-    bool hasUnknownAtoms() const;
-
-    /// A copy where every atom that cannot be evaluated is replaced with the constant that maximizes the condition.
-    /// It has the same `can_be_true` on every range, but `can_be_false` is not exact, so it must not be used for exact ranges.
-    KeyCondition createWithUnknownAtomsAssumedTrue() const;
 
     String toString() const;
 

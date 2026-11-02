@@ -1890,25 +1890,6 @@ bool KeyCondition::addCondition(const String & column, const Range & range)
     return true;
 }
 
-bool KeyCondition::hasUnknownAtoms() const
-{
-    return std::ranges::any_of(expandAtomGroups(rpn), [](const RPNElement & element)
-    {
-        return element.function == RPNElement::FUNCTION_UNKNOWN;
-    });
-}
-
-KeyCondition KeyCondition::createWithUnknownAtomsAssumedTrue() const
-{
-    KeyCondition result = *this;
-    forEachAtomWithPolarity(result.rpn, [](RPNElement & atom, bool positive)
-    {
-        if (atom.function == RPNElement::FUNCTION_UNKNOWN)
-            atom = RPNElement(positive ? RPNElement::ALWAYS_TRUE : RPNElement::ALWAYS_FALSE);
-    });
-    return result;
-}
-
 bool KeyCondition::hasOnlyConjunctions() const
 {
     return std::ranges::none_of(rpn, [](const RPNElement & element) { return element.function == RPNElement::FUNCTION_OR; });
@@ -7258,7 +7239,9 @@ Truth KeyCondition::checkBoundsInRange(
         key_bounds,
         [&](const Hyperrectangle & key_ranges_hyperrectangle)
         {
-            return checkBoundsInHyperrectangle(key_col_to_sparse_pos, key_ranges_hyperrectangle, sparse_data_types);
+            return checkBoundsInHyperrectangle(
+                key_col_to_sparse_pos, key_ranges_hyperrectangle, sparse_data_types,
+                /*num_refinable_key_columns=*/ enumerated_key_prefix_size);
         });
 }
 
@@ -8534,14 +8517,23 @@ BoolMask KeyCondition::checkInHyperrectangle(
     const Hyperrectangle & sparse_hyperrectangle,
     const DataTypes & sparse_data_types) const
 {
-    return checkBoundsInHyperrectangle(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types).mask();
+    return checkBoundsInHyperrectangle(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types, key_col_to_sparse_pos.size()).mask();
 }
 
 Truth KeyCondition::checkBoundsInHyperrectangle(
     const std::vector<int> & key_col_to_sparse_pos,
     const Hyperrectangle & sparse_hyperrectangle,
-    const DataTypes & sparse_data_types) const
+    const DataTypes & sparse_data_types,
+    size_t num_refinable_key_columns) const
 {
+    /// The other key columns have the same range on every range the caller checks. A key column that the part doesn't load
+    /// in memory is one. Only the partition minmax index bounds it, for the whole part.
+    auto is_fixed_atom = [&](const RPNElement & element)
+    {
+        return !element.key_columns.empty()
+            && std::ranges::all_of(element.key_columns, [&](size_t column) { return column >= num_refinable_key_columns; });
+    };
+
     absl::InlinedVector<Truth, 16> rpn_stack;
 
     auto get_sparse_info = [&](size_t key_column) -> std::pair<bool, size_t>
@@ -8986,12 +8978,19 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
         }
     };
 
+    const auto apply_atom = [&](const RPNElement & element)
+    {
+        apply_element(element);
+        if (is_fixed_atom(element))
+            rpn_stack.back() = rpn_stack.back().fixed();
+    };
+
     for (const auto & element : rpn)
     {
         if (element.function == RPNElement::FUNCTION_ATOM_GROUP)
-            pushAtomGroupTruth(element, apply_element, rpn_stack);
+            pushAtomGroupTruth(element, apply_atom, rpn_stack);
         else
-            apply_element(element);
+            apply_atom(element);
     }
 
     if (rpn_stack.size() != 1)
