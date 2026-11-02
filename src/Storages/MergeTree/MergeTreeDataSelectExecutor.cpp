@@ -2431,11 +2431,6 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
         return part_ranges;
 
-    /// If conditions are relaxed, don't fill exact ranges.
-    if (key_condition.isRelaxed() || (part_offset_condition && part_offset_condition->isRelaxed())
-        || (total_offset_condition && total_offset_condition->isRelaxed()))
-        exact_ranges = nullptr;
-
     const auto & primary_key = metadata_snapshot->getPrimaryKey();
     /// The columns are unnamed, because `KeyCondition` names the function results it caches in this block.
     auto index_columns = std::make_shared<ColumnsWithTypeAndName>();
@@ -2696,6 +2691,8 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     std::vector<FieldRef> part_offset_left(2);
     std::vector<FieldRef> part_offset_right(2);
 
+    const bool key_types_may_hold_null = KeyCondition::keyTypesMayHoldNull(use_sparse_pk_representation ? sparse_key_types : key_types);
+
     auto check_bounds_in_range = [&](const MarkRange & range, Truth need)
     {
         auto check_key_condition = [&]() -> Truth
@@ -2765,7 +2762,8 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     sparse_key_types,
                     equal_boundaries_mask,
                     need,
-                    &index_bounds);
+                    &index_bounds,
+                    key_types_may_hold_null);
             }
 
             if (range.end == marks_count)
@@ -2807,7 +2805,7 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                 }
             }
             return key_condition.checkBoundsInRange(
-                used_key_size, index_left.data(), index_right.data(), key_types, need, &index_bounds);
+                used_key_size, index_left.data(), index_right.data(), key_types, need, &index_bounds, key_types_may_hold_null);
         };
 
         auto check_part_offset_condition = [&]() -> Truth
@@ -2993,18 +2991,18 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
                     if (result_exact_range.begin < result_exact_range.end)
                     {
                         const size_t num_unevaluable_before = KeyCondition::getNumUnevaluableChainApplications();
-                        const bool exact_range_can_be_false
-                            = check_in_range(result_exact_range, BoolMask::consider_only_can_be_false).can_be_false;
+                        const Side exact_range_is_true = check_bounds_in_range(result_exact_range, Truth{}).is_true;
                         /// A monotonic function chain that could not be evaluated on the range answers "unknown":
                         /// an over-approximation that supports no exactness claim and contradicts none either.
                         const bool exact_range_unevaluable
                             = KeyCondition::getNumUnevaluableChainApplications() != num_unevaluable_before;
 
-                        if (exact_range_unevaluable)
+                        /// So does a check where no subrange can be at `Always`. The check of a relaxed atom is such a check.
+                        if (exact_range_unevaluable || !exact_range_is_true.mayBeAlways())
                         {
                             /// Neither an exact range nor an inconsistency.
                         }
-                        else if (exact_range_can_be_false)
+                        else if (exact_range_is_true.level() != Side::Always)
                         {
                             /// key_condition.matchesExactContinuousRange returned true, but the
                             /// range doesn't seem to be continuous. Something's broken - most likely a
@@ -3033,19 +3031,14 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
 #ifndef NDEBUG
                             if (used_key_prefix_loaded_in_memory && !boundary_pair_inexact)
                             {
-                                auto describe_condition = [](const KeyCondition & condition)
-                                {
-                                    return fmt::format("(relaxed: {}): {}", condition.isRelaxed(), condition.toString());
-                                };
-
                                 String conditions_description = fmt::format(
-                                    "key condition (useful: {}) {}", key_condition_useful, describe_condition(key_condition));
+                                    "key condition (useful: {}) {}", key_condition_useful, key_condition.toString());
                                 if (part_offset_condition_useful)
                                     conditions_description
-                                        += fmt::format("; part offset condition {}", describe_condition(*part_offset_condition));
+                                        += fmt::format("; part offset condition {}", part_offset_condition->toString());
                                 if (total_offset_condition_useful)
                                     conditions_description
-                                        += fmt::format("; total offset condition {}", describe_condition(*total_offset_condition));
+                                        += fmt::format("; total offset condition {}", total_offset_condition->toString());
 
                                 LOG_ERROR(
                                     log,

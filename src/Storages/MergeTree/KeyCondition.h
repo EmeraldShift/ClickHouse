@@ -87,7 +87,7 @@ public:
     /// Any condition over a key that can be reverse-sorted (a MergeTree primary key) must be
     /// constructed this way, otherwise a reverse key would be analyzed as ascending. The key's
     /// types let the condition relax range atoms that granule bounds cannot answer exactly, over
-    /// a `Tuple` key column that can hold a NaN (see `isRelaxed`).
+    /// a `Tuple` key column that can hold a NaN.
     KeyCondition(
         const ActionsDAGWithInversionPushDown & filter_dag,
         ContextPtr context,
@@ -148,7 +148,8 @@ public:
         const Hyperrectangle & hyperrectangle,
         const DataTypes & data_types,
         const ColumnIndexToBloomFilter & column_index_to_column_bf = {},
-        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr) const;
+        const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn = nullptr,
+        bool key_types_may_hold_null = true) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
     /// `key_col_to_sparse_pos` maps key index to position in `sparse_hyperrectangle`, or -1 if not tracked.
@@ -165,7 +166,13 @@ public:
         const std::vector<int> & key_col_to_sparse_pos,
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_data_types,
-        size_t num_refinable_key_columns) const;
+        size_t num_refinable_key_columns,
+        bool key_types_may_hold_null = true) const;
+
+    /// Whether a value of one of `key_types` can be NULL or hold a nested NULL or NaN. If not, no atom is NULL on a row
+    /// that a check reads as an ordinary key value. A caller that checks many ranges with the same types passes the result
+    /// as `key_types_may_hold_null`.
+    static bool keyTypesMayHoldNull(const DataTypes & key_types);
 
     /// Whether the condition and its negation are (independently) feasible in the key range.
     /// left_key and right_key must contain all fields in the sort_descr in the appropriate order.
@@ -189,7 +196,8 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types,
         const Truth & need = {},
-        const Hyperrectangle * key_bounds = nullptr) const;
+        const Hyperrectangle * key_bounds = nullptr,
+        bool key_types_may_hold_null = true) const;
 
     /// Optimized overload. Instead of all/prefix of key columns, any subsequence of key column information (in order) can be given.
     /// However, `equal_boundaries_mask` must have the information about all/prefix keys. `equal_boundaries_mask` specifies whether ith key's
@@ -225,7 +233,8 @@ public:
         const DataTypes & sparse_data_types,
         const std::vector<UInt8> & equal_boundaries_mask,
         const Truth & need = {},
-        const Hyperrectangle * key_bounds = nullptr) const;
+        const Hyperrectangle * key_bounds = nullptr,
+        bool key_types_may_hold_null = true) const;
 
     const KeyOrder & getKeyOrder() const { return key_order; }
 
@@ -403,6 +412,10 @@ public:
         /// prefix is relaxed. See `Truth::relaxed`.
         bool relaxed = false;
 
+        /// Whether the key stores some rows where the atom is NULL as ordinary values. `assumeNotNull(x)` does that for a
+        /// NULL `x`. See `Truth::withHiddenNull`.
+        bool hides_null = false;
+
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();
 
@@ -472,71 +485,6 @@ public:
     const RPN & getRPN() const { return rpn; }
     const ColumnIndices & getKeyColumns() const { return key_columns; }
 
-    /// Whether this key condition is relaxed (computed from the RPN atoms). When a key
-    /// condition is relaxed, it is considered weakened. This is because keys may not
-    /// always align perfectly with the condition specified in the query, and the aim is
-    /// to enhance the usefulness of different types of key expressions across various
-    /// scenarios.
-    ///
-    /// For instance, in a scenario with one granule of key column toDate(a), where
-    /// the hyperrectangle is toDate(a) ∊ [x, y], the result of a ∊ [u, v] can be
-    /// deduced as toDate(a) ∊ [toDate(u), toDate(v)] due to the monotonic
-    /// non-decreasing nature of the toDate function. Similarly, for a ∊ (u, v), the
-    /// transformed outcome remains toDate(a) ∊ [toDate(u), toDate(v)] as toDate
-    /// does not strictly follow a monotonically increasing transformation. This is
-    /// one of the main use case about key condition relaxation.
-    ///
-    /// During the KeyCondition::checkInRange process, relaxing the key condition
-    /// can lead to a loosened result. For example, when transitioning from (u, v)
-    /// to [u, v], if a key is within the range [u, u], BoolMask::can_be_true will
-    /// be true instead of false, causing us to not skip this granule. This behavior
-    /// is acceptable as we can still filter it later on. Conversely, if the key is
-    /// within the range [u, v], BoolMask::can_be_false will be false instead of
-    /// true, indicating a stricter condition where all elements of the granule
-    /// satisfy the key condition. Hence, when the key condition is relaxed, we
-    /// cannot rely on BoolMask::can_be_false. One significant use case of
-    /// BoolMask::can_be_false is in trivial count optimization.
-    ///
-    /// Now let's review all the cases of key condition relaxation across different
-    /// atom types.
-    ///
-    /// 1. Not applicable: ALWAYS_FALSE, ALWAYS_TRUE, FUNCTION_NOT,
-    /// FUNCTION_AND, FUNCTION_OR.
-    ///
-    /// These atoms are either never relaxed or are relaxed by their children.
-    ///
-    /// 2. Constant transformed: FUNCTION_IN_RANGE, FUNCTION_NOT_IN_RANGE,
-    /// FUNCTION_IS_NULL. FUNCTION_IS_NOT_NULL, FUNCTION_IN_SET (1 element),
-    /// FUNCTION_NOT_IN_SET (1 element)
-    ///
-    /// These atoms are relaxed when the associated constants undergo
-    /// transformation by monotonic functions, as illustrated in the example
-    /// mentioned earlier. Two NaN rules relax them as well, each for the bound
-    /// its condition is evaluated against: a right-unbounded FUNCTION_IN_RANGE
-    /// atom over a key column that can hold a NaN inside a Tuple (for a
-    /// condition built over a KeyDescription), and, for a condition built
-    /// over a getExtremes-derived hyperrectangle, a range or single-element set
-    /// atom over any key column that can hide a NaN (see
-    /// relaxAtomsOverNaNHidingColumns).
-    ///
-    /// 3. Always relaxed: FUNCTION_UNKNOWN, FUNCTION_IN_SET (>1 elements),
-    /// FUNCTION_NOT_IN_SET (>1 elements), FUNCTION_ARGS_IN_HYPERRECTANGLE
-    ///
-    /// These atoms are always considered relaxed for the sake of implementation
-    /// simplicity, as there may be "gaps" within the atom's hyperrectangle that the
-    /// granule's hyperrectangle may or may not intersect.
-    ///
-    /// 4. Relaxed only if all its atoms are: FUNCTION_ATOM_GROUP
-    ///
-    /// One exact atom represents the whole predicate leaf of the group (see
-    /// `RPNElement::group_atoms`).
-    ///
-    /// NOTE: we also need to examine special functions that generate atoms. For
-    /// example, the `match` function can produce a FUNCTION_IN_RANGE atom based
-    /// on a given regular expression. Such an atom is relaxed unless the regular
-    /// expression has a perfect or an exact prefix, e.g. "^abc.*" or "^abc$".
-    bool isRelaxed() const;
-
     /// Whether a value of this type can be a NaN that an aggregated `getExtremes` bound does not show, and
     /// whose ordering comparisons are therefore all false rather than complementary. `Tuple` qualifies, per
     /// element. An `Array`/`Map` bound hides a NaN too (opposite `nan_direction_hint` per bound in
@@ -581,15 +529,6 @@ public:
         bool date_time_overflow_behavior_ignore_);
 
 private:
-    /// Whether any atom reads a `Nullable` key column whose analysed range may hold a NULL value.
-    /// A NULL satisfies neither a comparison nor its negation, which the two-valued range algebra of
-    /// `checkInHyperrectangle` cannot express, so it costs the analysis its `can_be_false` claim.
-    bool mayReadNullKeyValue(const Hyperrectangle & hyperrectangle, const DataTypes & key_types) const;
-    bool mayReadNullKeyValue(
-        const std::vector<int> & key_col_to_sparse_pos,
-        const Hyperrectangle & sparse_hyperrectangle,
-        const DataTypes & sparse_key_types) const;
-
     /// The truth on a range that the caller doesn't give. Each atom that the index can evaluate can have any value there.
     Truth checkBoundsOnAnyRange() const;
 
@@ -642,13 +581,15 @@ private:
         /// Cumulative monotonicity direction of `functions_chain`: false when applying the
         /// chain reverses comparison order (an odd number of non-increasing functions).
         bool chain_is_positive = true;
+        /// Whether every function of `functions_chain` is injective. Then the chain is strictly monotonic.
+        bool chain_is_injective = true;
     };
 
     /// The result of pushing the predicate's constant through a key-side recipe.
     /// The transformed `value` and `type` live in the key space of `key_column_num`
     /// and compare against that column directly. An exact atom requires an injective
-    /// transform, a normalization of the constant that loses nothing, no NaN in the transform
-    /// input, and no `NULL` that the key value hides; otherwise the atom must be relaxed.
+    /// transform, a normalization of the constant that loses nothing, and no NaN in the transform
+    /// input. Otherwise the atom must be relaxed.
     struct TransformedConstant
     {
         size_t key_column_num = 0;
@@ -685,6 +626,8 @@ private:
         /// `tryBuildComparisonAtom` can further relax the constraint during type conversion; exact
         /// conversions preserve this initial precision.
         bool is_relaxed = false;
+        /// Whether the key stores a NULL argument as an ordinary value, see `RPNElement::hides_null`.
+        bool hides_null = false;
         /// This flag is true when the key-side chain that produced the constant reverses comparison
         /// order (see `TransformedConstant::reverse_comparison`); the comparison operator
         /// must then be reversed as well.
@@ -714,7 +657,6 @@ private:
         const RPNBuilderFunctionTreeNode & func,
         const BuildInfo & info,
         const std::string & func_name,
-        bool allow_relaxed_pruning,
         AtomGroup & group,
         const ColumnWithTypeAndName * rewritten_constant = nullptr);
     /// `key <=> NULL` is "key IS NULL", so it produces the `isNull` atom, but only for a
@@ -731,7 +673,6 @@ private:
         const BuildInfo & info,
         const std::string & func_name,
         const ColumnWithTypeAndName & constant,
-        bool allow_relaxed_pruning,
         AtomGroup & group);
 
     /// Collects direct candidates, then candidates from monotonic and deterministic constant transforms.
@@ -739,8 +680,7 @@ private:
         const RPNBuilderTreeNode & key_arg,
         const BuildInfo & info,
         const std::string & func_name,
-        const ColumnWithTypeAndName & constant,
-        bool allow_relaxed_pruning);
+        const ColumnWithTypeAndName & constant);
 
     /// Builds a complete comparison atom, including type conversion, relaxation and the final range.
     /// Returns `std::nullopt` when the candidate cannot supply a sound constraint.
@@ -810,14 +750,10 @@ private:
     /// comparisons are not preserved. A float zero equals the zero of the other sign, so a scalar
     /// zero produces a candidate only when `f` maps both signs equally. A constant holding a nested
     /// float zero produces no candidate, because the transform can distinguish combinations of signs.
-    /// `nested_null_is_ordinary_value` is set for a null-safe comparison. There a `NULL` nested in a
-    /// `Tuple` is an ordinary value that matches only a `NULL` at the same position, so a transform that
-    /// hides it does not relax the atom.
     std::vector<TransformedConstant> transformConstantByDeterministicKeyFunctions(
         const RPNBuilderTreeNode & node,
         const BuildInfo & info,
-        const ColumnWithTypeAndName & constant,
-        bool nested_null_is_ordinary_value) const;
+        const ColumnWithTypeAndName & constant) const;
 
     /// This is a key-side recipe like `KeyWrappingChain`, except that the computation
     /// is an arbitrary deterministic sub-DAG instead of a chain of single-argument
@@ -848,13 +784,11 @@ private:
     void prepareSetAtomsForIn(
         const RPNBuilderFunctionTreeNode & func,
         const BuildInfo & info,
-        AtomGroup & group,
-        bool allow_relaxed_pruning);
+        AtomGroup & group);
     void prepareSetAtomsForHas(
         const RPNBuilderFunctionTreeNode & func,
         const BuildInfo & info,
-        AtomGroup & group,
-        bool allow_relaxed_pruning);
+        AtomGroup & group);
 
     /// One predicate component mapped to a key column, together with its comparison type and the
     /// optional transformation of set values into that column's key space.
@@ -876,6 +810,8 @@ private:
         size_t args_count = 1;
         /// A non-injective transform makes the set check a superset of the matching values.
         bool is_relaxed = false;
+        /// Whether the key stores a NULL argument as an ordinary value, see `RPNElement::hides_null`.
+        bool hides_null = false;
     };
 
     /// A predicate expression from which deterministic key transforms derive set atoms, together with those
@@ -930,11 +866,13 @@ private:
 
     /// Converts a candidate's set columns into key space and builds its `MergeTreeSetIndex`.
     /// The caller finalizes the prepared atom's function kind for the membership predicate.
+    /// `null_is_ordinary_value` tells whether the predicate is false rather than NULL for a NULL argument. `has` is such a
+    /// predicate.
     static std::optional<RPNElement> tryPrepareSetAtom(
         const Columns & set_columns,
         const DataTypes & set_types,
         SetAtomCandidate candidate,
-        bool allow_relaxed_pruning,
+        bool null_is_ordinary_value,
         const DataTypePtr & has_element_type);
 
     /// Maps the predicate expression whose values are tested for set membership (the left-hand side
@@ -956,7 +894,7 @@ private:
         const Columns & set_columns,
         const DataTypes & set_types,
         SetIndexAnalysisResult analysis,
-        bool allow_relaxed_pruning,
+        bool null_is_ordinary_value,
         AtomGroup & group,
         const DataTypePtr & has_element_type = nullptr) const;
 

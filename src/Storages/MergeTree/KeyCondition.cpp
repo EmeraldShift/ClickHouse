@@ -360,34 +360,10 @@ const KeyCondition::AtomMap KeyCondition::atom_map
             "notLike",
             [] (RPNElement & out, const Field & value)
             {
-                if (value.getType() != Field::Types::String)
+                if (!atom_map.at("like")(out, value))
                     return false;
-
-                auto prefix = extractFixedPrefixFromLikePattern(value.safeGet<String>(), /*requires_perfect_prefix*/ true);
-
-                /// A pattern without wildcards is equivalent to an inequality, so exclude an exact point range.
-                /// This must come before the empty-prefix bailout below: the empty pattern is wildcard-free
-                /// and equivalent to `value != ''`, so it needs the exact empty-string point exclusion too.
-                if (prefix.is_exact)
-                {
-                    out.function = RPNElement::FUNCTION_NOT_IN_RANGE;
-                    out.range = Range(prefix.prefix);
-                    return true;
-                }
-
-                /// A non-exact pattern with an empty prefix (e.g. '%' or '_foo') gives no usable bound.
-                if (prefix.prefix.empty())
-                    return false;
-
-                chassert(prefix.is_perfect);
-
-                String right_bound = firstStringThatIsGreaterThanAllStringsWithPrefix(prefix.prefix);
 
                 out.function = RPNElement::FUNCTION_NOT_IN_RANGE;
-                out.range = !right_bound.empty()
-                    ? Range(prefix.prefix, true, right_bound, false)
-                    : Range::createLeftBounded(prefix.prefix, true);
-
                 return true;
             }
         },
@@ -523,15 +499,6 @@ static bool monotonicChainSupportsNullAtom(const KeyCondition::MonotonicFunction
 {
     return chain.empty();
 }
-
-/// Functions with range inversion cannot be relaxed. It will become stricter instead.
-/// For example:
-/// create table test(d Date, k Int64, s String) Engine=MergeTree order by toYYYYMM(d);
-/// insert into test values ('2020-01-01', 1, '');
-/// insert into test values ('2020-01-02', 1, '');
-/// select * from test where d != '2020-01-01'; -- If relaxed, no record will return
-static const std::set<std::string_view> no_relaxed_atom_functions
-    = {"notLike", "notIn", "globalNotIn", "notNullIn", "globalNotNullIn", "notEquals", "notEmpty", "notHas"};
 
 static const std::map<std::string, std::string> inverse_relations =
 {
@@ -1764,24 +1731,6 @@ KeyCondition::KeyCondition(
     , date_time_overflow_behavior_ignore(date_time_overflow_behavior_ignore_)
 {}
 
-bool KeyCondition::isRelaxed() const
-{
-    const auto is_relaxed_atom = [](const RPNElement & elem)
-    {
-        return elem.relaxed
-            || elem.function == RPNElement::FUNCTION_UNKNOWN
-            || ((elem.function == RPNElement::FUNCTION_IN_SET || elem.function == RPNElement::FUNCTION_NOT_IN_SET)
-                && elem.set_index->size() > 1);
-    };
-
-    return std::any_of(rpn.begin(), rpn.end(), [&](const RPNElement & elem)
-    {
-        if (elem.function == RPNElement::FUNCTION_ATOM_GROUP)
-            return std::all_of(elem.group_atoms.begin(), elem.group_atoms.end(), is_relaxed_atom);
-        return is_relaxed_atom(elem);
-    });
-}
-
 bool KeyCondition::typeMayHideNaN(const DataTypePtr & type)
 {
     if (!type)
@@ -1989,18 +1938,24 @@ static std::optional<FieldRef> applyFunction(const FunctionBasePtr & func, size_
     return FieldRef(field.columns, field.row_idx, result_idx);
 }
 
+static bool castColumnWithoutNulls(ColumnPtr & column, DataTypePtr & type, const DataTypePtr & target_type, bool & out_is_exact);
+
 /// Sequentially applies functions to the column, returns `true`
 /// if all function arguments are compatible with functions
 /// signatures, and none of the functions produce `NULL` output.
 ///
 /// After functions chain execution, fills result column and its type.
+/// `out_cast_is_exact` reports whether the cast to the argument type of the first function kept every value.
 static bool applyFunctionChainToColumn(
     const ColumnPtr & in_column,
     const DataTypePtr & in_data_type,
     const std::vector<FunctionBasePtr> & functions,
     ColumnPtr & out_column,
-    DataTypePtr & out_data_type)
+    DataTypePtr & out_data_type,
+    bool & out_cast_is_exact)
 {
+    out_cast_is_exact = true;
+
     auto result_column = in_column->convertToFullIfWrapped()->convertToFullColumnIfLowCardinality();
     auto result_type = removeLowCardinality(in_data_type);
 
@@ -2020,39 +1975,8 @@ static bool applyFunctionChainToColumn(
 
     /// And cast it to the argument type of the first function in the chain
     auto in_argument_type = removeLowCardinality(getArgumentTypeOfMonotonicFunction(*functions[0]));
-    if (canBeSafelyCast(result_type, in_argument_type))
-    {
-        result_column = castColumnAccurate({result_column, result_type, ""}, in_argument_type);
-        result_type = in_argument_type;
-    }
-    else if ((!in_argument_type->isNullable() && !in_argument_type->canBeInsideNullable())
-             || !canBeAccurateCastOrNullTarget(in_argument_type))
-    {
-        /// We cannot apply castColumnAccurateOrNull() because it will throw exception
+    if (!castColumnWithoutNulls(result_column, result_type, in_argument_type, out_cast_is_exact))
         return false;
-    }
-    /// If column cannot be cast accurate, casting with OrNull, and in case all
-    /// values has been cast (no nulls), unpacking nested column from nullable.
-    /// In case any further functions require Nullable input, they'll be able
-    /// to cast it.
-    else
-    {
-        result_column = castColumnAccurateOrNull({result_column, result_type, ""}, in_argument_type);
-        /// `castColumnAccurateOrNull` is implemented on top of `FunctionCast` whose wrappers can
-        /// return `ColumnConst` for a 1-row input — same hazard as the post-`func->execute` case
-        /// below. Unwrap defensively so the `assert_cast<const ColumnNullable &>` always sees a
-        /// plain `ColumnNullable`.
-        result_column = result_column->convertToFullColumnIfConst();
-        const auto & result_column_nullable = assert_cast<const ColumnNullable &>(*result_column);
-        const auto & null_map_data = result_column_nullable.getNullMapData();
-        for (char8_t i : null_map_data)
-        {
-            if (i != 0)
-                return false;
-        }
-        result_column = result_column_nullable.getNestedColumnPtr();
-        result_type = removeNullable(in_argument_type);
-    }
 
     for (const auto & func : functions)
     {
@@ -2437,7 +2361,7 @@ static bool floatValuesMissKeyValues(
 /// Over a type of consecutive integers (the integers, `Date`, `Date32` and `DateTime`), the strict
 /// comparison `x < c` matches the same rows as `x <= c - 1`, and `x > c` the same as `x >= c + 1`. This
 /// replaces the constant `c` of such a comparison with that inclusive bound, where `x` has the type
-/// `transform_input_type`. An atom built from a transformed constant is relaxed and compares non-strictly,
+/// `transform_input_type`. The atom of a chain that is not injective is relaxed and compares non-strictly,
 /// so only the inclusive bound leaves out a key bucket that `c` starts, for `x < c`, or ends, for `x > c`:
 /// for `ts < '2026-01-11 00:00:00'`, the bound `'2026-01-10 23:59:59'` gives `toDate(ts) <= '2026-01-10'`,
 /// while `c` gives `toDate(ts) <= '2026-01-11'` and keeps a whole day without matches.
@@ -2528,14 +2452,16 @@ std::vector<KeyCondition::TransformedConstant> KeyCondition::transformConstantBy
                 || floatValuesMissKeyValues(constant.column, constant.type, transform_input_type, std::make_shared<DataTypeFloat64>())
                 || !tryNormalizeTextConstantForZonelessDateTimeInput(transform_input_type, normalized_constant))
                 continue;
-            makeStrictBoundInclusive(func_name, transform_input_type, normalized_constant);
+            if (!chain.chain_is_injective)
+                makeStrictBoundInclusive(func_name, transform_input_type, normalized_constant);
         }
 
         ColumnPtr transformed_const_column;
         DataTypePtr transformed_const_type;
+        bool cast_is_exact = true;
         if (!applyFunctionChainToColumn(
                 normalized_constant.column, normalized_constant.type, chain.functions_chain,
-                transformed_const_column, transformed_const_type))
+                transformed_const_column, transformed_const_type, cast_is_exact))
             continue;
 
         Field transformed_value = (*transformed_const_column)[0];
@@ -2548,7 +2474,9 @@ std::vector<KeyCondition::TransformedConstant> KeyCondition::transformConstantBy
                 .value = std::move(transformed_value),
                 .type = transformed_const_type,
                 .is_fixed_string = transformed_is_fixed_string,
-                .requires_relaxed_atom = true,
+                /// An injective monotonic chain is strictly monotonic. Comparing the key with the transformed constant then
+                /// has the same result as comparing the argument with the constant, if the cast kept its value.
+                .requires_relaxed_atom = !chain.chain_is_injective || !cast_is_exact,
                 .reverse_comparison = !chain.chain_is_positive});
     }
 
@@ -2901,9 +2829,13 @@ static bool castColumnWithoutNulls(
 
     /// Without a conversion between the two types, the column cannot be transformed into the key space,
     /// and the caller skips this candidate.
-    const ColumnPtr probe_column = tryCastColumnAccurateOrNull({column, type, ""}, probe_type);
+    ColumnPtr probe_column = tryCastColumnAccurateOrNull({column, type, ""}, probe_type);
     if (!probe_column)
         return false;
+
+    /// `castColumnAccurateOrNull` is implemented on top of `FunctionCast`, whose wrappers can return a `ColumnConst` for a
+    /// 1-row input. Unwrap the result so the `assert_cast` below sees a plain `ColumnNullable`.
+    probe_column = probe_column->convertToFullColumnIfConst();
 
     const auto & n = assert_cast<const ColumnNullable &>(*probe_column);
 
@@ -3253,8 +3185,7 @@ bool deterministicTransformMapsFloatZerosAlike(
 std::vector<KeyCondition::TransformedConstant> KeyCondition::transformConstantByDeterministicKeyFunctions(
     const RPNBuilderTreeNode & node,
     const BuildInfo & info,
-    const ColumnWithTypeAndName & constant,
-    bool nested_null_is_ordinary_value) const
+    const ColumnWithTypeAndName & constant) const
 {
     const String expr_name = findKeySubexpressionName(node, info.key_subexpr_names);
     if (expr_name.empty())
@@ -3315,20 +3246,14 @@ std::vector<KeyCondition::TransformedConstant> KeyCondition::transformConstantBy
                 transformed_const_column, transformed_const_type))
             continue;
 
-        /// Besides a non-injective transform, three cases make the atom stricter than the predicate, so
+        /// Besides a non-injective transform, two cases make the atom stricter than the predicate. Then
         /// its `can_be_false` is not usable:
         /// - The transform input holds a NaN. The comparison reads the constant in the domain of the
         ///   column the key expression consumes, where a NaN equals no value, not even itself. The
         ///   transform maps it to an ordinary key value that the index compares as equal.
-        /// - A value of that column may hold a `NULL`, which makes the comparison `NULL` at row level,
-        ///   and `WHERE` rejects the row. When the transform maps such a value to an ordinary key value,
-        ///   the index compares it as unequal to the constant, so a negated atom claims the row as
-        ///   matching, and `mayReadNullKeyValue` cannot see it from the key type. A null-safe comparison
-        ///   never answers `NULL`, so a `NULL` nested in a `Tuple` does not matter for it.
         /// - The normalization of the constant lost information. The key point then has more than one
         ///   preimage, as for a non-injective transform.
         const bool requires_relaxed_atom = transform_input_has_nan
-            || deterministicTransformMayHideNull(candidate.dag.input_type, candidate.key_column_type, nested_null_is_ordinary_value)
             || !normalization_is_exact
             || !isDeterministicTransformInjective(candidate.dag.actions->getActionsDAG(), expr_name, candidate.dag.output_name);
 
@@ -3421,6 +3346,8 @@ std::optional<KeyCondition::SetIndexAnalysisResult> KeyCondition::tryAnalyzePred
             const auto & dag = transform->dag;
             if (!isDeterministicTransformInjective(dag.actions->getActionsDAG(), dag.input_name, dag.output_name))
                 candidate.is_relaxed = true;
+            if (deterministicTransformMayHideNull(dag.input_type, transform->key_column_type, /*nested_null_is_ordinary_value*/ false))
+                candidate.hides_null = true;
 
             candidate.column_mappings.push_back({
                 .index_mapping = {.tuple_index = tuple_index, .key_index = transform->key_column_num, .functions = {}},
@@ -3956,7 +3883,7 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryPrepareSetAtom(
     const Columns & set_columns,
     const DataTypes & set_types,
     SetAtomCandidate candidate,
-    bool allow_relaxed_pruning,
+    bool null_is_ordinary_value,
     const DataTypePtr & has_element_type)
 {
     chassert(set_types.size() == set_columns.size());
@@ -3992,11 +3919,7 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryPrepareSetAtom(
             /// below for the transform input, and equally for a set that is packed already, such
             /// as the array elements of `has`.
             if (transform_consumes_whole_tuple)
-            {
-                if (!allow_relaxed_pruning)
-                    return std::nullopt;
                 candidate.is_relaxed = true;
-            }
 
             /// The prepared set for `IN` can come as "unpacked" columns (one column per tuple element),
             /// but for a packed tuple key we must keep it as a single ColumnTuple so it can be cast to
@@ -4025,7 +3948,9 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryPrepareSetAtom(
         return std::nullopt;
 
     RPNElement element;
-    element.relaxed = candidate.is_relaxed;
+    /// A predicate that is false rather than NULL for a NULL argument is relaxed by the NULLs the key hides.
+    element.relaxed = candidate.is_relaxed || (candidate.hides_null && null_is_ordinary_value);
+    element.hides_null = candidate.hides_null && !null_is_ordinary_value;
     std::vector<MergeTreeSetIndex::KeyTuplePositionMapping> indexes_mapping;
     indexes_mapping.reserve(candidate.column_mappings.size());
     for (auto & mapping : candidate.column_mappings)
@@ -4058,7 +3983,7 @@ void KeyCondition::appendSetAtoms(
     const Columns & set_columns,
     const DataTypes & set_types,
     SetIndexAnalysisResult analysis,
-    bool allow_relaxed_pruning,
+    bool null_is_ordinary_value,
     AtomGroup & group,
     const DataTypePtr & has_element_type) const
 {
@@ -4067,12 +3992,12 @@ void KeyCondition::appendSetAtoms(
     /// Component and packed-tuple mappings can coexist even when they constrain the same key column.
     /// Key coverage only limits the additional wrapped-set candidates below.
     if (auto atom = tryPrepareSetAtom(
-            set_columns, set_types, std::move(analysis.componentwise_candidate), allow_relaxed_pruning, has_element_type))
+            set_columns, set_types, std::move(analysis.componentwise_candidate), null_is_ordinary_value, has_element_type))
         group.atoms.emplace_back(std::move(*atom));
 
     if (analysis.packed_tuple_candidate)
         if (auto atom = tryPrepareSetAtom(
-                set_columns, set_types, std::move(*analysis.packed_tuple_candidate), allow_relaxed_pruning, has_element_type))
+                set_columns, set_types, std::move(*analysis.packed_tuple_candidate), null_is_ordinary_value, has_element_type))
             group.atoms.emplace_back(std::move(*atom));
 
     /// Atoms for the predicate's components and whole tuple take priority over additional
@@ -4104,12 +4029,10 @@ void KeyCondition::appendSetAtoms(
 
             const bool is_injective = isDeterministicTransformInjective(
                 candidate.dag.actions->getActionsDAG(), candidate.dag.input_name, candidate.dag.output_name);
-            /// A non-injective transform supplies only a necessary membership condition, whose
-            /// complement cannot prune.
-            if (!allow_relaxed_pruning && !is_injective)
-                continue;
 
             SetAtomCandidate set_candidate;
+            set_candidate.hides_null = deterministicTransformMayHideNull(
+                candidate.dag.input_type, candidate.key_column_type, /*nested_null_is_ordinary_value*/ false);
             set_candidate.column_mappings.push_back({
                 .index_mapping = std::move(mapping),
                 .set_transform = std::move(candidate.dag),
@@ -4120,11 +4043,8 @@ void KeyCondition::appendSetAtoms(
             set_candidate.is_relaxed = !is_injective;
 
             auto candidate_atom = tryPrepareSetAtom(
-                set_columns, set_types, std::move(set_candidate), allow_relaxed_pruning, has_element_type);
-
-            /// Additional atoms for complement predicates must be exact. `tryPrepareSetAtom` can relax
-            /// even an injective transform when its mapping covers only some tuple components.
-            if (!candidate_atom || (!allow_relaxed_pruning && candidate_atom->relaxed))
+                set_columns, set_types, std::move(set_candidate), null_is_ordinary_value, has_element_type);
+            if (!candidate_atom)
                 continue;
 
             for (size_t column_idx : candidate_atom->key_columns)
@@ -4141,8 +4061,7 @@ void KeyCondition::appendSetAtoms(
 void KeyCondition::prepareSetAtomsForIn(
     const RPNBuilderFunctionTreeNode & func,
     const BuildInfo & info,
-    AtomGroup & group,
-    bool allow_relaxed_pruning)
+    AtomGroup & group)
 {
     if (func.getArgumentsSize() != 2)
         return;
@@ -4179,7 +4098,11 @@ void KeyCondition::prepareSetAtomsForIn(
     const auto set_columns = prepared_set->getSetElements();
     const auto set_types = future_set->getTypes();
 
-    appendSetAtoms(set_columns, set_types, std::move(*analysis), allow_relaxed_pruning, group);
+    /// `nullIn` is false, not NULL, for a NULL argument.
+    const auto & func_name = func.getFunctionName();
+    const bool null_is_ordinary_value
+        = func_name == "nullIn" || func_name == "notNullIn" || func_name == "globalNullIn" || func_name == "globalNotNullIn";
+    appendSetAtoms(set_columns, set_types, std::move(*analysis), null_is_ordinary_value, group);
 }
 
 /// A `Variant` column describes at the type level every alternative it *may* hold, but a constant
@@ -4221,8 +4144,7 @@ static DataTypePtr narrowVariantToOccupiedAlternatives(
 void KeyCondition::prepareSetAtomsForHas(
     const RPNBuilderFunctionTreeNode & func,
     const BuildInfo & info,
-    AtomGroup & group,
-    bool allow_relaxed_pruning)
+    AtomGroup & group)
 {
     chassert(func.getFunctionName() == "has" || func.getFunctionName() == "notHas");
 
@@ -4308,7 +4230,8 @@ void KeyCondition::prepareSetAtomsForHas(
     Columns set_columns = {array_elements};
     DataTypes set_types = {array_nested_type};
 
-    appendSetAtoms(set_columns, set_types, std::move(*analysis), allow_relaxed_pruning, group, checked_element_type);
+    /// `has` is false, not NULL, for a NULL argument.
+    appendSetAtoms(set_columns, set_types, std::move(*analysis), /*null_is_ordinary_value*/ true, group, checked_element_type);
 }
 
 
@@ -4706,6 +4629,7 @@ std::vector<KeyCondition::KeyWrappingChain> KeyCondition::collectKeyWrappingChai
 
                 bool candidate_valid = true;
                 bool chain_is_positive = true;
+                bool chain_is_injective = true;
 
                 while (!chain.empty())
                 {
@@ -4732,6 +4656,11 @@ std::vector<KeyCondition::KeyWrappingChain> KeyCondition::collectKeyWrappingChai
                     auto monotonicity = func_base->getMonotonicityForRange(*input_child->result_type, Field(), Field());
                     if (!monotonicity.is_positive)
                         chain_is_positive = !chain_is_positive;
+
+                    ColumnsWithTypeAndName arguments;
+                    for (const auto * child : func->children)
+                        arguments.push_back({child->column, child->result_type, child->result_name});
+                    chain_is_injective = chain_is_injective && func_base->isInjective(arguments);
 
                     ColumnWithTypeAndName const_arg;
                     FunctionWithOptionalConstArg::Kind kind = FunctionWithOptionalConstArg::Kind::NO_CONST;
@@ -4798,6 +4727,7 @@ std::vector<KeyCondition::KeyWrappingChain> KeyCondition::collectKeyWrappingChai
                 if (candidate_valid)
                 {
                     candidate.chain_is_positive = chain_is_positive;
+                    candidate.chain_is_injective = chain_is_injective;
                     result.push_back(std::move(candidate));
 
                     if (first_match_only)
@@ -5275,10 +5205,6 @@ void KeyCondition::extractAtomsFromFunction(const RPNBuilderTreeNode & node, con
     if (atom_it == atom_map.end())
         return;
 
-    /// Complement predicates cannot prune through relaxed transformations. They can still produce
-    /// relaxed deterministic atoms, which evaluation treats as unknown instead of using for pruning.
-    const bool allow_relaxed_pruning = !no_relaxed_atom_functions.contains(func_name);
-
     /// This fills the function kind and the range/set of every prepared element in `group` via the
     /// `atom_map` builder. The set, unary and polygon builders reached from here always succeed and
     /// ignore the value argument; comparison atoms pass the real constant in
@@ -5311,7 +5237,7 @@ void KeyCondition::extractAtomsFromFunction(const RPNBuilderTreeNode & node, con
     /// IN / NOT IN
     if (functionIsInOrGlobalInOperator(func_name))
     {
-        prepareSetAtomsForIn(func, info, group, allow_relaxed_pruning);
+        prepareSetAtomsForIn(func, info, group);
         finalize_atoms();
         return;
     }
@@ -5319,7 +5245,7 @@ void KeyCondition::extractAtomsFromFunction(const RPNBuilderTreeNode & node, con
     /// has(const_array, key) / notHas(const_array, key)
     if (func_name == "has" || func_name == "notHas")
     {
-        prepareSetAtomsForHas(func, info, group, allow_relaxed_pruning);
+        prepareSetAtomsForHas(func, info, group);
         finalize_atoms();
         return;
     }
@@ -5369,7 +5295,7 @@ void KeyCondition::extractAtomsFromFunction(const RPNBuilderTreeNode & node, con
     /// Binary comparisons of a key expression with a constant.
     else if (num_args == 2)
     {
-        extractBinaryComparisonAtoms(func, info, func_name, allow_relaxed_pruning, group);
+        extractBinaryComparisonAtoms(func, info, func_name, group);
     }
     /// `LIKE pattern ESCAPE 'c'` and `NOT LIKE pattern ESCAPE 'c'` arrive here as a
     /// 3-argument function call `like(col, pattern, escape_char)`. Fold the escape
@@ -5403,8 +5329,7 @@ void KeyCondition::extractAtomsFromFunction(const RPNBuilderTreeNode & node, con
             pattern_type,
             {}};
 
-        extractBinaryComparisonAtoms(
-            func, info, func_name, allow_relaxed_pruning, group, &rewritten_constant);
+        extractBinaryComparisonAtoms(func, info, func_name, group, &rewritten_constant);
     }
 }
 
@@ -5517,7 +5442,6 @@ void KeyCondition::extractBinaryComparisonAtoms(
     const RPNBuilderFunctionTreeNode & func,
     const BuildInfo & info,
     const std::string & func_name,
-    bool allow_relaxed_pruning,
     AtomGroup & group,
     const ColumnWithTypeAndName * rewritten_constant)
 {
@@ -5619,7 +5543,7 @@ void KeyCondition::extractBinaryComparisonAtoms(
         normalized_func_name = reversed;
     }
 
-    extractComparisonAtomsForKeyArgument(key_arg, info, normalized_func_name, constant, allow_relaxed_pruning, group);
+    extractComparisonAtomsForKeyArgument(key_arg, info, normalized_func_name, constant, group);
 }
 
 /// `key <=> NULL` is "key IS NULL", so it is analyzed with the `isNull` atom. That atom
@@ -5668,20 +5592,16 @@ void KeyCondition::extractComparisonAtomsForKeyArgument(
     const BuildInfo & info,
     const std::string & func_name,
     const ColumnWithTypeAndName & constant,
-    bool allow_relaxed_pruning,
     AtomGroup & group)
 {
-    const auto candidates = collectComparisonAtomCandidates(key_arg, info, func_name, constant, allow_relaxed_pruning);
+    const auto candidates = collectComparisonAtomCandidates(key_arg, info, func_name, constant);
     if (candidates.empty())
         return;
 
     /// Candidates not yet marked relaxed are considered before already-relaxed ones.
     /// Source order alone is not a precision order: one key column can be reachable both
-    /// through a relaxed monotonic transform and through an exact deterministic transform.
-    /// For `ORDER BY negate(x)` and `WHERE x = 5`, the monotonic transform proposes the relaxed
-    /// `negate(x) = -5` before the deterministic transform proposes the exact candidate for the
-    /// same key column. Keeping the relaxed one would make the whole key condition relaxed
-    /// (`isRelaxed`) and disable exact-range consumers such as `markRangesFromPKRange`.
+    /// through a relaxed transform and through an exact one. Keeping the relaxed one would lose
+    /// the ranges where the exact one is `Always`.
     /// So emission runs in two passes: first candidates that can still produce an exact atom,
     /// including exact transformed candidates, then already-relaxed candidates for uncovered key columns.
     /// Within a pass, candidates keep the source priority order. Atom construction may further relax a
@@ -5713,8 +5633,7 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
     const RPNBuilderTreeNode & key_arg,
     const BuildInfo & info,
     const std::string & func_name,
-    const ColumnWithTypeAndName & constant,
-    bool allow_relaxed_pruning)
+    const ColumnWithTypeAndName & constant)
 {
     const Field const_value = (*constant.column)[0];
     const DataTypePtr const_type = removeNullable(constant.type);
@@ -5730,8 +5649,13 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
 
     /// The constant was already pushed through a key-side recipe, so it compares
     /// against the key column directly and the check-time chain is empty.
+    /// The key may store a NULL argument as an ordinary value. `assumeNotNull(x)` does that for a NULL `x`. The atom is NULL
+    /// on such a row. `<=>` is false there, and its atom is relaxed instead.
+    const bool null_is_ordinary_value = func_name == "isNotDistinctFrom";
     auto add_transformed_constant_candidate = [&](const TransformedConstant & transformed, bool is_relaxed)
     {
+        const bool hides_null = deterministicTransformMayHideNull(
+            key_arg.getDAGNode()->result_type, transformed.key_column_type, null_is_ordinary_value);
         candidates.push_back(ComparisonAtomCandidate{
             .key_column_num = transformed.key_column_num,
             .key_expr_type = transformed.key_column_type,
@@ -5740,7 +5664,8 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
             .const_value = transformed.value,
             .const_type = transformed.type,
             .const_is_fixed_string = transformed.is_fixed_string,
-            .is_relaxed = is_relaxed,
+            .is_relaxed = is_relaxed || (hides_null && null_is_ordinary_value),
+            .hides_null = hides_null && !null_is_ordinary_value,
             .reverse_comparison = transformed.reverse_comparison});
     };
 
@@ -5805,12 +5730,10 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
     }
 
     /// 2. The monotonic constant transform infers key constraints by transforming the
-    /// constant with key functions. Such candidates are always relaxed, because the
-    /// transformed range is a superset of the exact matches. A relaxed atom under a
-    /// complement-producing function (see `no_relaxed_atom_functions`) would become
-    /// stricter instead and could prune matching rows, which is why this source is
-    /// gated.
-    if (allow_relaxed_pruning && source_may_contribute())
+    /// constant with key functions. Such a candidate is relaxed, because the transformed
+    /// range is a superset of the exact matches, unless the chain is injective (see
+    /// `transformConstantByMonotonicKeyFunctions`).
+    if (source_may_contribute())
     {
         auto transformed_candidates = transformConstantByMonotonicKeyFunctions(
             key_arg,
@@ -5869,10 +5792,8 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
                 ///
                 /// So the rewrite may over-read, but it does not incorrectly prune matching rows.
                 ///
-                /// The same argument applies to `>`, `>=`, `<=`, and `=`.
-                /// It does not apply to `!=`: `notEquals` is in `no_relaxed_atom_functions`, so if
-                /// analysis would need to push the constant through a monotonic function chain, we do
-                /// not create a relaxed atom for `!=` on this path.
+                /// The same argument applies to `>`, `>=`, `<=`, and `=`. `!=` is checked as the negation
+                /// of the relaxed `=`.
                 if (func_base.getName() == "assumeNotNull")
                     return true;
 
@@ -5886,7 +5807,7 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
             });
 
         for (const auto & transformed : transformed_candidates)
-            add_transformed_constant_candidate(transformed, /*is_relaxed*/ true);
+            add_transformed_constant_candidate(transformed, /*is_relaxed*/ transformed.requires_relaxed_atom);
     }
 
     /// 3. The deterministic constant transform contributes candidates for the key columns
@@ -5898,18 +5819,15 @@ std::vector<KeyCondition::ComparisonAtomCandidate> KeyCondition::collectComparis
     /// Equality (in both polarities) is the only comparison that an arbitrary
     /// deterministic `f` translates: `x = c` implies `f(x) = f(c)`, but order
     /// comparisons are not preserved. A float zero `c` is the exception to the
-    /// implication (see `transformConstantByDeterministicKeyFunctions`). `notEquals`
-    /// is tolerable even though the transform may relax the atom (when the transform
-    /// is not injective), because evaluation forces `can_be_false = true` for relaxed
-    /// elements, so such an atom never prunes.
+    /// implication (see `transformConstantByDeterministicKeyFunctions`). `notEquals` is checked
+    /// as the negation of `equals`.
     /// `isNotDistinctFrom` with a non-NULL constant (the NULL constant case never reaches here)
     /// matches only values identical to the constant, so it translates the same way. A `NULL` nested
     /// in a `Tuple` constant is such a value for it: it matches only a `NULL` at the same position.
     if ((func_name == "equals" || func_name == "notEquals" || func_name == "isNotDistinctFrom")
         && source_may_contribute())
     {
-        auto transformed_candidates = transformConstantByDeterministicKeyFunctions(
-            key_arg, info, constant_for_transform, /*nested_null_is_ordinary_value*/ func_name == "isNotDistinctFrom");
+        auto transformed_candidates = transformConstantByDeterministicKeyFunctions(key_arg, info, constant_for_transform);
 
         for (const auto & transformed : transformed_candidates)
             add_transformed_constant_candidate(transformed, /*is_relaxed*/ transformed.requires_relaxed_atom);
@@ -6137,6 +6055,7 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryBuildComparisonAtom(
     element.monotonic_functions_chain = std::move(chain);
     element.argument_num_of_space_filling_curve = candidate.argument_num_of_space_filling_curve;
     element.relaxed = is_relaxed;
+    element.hides_null = candidate.hides_null;
 
     const auto atom_it = atom_map.find(func_name);
     chassert(atom_it != atom_map.end());
@@ -6202,17 +6121,9 @@ void KeyCondition::extractBareColumnAtoms(const RPNBuilderTreeNode & node, const
     if (node_type->isNullable() || !node_type->canBeUsedInBooleanContext())
         return;
 
-    /// `notEquals` is in `no_relaxed_atom_functions`, so the relaxed monotonic constant
-    /// transform must stay disabled, same as for the explicit predicate.
     const auto zero_type = std::make_shared<DataTypeUInt8>();
     const ColumnWithTypeAndName zero{zero_type->createColumnConst(1, Field(UInt64(0))), zero_type, {}};
-    extractComparisonAtomsForKeyArgument(
-        node,
-        info,
-        "notEquals",
-        zero,
-        /*allow_relaxed_pruning=*/ false,
-        group);
+    extractComparisonAtomsForKeyArgument(node, info, "notEquals", zero, group);
 }
 
 
@@ -7145,7 +7056,8 @@ Truth KeyCondition::checkBoundsInRange(
     const FieldRef * right_keys,
     const DataTypes & data_types,
     const Truth & need,
-    const Hyperrectangle * key_bounds) const
+    const Hyperrectangle * key_bounds,
+    bool key_types_may_hold_null) const
 {
     chassert(key_order.compareTuples(left_keys, right_keys, used_key_size) <= 0);
 
@@ -7157,7 +7069,7 @@ Truth KeyCondition::checkBoundsInRange(
     return forAnyHyperrectangle(used_key_size, left_keys, right_keys, true, true, key_ranges, data_types, key_order, 0, need, key_bounds,
         [&] (const Hyperrectangle & key_ranges_hyperrectangle)
     {
-        return checkBoundsInHyperrectangle(key_ranges_hyperrectangle, data_types);
+        return checkBoundsInHyperrectangle(key_ranges_hyperrectangle, data_types, {}, nullptr, key_types_may_hold_null);
     });
 }
 
@@ -7183,7 +7095,8 @@ Truth KeyCondition::checkBoundsInRange(
     const DataTypes & sparse_data_types,
     const std::vector<UInt8> & equal_boundaries_mask,
     const Truth & need,
-    const Hyperrectangle * key_bounds) const
+    const Hyperrectangle * key_bounds,
+    bool key_types_may_hold_null) const
 {
     const size_t sparse_keys_size = sparse_key_indices.size();
 
@@ -7245,7 +7158,7 @@ Truth KeyCondition::checkBoundsInRange(
         {
             return checkBoundsInHyperrectangle(
                 key_col_to_sparse_pos, key_ranges_hyperrectangle, sparse_data_types,
-                /*num_refinable_key_columns=*/ enumerated_key_prefix_size);
+                /*num_refinable_key_columns=*/ enumerated_key_prefix_size, key_types_may_hold_null);
         });
 }
 
@@ -7586,8 +7499,8 @@ bool KeyCondition::extractPlainRanges(Ranges & ranges) const
         /// `FUNCTION_IS_NULL`, `FUNCTION_IS_NOT_NULL`, ...) and any future atom that introduces
         /// relaxation handling. Operator elements (`FUNCTION_AND`, `FUNCTION_OR`, `FUNCTION_NOT`,
         /// `ALWAYS_TRUE`, `ALWAYS_FALSE`) are never set as relaxed; relaxation propagates through them
-        /// via their child atoms (see the comment on `KeyCondition::isRelaxed` in `KeyCondition.h`).
-        if (element.relaxed)
+        /// via their child atoms. An atom that hides NULLs does not yield exact ranges either.
+        if (element.relaxed || element.hides_null)
             return false;
 
         if (element.function == RPNElement::FUNCTION_AND)
@@ -7847,17 +7760,25 @@ namespace
 /// has the ordinary bounds `[(2, 1), (3, 0)]`. The top level itself is analysed from the range, see below.
 /// Only `Tuple` elements are descended: an `Array` or a `Map` comparison is `compareAt`-based, so it
 /// answers a definite value for a nested `NULL` and orders a nested `NaN` exactly where the index does.
-bool keyTypeMayHoldNestedNullOrNaN(const DataTypePtr & key_type)
+///
+/// The index analysis asks this for every atom it checks on every hyperrectangle, from many threads. So the key type is
+/// unwrapped by its type id and through references. Copying its `DataTypePtr` makes the threads contend on the
+/// reference count.
+bool keyTypeMayHoldNestedNullOrNaN(const IDataType & key_type)
 {
-    const auto * tuple = typeid_cast<const DataTypeTuple *>(removeNullable(removeLowCardinality(key_type)).get());
-    if (!tuple)
+    const IDataType * type = &key_type;
+    if (type->getTypeId() == TypeIndex::LowCardinality)
+        type = assert_cast<const DataTypeLowCardinality &>(*type).getDictionaryType().get();
+    if (type->getTypeId() == TypeIndex::Nullable)
+        type = assert_cast<const DataTypeNullable &>(*type).getNestedType().get();
+    if (type->getTypeId() != TypeIndex::Tuple)
         return false;
 
-    for (const auto & element : tuple->getElements())
+    for (const auto & element : assert_cast<const DataTypeTuple &>(*type).getElements())
     {
         const auto unwrapped = removeLowCardinality(element);
         if (unwrapped->isNullable() || WhichDataType(removeNullable(unwrapped)).isFloat()
-            || keyTypeMayHoldNestedNullOrNaN(unwrapped))
+            || keyTypeMayHoldNestedNullOrNaN(*unwrapped))
             return true;
     }
     return false;
@@ -7888,7 +7809,7 @@ bool rangeOfKeyColumnMayHoldNull(
 
     const auto & key_type = key_types[key_position];
     return (key_range.right.isPositiveInfinity() && isNullableOrLowCardinalityNullable(key_type))
-        || (atomMayClaimNestedNullOrNaN(element) && keyTypeMayHoldNestedNullOrNaN(key_type));
+        || (atomMayClaimNestedNullOrNaN(element) && keyTypeMayHoldNestedNullOrNaN(*key_type));
 }
 
 /// Pushes the truth of an atom group. `apply_element` pushes the truth of one atom. Each atom bounds the truth
@@ -7933,13 +7854,20 @@ bool atomIsNullForNullArgument(KeyCondition::RPNElement::Function function)
 }
 
 /// The truth of an atom on a range, from the check of its positive form. The positive form of `x NOT IN (1, 2)` is
-/// `x IN (1, 2)`.
-ALWAYS_INLINE Truth atomTruth(const KeyCondition::RPNElement & element, Truth range_check)
+/// `x IN (1, 2)`. `may_be_null` tells whether the atom may be NULL on rows that the check reads as ordinary key values.
+/// A `Nullable` key column holds such rows at the end of its range. A subrange may hold only such rows.
+ALWAYS_INLINE Truth atomTruth(const KeyCondition::RPNElement & element, Truth range_check, bool may_be_null)
 {
     using RPNElement = KeyCondition::RPNElement;
 
     if (element.relaxed)
         range_check = range_check.relaxed();
+
+    if (element.hides_null)
+        range_check = range_check.withHiddenNull();
+
+    if (may_be_null)
+        range_check = range_check.withNull();
 
     if (element.function == RPNElement::FUNCTION_NOT_IN_RANGE || element.function == RPNElement::FUNCTION_NOT_IN_SET
         || element.function == RPNElement::FUNCTION_IS_NULL)
@@ -7950,54 +7878,12 @@ ALWAYS_INLINE Truth atomTruth(const KeyCondition::RPNElement & element, Truth ra
 
 }
 
-/// `WHERE` rejects a row whose comparison is NULL, so a NULL key value satisfies neither a comparison
-/// nor its negation. The two-valued range algebra of `checkInHyperrectangle` cannot express that: "no
-/// NULL row lies inside the range" turns, under negation, into "every row lies outside it", which
-/// reports a granule of NULLs as wholly matching a negated comparison - and the exact-count
-/// optimization then counts the very rows the `WHERE` throws away. So the exactness of the whole
-/// analysis is gone as soon as one such atom reads a `Nullable` key column whose range may hold a
-/// NULL, or a composite key column whose values may carry a nested `NULL` or `NaN`, which is the same
-/// "neither true nor false" at row level. `IS NULL` and `IS NOT NULL` are excluded: they answer true or false for a NULL as well, so
-/// the algebra describes them exactly. Only `can_be_false` is affected; `can_be_true`, and with it
-/// every pruning decision, is left alone.
-bool KeyCondition::mayReadNullKeyValue(const Hyperrectangle & hyperrectangle, const DataTypes & key_types) const
+bool KeyCondition::keyTypesMayHoldNull(const DataTypes & key_types)
 {
-    for (const auto & element : expandAtomGroups(rpn))
+    return std::ranges::any_of(key_types, [](const DataTypePtr & key_type)
     {
-        if (!atomIsNullForNullArgument(element.function))
-            continue;
-
-        for (size_t key_column : element.key_columns)
-            if (key_column < hyperrectangle.size() && rangeOfKeyColumnMayHoldNull(element, hyperrectangle[key_column], key_types, key_column))
-                return true;
-    }
-
-    return false;
-}
-
-/// The same over the sparse representation of the primary index, where a key column is addressed by
-/// its position among the columns the index resolves.
-bool KeyCondition::mayReadNullKeyValue(
-    const std::vector<int> & key_col_to_sparse_pos, const Hyperrectangle & sparse_hyperrectangle, const DataTypes & sparse_key_types) const
-{
-    for (const auto & element : expandAtomGroups(rpn))
-    {
-        if (!atomIsNullForNullArgument(element.function))
-            continue;
-
-        for (size_t key_column : element.key_columns)
-        {
-            if (key_column >= key_col_to_sparse_pos.size() || key_col_to_sparse_pos[key_column] == -1)
-                continue;
-
-            const size_t sparse_pos = static_cast<size_t>(key_col_to_sparse_pos[key_column]);
-            if (sparse_pos < sparse_hyperrectangle.size()
-                && rangeOfKeyColumnMayHoldNull(element, sparse_hyperrectangle[sparse_pos], sparse_key_types, sparse_pos))
-                return true;
-        }
-    }
-
-    return false;
+        return key_type && (isNullableOrLowCardinalityNullable(key_type) || keyTypeMayHoldNestedNullOrNaN(*key_type));
+    });
 }
 
 bool KeyCondition::fieldHasNullInside(const Field & field)
@@ -8045,14 +7931,20 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
     const Hyperrectangle & hyperrectangle,
     const DataTypes & data_types,
     const ColumnIndexToBloomFilter & column_index_to_column_bf,
-    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn) const
+    const UpdatePartialDisjunctionResultFn & update_partial_disjunction_result_fn,
+    bool key_types_may_hold_null) const
 {
     absl::InlinedVector<Truth, 16> rpn_stack;
 
     /// Pushes the truth of an atom from the check of its positive form, see `atomTruth`.
     auto push_atom = [&](const RPNElement & element, BoolMask range_check) ALWAYS_INLINE
     {
-        rpn_stack.push_back(atomTruth(element, Truth::check(range_check)));
+        const bool may_be_null = key_types_may_hold_null && atomIsNullForNullArgument(element.function)
+            && std::ranges::any_of(element.key_columns, [&](size_t column)
+            {
+                return column < hyperrectangle.size() && rangeOfKeyColumnMayHoldNull(element, hyperrectangle[column], data_types, column);
+            });
+        rpn_stack.push_back(atomTruth(element, Truth::check(range_check), may_be_null));
     };
 
     auto curve_type = [&](size_t key_column_pos)
@@ -8510,9 +8402,6 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
 
-    if (unlikely(rpn_stack[0].is_true.level() == Side::Always && mayReadNullKeyValue(hyperrectangle, data_types)))
-        rpn_stack[0] = rpn_stack[0].withNull();
-
     return rpn_stack[0];
 }
 
@@ -8528,7 +8417,8 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
     const std::vector<int> & key_col_to_sparse_pos,
     const Hyperrectangle & sparse_hyperrectangle,
     const DataTypes & sparse_data_types,
-    size_t num_refinable_key_columns) const
+    size_t num_refinable_key_columns,
+    bool key_types_may_hold_null) const
 {
     /// The other key columns have the same range on every range the caller checks. A key column that the part doesn't load
     /// in memory is one. Only the partition minmax index bounds it, for the whole part.
@@ -8550,7 +8440,14 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
     /// Pushes the truth of an atom from the check of its positive form, see `atomTruth`.
     auto push_atom = [&](const RPNElement & element, BoolMask range_check) ALWAYS_INLINE
     {
-        rpn_stack.push_back(atomTruth(element, Truth::check(range_check)));
+        const bool may_be_null = key_types_may_hold_null && atomIsNullForNullArgument(element.function)
+            && std::ranges::any_of(element.key_columns, [&](size_t column)
+            {
+                auto [is_key_col_present, sparse_pos] = get_sparse_info(column);
+                return is_key_col_present
+                    && rangeOfKeyColumnMayHoldNull(element, sparse_hyperrectangle[sparse_pos], sparse_data_types, sparse_pos);
+            });
+        rpn_stack.push_back(atomTruth(element, Truth::check(range_check), may_be_null));
     };
 
     auto curve_type = [&](size_t key_column_pos)
@@ -9000,10 +8897,6 @@ Truth KeyCondition::checkBoundsInHyperrectangle(
     if (rpn_stack.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Unexpected stack size in KeyCondition::checkInHyperrectangle");
 
-    if (unlikely(rpn_stack[0].is_true.level() == Side::Always
-                 && mayReadNullKeyValue(key_col_to_sparse_pos, sparse_hyperrectangle, sparse_data_types)))
-        rpn_stack[0] = rpn_stack[0].withNull();
-
     return rpn_stack[0];
 }
 
@@ -9277,7 +9170,7 @@ String KeyCondition::RPNElement::toString(const std::vector<String> & key_names)
 
 Truth KeyCondition::checkBoundsOnAnyRange() const
 {
-    /// A negated relaxed atom excludes no range, and `force_primary_key` rejects it.
+    /// A negated relaxed atom, like `s NOT LIKE 'a_'`, excludes no range, and `force_primary_key` rejects it.
     std::vector<Truth> rpn_stack;
     const auto push_atom = [&](const RPNElement & element)
     {
@@ -9288,7 +9181,7 @@ Truth KeyCondition::checkBoundsOnAnyRange() const
         else if (element.function == RPNElement::ALWAYS_FALSE)
             rpn_stack.push_back(Truth::check(BoolMask(false, true)));
         else
-            rpn_stack.push_back(atomTruth(element, Truth::check(true, true, true)));
+            rpn_stack.push_back(atomTruth(element, Truth::check(true, true, true), /*may_be_null*/ false));
     };
 
     for (const auto & element : rpn)
