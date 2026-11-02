@@ -237,13 +237,11 @@ public:
         const FieldRef * right_keys,
         const DataTypes & data_types) const;
 
-    /// Checks that the index can not be used
-    /// FUNCTION_UNKNOWN will be AND'ed (if any).
+    /// Checks that the index can not be used: no range check can exclude a range.
     bool alwaysUnknownOrTrue() const;
 
-    /// Checks that the index can not be used
-    /// Does not allow any FUNCTION_UNKNOWN (will instantly return true).
-    bool anyUnknownOrAlwaysTrue() const;
+    /// Checks that no range check can find a range where every row matches.
+    bool alwaysUnknownOrFalse() const;
 
     bool alwaysFalse() const;
 
@@ -591,6 +589,9 @@ private:
         const std::vector<int> & key_col_to_sparse_pos,
         const Hyperrectangle & sparse_hyperrectangle,
         const DataTypes & sparse_key_types) const;
+
+    /// The truth on a range that the caller doesn't give. Each atom that the index can evaluate can have any value there.
+    Truth checkBoundsOnAnyRange() const;
 
     /// The atoms extracted from one predicate leaf, which become one element of the RPN: none makes
     /// `FUNCTION_UNKNOWN`, one is the element itself, and several make a `FUNCTION_ATOM_GROUP` (see
@@ -958,30 +959,6 @@ private:
         bool allow_relaxed_pruning,
         AtomGroup & group,
         const DataTypePtr & has_element_type = nullptr) const;
-
-    /// Checks that the index can not be used.
-    ///
-    /// If unknown_any is false (used by alwaysUnknownOrTrue()), then FUNCTION_UNKNOWN can be AND'ed,
-    /// otherwise (anyUnknownOrAlwaysTrue()) first FUNCTION_UNKNOWN will return true (index cannot be used).
-    ///
-    /// Consider the following example:
-    ///
-    ///     CREATE TABLE test(p DateTime, k int) ENGINE MergeTree PARTITION BY toDate(p) ORDER BY k;
-    ///     INSERT INTO test VALUES ('2020-09-01 00:01:02', 1), ('2020-09-01 20:01:03', 2), ('2020-09-02 00:01:03', 3);
-    ///
-    /// - SELECT count() FROM test WHERE toDate(p) >= '2020-09-01' AND p <= '2020-09-01 00:00:00'
-    ///   In this case rpn will be (FUNCTION_IN_RANGE, FUNCTION_UNKNOWN (due to strict), FUNCTION_AND)
-    ///   and for optimize_trivial_count_query we cannot use index if there is at least one FUNCTION_UNKNOWN.
-    ///   since there is no post processing and return count() based on only the first predicate is wrong.
-    ///
-    /// - SELECT * FROM test WHERE toDate(p) >= '2020-09-01' AND p <= '2020-09-01 00:00:00'
-    ///   In this case will be (FUNCTION_IN_RANGE, FUNCTION_IN_RANGE (due to non-strict), FUNCTION_AND)
-    ///   so it will prune everything out and nothing will be read.
-    ///
-    /// - SELECT * FROM test WHERE toDate(p) >= '2020-09-01' AND toUnixTimestamp(p)%5==0
-    ///   In this case will be (FUNCTION_IN_RANGE, FUNCTION_UNKNOWN, FUNCTION_AND)
-    ///   and all, two, partitions will be scanned, but due to filtering later none of rows will be matched.
-    bool unknownOrAlwaysTrue(bool unknown_any) const;
 
     /** Iterates over RPN and collapses FUNCTION_IN_RANGE over the arguments of space-filling curve function
       * into atom of type FUNCTION_ARGS_IN_HYPERRECTANGLE. The hyperrectangles of the leaves of a conjunction

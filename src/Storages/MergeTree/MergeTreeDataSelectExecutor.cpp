@@ -2418,9 +2418,14 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     if (marks_count == 0)
         return res;
 
-    bool key_condition_useful = !key_condition.alwaysUnknownOrTrue();
-    bool part_offset_condition_useful = part_offset_condition && !part_offset_condition->alwaysUnknownOrTrue();
-    bool total_offset_condition_useful = total_offset_condition && !total_offset_condition->alwaysUnknownOrTrue();
+    /// A condition that can exclude no range is still useful if it can find exact ranges.
+    const auto is_useful = [&](const KeyCondition & condition)
+    {
+        return !condition.alwaysUnknownOrTrue() || (exact_ranges && !condition.alwaysUnknownOrFalse());
+    };
+    bool key_condition_useful = is_useful(key_condition);
+    bool part_offset_condition_useful = part_offset_condition && is_useful(*part_offset_condition);
+    bool total_offset_condition_useful = total_offset_condition && is_useful(*total_offset_condition);
 
     /// If index is not used.
     if (!key_condition_useful && !part_offset_condition_useful && !total_offset_condition_useful)
