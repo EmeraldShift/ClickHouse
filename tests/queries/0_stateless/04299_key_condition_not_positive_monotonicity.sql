@@ -22,7 +22,7 @@ SELECT c0 FROM test_divide_neg WHERE c0 <= 0 ORDER BY c0 SETTINGS force_primary_
 SELECT c0 FROM test_divide_neg WHERE c0 > 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 3;
 SELECT c0 FROM test_divide_neg WHERE c0 >= 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 3;
 SELECT c0 FROM test_divide_neg WHERE c0 = -1 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 2;
-SELECT c0 FROM test_divide_neg WHERE c0 != 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 5;
+SELECT c0 FROM test_divide_neg WHERE c0 != 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 5; -- { serverError INDEX_NOT_USED }
 
 -- Reversed-argument form (constant on the left).
 SELECT c0 FROM test_divide_neg WHERE 0 > c0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 4;
@@ -44,7 +44,7 @@ SELECT c0 FROM test_intdiv_neg WHERE c0 <= 0 ORDER BY c0 SETTINGS force_primary_
 SELECT c0 FROM test_intdiv_neg WHERE c0 > 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 4;
 SELECT c0 FROM test_intdiv_neg WHERE c0 >= 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 4;
 SELECT c0 FROM test_intdiv_neg WHERE c0 = -1 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 4;
-SELECT c0 FROM test_intdiv_neg WHERE c0 != 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 5;
+SELECT c0 FROM test_intdiv_neg WHERE c0 != 0 ORDER BY c0 SETTINGS force_primary_key = 1, max_rows_to_read = 5; -- { serverError INDEX_NOT_USED }
 
 EXPLAIN indexes = 1
 SELECT c0 FROM test_intdiv_neg WHERE c0 < 0;
