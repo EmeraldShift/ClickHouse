@@ -3233,7 +3233,6 @@ void ReadFromMergeTree::buildPartitionPruningIndexes(
             metadata_snapshot,
             *filter_dag_ptr,
             query_context,
-            /*strict=*/false,
             /*skip_analysis=*/skip_partition_pruning_ || !settings[Setting::use_partition_pruning],
             require_ready_sets);
     }
