@@ -51,6 +51,7 @@ Expression ((Project names + Projection))
             Condition: true
             Parts: 1/1
             Granules: 7/7
+            Search Algorithm: generic exclusion search
           Ranges: 1
 SELECT count() FROM tab WHERE col < nan;
 0
@@ -81,6 +82,7 @@ Expression ((Project names + Projection))
             Condition: true
             Parts: 1/1
             Granules: 7/7
+            Search Algorithm: generic exclusion search
           Ranges: 1
 SELECT count() FROM tab WHERE isNaN(col);
 2
