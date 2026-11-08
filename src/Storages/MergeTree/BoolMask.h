@@ -2,6 +2,8 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
+
 /// Multiple Boolean values. That is, two Boolean values: can it be true, can it be false.
 struct BoolMask
 {
@@ -43,6 +45,147 @@ struct BoolMask
     /// no longer changeable under BoolMask::combine (isComplete).
     static const BoolMask consider_only_can_be_true;
     static const BoolMask consider_only_can_be_false;
+};
+
+/// Index analysis checks a condition on a range of rows, like a range of marks or a partition, using the index of the
+/// range. On a row, the condition is true, false, or NULL. `Truth` holds a `Side` for true and one for false, and a
+/// NULL row counts as neither.
+///
+/// A `Side` is about one value. Its level is `Never` if no row of the range has the value, and `Always` if every row has
+/// it. Otherwise, or if the index can't tell, the level is `Unknown`. `lo` and `hi` bound the level of the same check on a
+/// subrange. If `lo == hi`, every subrange is at that level. A check usually returns one of these.
+///
+///     {Never, Never}             No row has the value.
+///     {Always, Always}           Every row has the value.
+///     {Never, Always}            Some rows may have the value, and a subrange can be at any level.
+///     {Unknown, Unknown}         Some rows may have the value, and every check of a subrange answers `Unknown`.
+///
+/// Take the key `(a, b)` and the condition `b = 5`. On a range of marks where `a` changes, the key doesn't bound `b`, but
+/// on a subrange where `a` is constant it does. So `is_true` is `{Never, Always}`. A condition on a column that the key
+/// doesn't store has `{Unknown, Unknown}`.
+struct Side
+{
+    enum Level : uint8_t { Never, Unknown, Always };
+
+    Level lo = Never;
+    Level hi = Always;
+
+    static Side point(Level level) { return {level, level}; }
+
+    /// `can_be` tells whether some row can have the value, and `can_be_other` whether some row can have another value. A
+    /// subrange can be at any level.
+    static Side of(bool can_be, bool can_be_other)
+    {
+        if (!can_be)
+            return point(Never);
+        if (!can_be_other)
+            return point(Always);
+        return {Never, Always};
+    }
+
+    Level level() const { return lo == hi ? lo : Unknown; }
+
+    /// Whether some subrange can be at `Never`, or at `Always`.
+    bool mayBeNever() const { return lo == Never; }
+    bool mayBeAlways() const { return hi == Always; }
+
+    /// `(a AND b).is_true` is `a.is_true & b.is_true`, and `(a OR b).is_true` is `a.is_true | b.is_true`.
+    Side operator&(Side other) const { return {std::min(lo, other.lo), std::min(hi, other.hi)}; }
+    Side operator|(Side other) const { return {std::max(lo, other.lo), std::max(hi, other.hi)}; }
+
+    /// The side of a range that is the union of the two ranges.
+    static Side hull(Side left, Side right) { return {std::min(left.lo, right.lo), std::max(left.hi, right.hi)}; }
+
+    /// Whether more `hull`s can't change the side where a caller reads it. The caller reads `lo` down to `need.lo` and
+    /// `hi` up to `need.hi`.
+    bool covers(Side need) const { return lo <= need.lo && hi >= need.hi; }
+};
+
+/// The values of a condition on the rows of a range, see `Side`. A range can be skipped if `is_true` is `Never`, and every
+/// row of the range matches if `is_true` is `Always`. `Truth{}` lets every value be on some row and a subrange be at any
+/// level. `NOT`, `AND`, and `OR` combine truths the way they combine rows. The truth of an atom starts from `check`. The
+/// methods below adjust it for an atom that the key can't check exactly.
+struct Truth
+{
+    Side is_true;
+    Side is_false;
+
+    /// The truth from a check that returns whether the condition can be true and whether it can be false on the range. A
+    /// subrange can have fewer values.
+    static Truth check(BoolMask mask) { return {Side::of(mask.can_be_true, mask.can_be_false), Side::of(mask.can_be_false, mask.can_be_true)}; }
+
+    /// The truth of a condition on a column that the index doesn't store.
+    static Truth unknown() { return {Side::point(Side::Unknown), Side::point(Side::Unknown)}; }
+
+    /// The same levels, with every subrange at the level of the range.
+    Truth fixed() const { return {fixed(is_true), fixed(is_false)}; }
+
+    /// For a check that returns a superset of the rows where the atom is true, like `s LIKE 'ab%c'` checking that `s` is
+    /// in `['ab', 'ac')`. The atom is its check `AND` an unknown condition. Its `is_true` keeps `Never` but loses `Always`.
+    Truth relaxed() const { return *this & unknown(); }
+
+    /// The condition can also be NULL on some rows of the range. A subrange may hold only such rows.
+    Truth withNull() const { return {{Side::Never, is_true.hi}, {Side::Never, is_false.hi}}; }
+
+    /// For a key that stores a NULL as an ordinary value, like `assumeNotNull(x)`. The condition may be NULL on any row
+    /// where the check returns true or false.
+    Truth withHiddenNull() const
+    {
+        auto may_be_null = [](Side side) -> Side { return {std::min(side.lo, Side::Unknown), std::min(side.hi, Side::Unknown)}; };
+        return {may_be_null(is_true), may_be_null(is_false)};
+    }
+
+    Truth operator&(const Truth & other) const { return {is_true & other.is_true, is_false | other.is_false}; }
+    Truth operator|(const Truth & other) const { return !(!*this & !other); }
+    Truth operator!() const { return {is_false, is_true}; }
+
+    /// The truth on a range that is the union of the two ranges.
+    static Truth hull(const Truth & left, const Truth & right)
+    {
+        return {Side::hull(left.is_true, right.is_true), Side::hull(left.is_false, right.is_false)};
+    }
+
+    /// The truth from two checks of the same condition on the same range. Both truths must describe the whole range, not a
+    /// `hull` that stopped early at `covers`. A truth lets a row be NULL unless every row is true or every row is false.
+    static Truth meet(const Truth & left, const Truth & right)
+    {
+        auto can_be = [](Side l, Side r) { return l.level() != Side::Never && r.level() != Side::Never; };
+        auto can_be_null = [](const Truth & truth) { return truth.is_true.level() != Side::Always && truth.is_false.level() != Side::Always; };
+        auto may_lack = [](Side l, Side r) { return l.mayBeNever() || r.mayBeNever(); };
+        const bool t = can_be(left.is_true, right.is_true);
+        const bool f = can_be(left.is_false, right.is_false);
+        const bool n = can_be_null(left) && can_be_null(right);
+        const bool no_t = may_lack(left.is_true, right.is_true);
+        const bool no_f = may_lack(left.is_false, right.is_false);
+        return {fromValues(t, f || n, no_t, no_f), fromValues(f, t || n, no_f, no_t)};
+    }
+
+    /// See `Side::covers`. A caller that reads both sides whole, like `meet`, needs `Truth{}`.
+    bool covers(const Truth & need) const { return is_true.covers(need.is_true) && is_false.covers(need.is_false); }
+
+    /// The `need` of a caller that reads only `is_true`. Every side covers `{Always, Never}`.
+    static Truth need(Side is_true) { return {is_true, {Side::Always, Side::Never}}; }
+
+    /// The `need` of a caller that reads only `mask()`, with the bits that `initial_mask` sets already known.
+    static Truth need(BoolMask initial_mask)
+    {
+        return need(Side{initial_mask.can_be_false ? Side::Always : Side::Unknown, initial_mask.can_be_true ? Side::Never : Side::Unknown});
+    }
+
+    /// Whether some row can match, and whether some row can fail to match.
+    BoolMask mask() const { return {is_true.level() != Side::Never, is_true.level() != Side::Always}; }
+
+private:
+    static Side fixed(Side side) { return side.lo == side.hi ? side : Side::point(Side::Unknown); }
+
+    static Side fromValues(bool can_be, bool others_can_be, bool may_lack, bool may_be_only)
+    {
+        if (!can_be)
+            return Side::point(Side::Never);
+        if (!others_can_be)
+            return Side::point(Side::Always);
+        return {may_lack ? Side::Never : Side::Unknown, may_be_only ? Side::Always : Side::Unknown};
+    }
 };
 
 namespace fmt
