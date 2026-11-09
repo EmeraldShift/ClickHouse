@@ -227,6 +227,16 @@ SELECT count() FROM test_nullable_int64 WHERE uid >= (1.0 / 0.0) SETTINGS force_
 SELECT count() FROM test_nullable_int64 WHERE uid < 9223372036854775808.0;
 SELECT count() FROM test_nullable_int64 WHERE uid >= 9223372036854775808.0 SETTINGS force_primary_key = 1, max_rows_to_read = 1;
 
+DROP TABLE IF EXISTS test_nullable_int64_pair;
+CREATE TABLE test_nullable_int64_pair (uid Nullable(Int64), v Int64) ENGINE = MergeTree ORDER BY (uid, v) SETTINGS allow_nullable_key = 1, index_granularity = 4, index_granularity_bytes = 10485760;
+INSERT INTO test_nullable_int64_pair SELECT if(number % 3 = 0, NULL, number % 10), number % 5 FROM numbers(1000);
+
+-- Nullable Int64 with a second key column. Here count() takes exact ranges from the primary key, and they must leave out the NULL rows.
+SET optimize_use_projections = 1, optimize_use_implicit_projections = 1;
+SELECT count() FROM test_nullable_int64_pair WHERE uid < 1e30 AND v = 4;
+SELECT count() FROM test_nullable_int64_pair WHERE uid >= -1e30 AND v = 4;
+SELECT count() FROM test_nullable_int64_pair WHERE uid != 100000.5 AND v = 4;
+
 DROP TABLE IF EXISTS test_int64_2pow53;
 CREATE TABLE test_int64_2pow53 (uid Int64) ENGINE = MergeTree ORDER BY uid SETTINGS index_granularity = 1, index_granularity_bytes = 10485760;
 INSERT INTO test_int64_2pow53 VALUES (9007199254740991), (9007199254740992), (9007199254740993), (9007199254740994);

@@ -6105,6 +6105,14 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryBuildComparisonAtom(
                 /// `ALWAYS_TRUE` would claim that every row matches.
                 chassert(!is_relaxed);
 
+                /// A `NULL` key value makes the comparison `NULL`, not true. On a `Nullable` key a fold to
+                /// `ALWAYS_TRUE` would match the `NULL` rows too. A fold to `ALWAYS_FALSE` stays, as the
+                /// `NULL` rows don't match either. No `NOT` applies to the fold. An integer key compared with a
+                /// float constant other than NaN isn't a float comparison for `isFloatComparison`, so
+                /// `cloneDAGWithInversionPushDown` inverts the `NOT` into the comparison, and a NaN constant doesn't fold.
+                if (key_expr_type_is_nullable && float_rewrite_element.function == RPNElement::ALWAYS_TRUE)
+                    return std::nullopt;
+
                 /// The comparison folded to a constant. Return it directly so `atom_map` does not
                 /// overwrite its `ALWAYS_TRUE` or `ALWAYS_FALSE` function.
                 float_rewrite_element.key_columns.push_back(candidate.key_column_num);
