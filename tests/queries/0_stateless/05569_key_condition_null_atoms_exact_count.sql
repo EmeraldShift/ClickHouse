@@ -39,6 +39,9 @@ SELECT count() FROM t_nested_null WHERE NOT (t < (0., 1));
 -- Rows where `t < (20., 0)` is NULL lie above `(20., 0)`, outside the atom's range. Without a `NOT` above the atom,
 -- the filter skips them as if the atom were false. The count doesn't read the granules below `(20., 0)`.
 SELECT count() FROM t_nested_null WHERE t < (20., 0) SETTINGS max_rows_to_read = 8;
+-- `t > (20., 0)` is NULL on the row `(20., NULL)` inside its range. The primary key doesn't search it as one continuous
+-- range.
+SELECT count() FROM t_nested_null WHERE t > (20., 0);
 
 -- Half of the rows have a NULL `x`, and the key puts them last.
 DROP TABLE IF EXISTS t_null_granules;

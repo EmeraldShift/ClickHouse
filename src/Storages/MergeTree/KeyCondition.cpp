@@ -101,6 +101,7 @@ namespace
 {
 
 bool keyTypeMayHoldNestedNull(const DataTypePtr & key_type);
+bool atomMayClaimNestedNull(const KeyCondition::RPNElement & element);
 
 /// A strict comparison does not survive a relaxed constant: after the constant has been
 /// transformed by a non-injective monotonic key function, only the non-strict bound is
@@ -7536,6 +7537,10 @@ bool KeyCondition::matchesExactContinuousRange() const
 
         if (element.function == RPNElement::Function::FUNCTION_IN_RANGE)
         {
+            /// The atom may be NULL on a row inside its range, so the rows it matches aren't one continuous range.
+            if (atomMayClaimNestedNull(element))
+                return false;
+
             auto [is_chain_always_monotonic, is_chain_strict] = check_monotonicity_of_chain(element.monotonic_functions_chain);
             if (!is_chain_always_monotonic)
                 return false;
