@@ -5993,6 +5993,20 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryBuildComparisonAtom(
     DataTypePtr const_type = candidate.const_type;
     MonotonicFunctionsChain chain = candidate.monotonic_functions_chain;
 
+    /// A comparison that is true on every non-NULL key value, or on none, is still NULL on a NULL key value. So it folds
+    /// to a range atom that holds every non-NULL value, or to an empty one, instead of `ALWAYS_TRUE` or `ALWAYS_FALSE`.
+    const auto folded_atom = [&](bool value)
+    {
+        RPNElement element(
+            RPNElement::FUNCTION_IN_RANGE,
+            {candidate.key_column_num},
+            value ? Range::createWholeUniverseWithoutNull() : Range(NEGATIVE_INFINITY, false, NEGATIVE_INFINITY, false));
+        element.monotonic_functions_chain = chain;
+        element.argument_num_of_space_filling_curve = candidate.argument_num_of_space_filling_curve;
+        element.relaxed = is_relaxed;
+        return element;
+    };
+
     /// What the chain actually produces, which is what any cast appended below will be fed. This
     /// stays unstripped: only the copy used to choose the comparison supertype is stripped.
     DataTypePtr chain_result_type
@@ -6080,16 +6094,12 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryBuildComparisonAtom(
 
                 /// With validation off, `equals`/`notEquals` fold an unknown enum literal to a
                 /// constant instead of throwing, so the index must do the same instead of converting.
-                /// Nullable keys are declined, as for NaN above: `NULL <op> 'x'` is NULL, not a constant.
                 if (!validate_enum_literals_in_operators && isUnknownEnumElement(*key_expr_type_not_null, const_value))
                 {
-                    if (key_expr_type_is_nullable)
-                        return std::nullopt;
-
                     if (func_name == "equals")
-                        return RPNElement(RPNElement::ALWAYS_FALSE);
+                        return folded_atom(false);
                     if (func_name == "notEquals")
-                        return RPNElement(RPNElement::ALWAYS_TRUE);
+                        return folded_atom(true);
                     return std::nullopt;
                 }
 
@@ -6119,10 +6129,7 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryBuildComparisonAtom(
                 /// `ALWAYS_TRUE` would claim that every row matches.
                 chassert(!is_relaxed);
 
-                /// The comparison folded to a constant. Return it directly so `atom_map` does not
-                /// overwrite its `ALWAYS_TRUE` or `ALWAYS_FALSE` function.
-                float_rewrite_element.key_columns.push_back(candidate.key_column_num);
-                return float_rewrite_element;
+                return folded_atom(float_rewrite_element.function == RPNElement::ALWAYS_TRUE);
             }
 
             if (!float_literal_was_rewritten)
@@ -8057,6 +8064,15 @@ std::optional<BoolMask> KeyCondition::checkRangeAtomInKeyRange(
     /// The case when the column is wrapped in a chain of possibly monotonic functions.
     if (!element.monotonic_functions_chain.empty())
     {
+        /// A folded comparison (see `tryBuildComparisonAtom`) has an empty range, or one that holds every non-NULL
+        /// value. An empty range is false on every row. The other is true on every row of a key range without NULL,
+        /// since the chain doesn't return NULL there. So the chain is applied only where the key range may hold NULL,
+        /// and a chain that can't be applied makes the atom unknown only there.
+        if (element.range.empty())
+            return BoolMask(false, true);
+        if (element.range.isInfinite() && !rangeOfKeyColumnMayHoldNull(key_column_range, key_types, key_position))
+            return BoolMask(true, false);
+
         std::optional<Range> new_range = applyMonotonicFunctionsChainToRange(
             *key_range_ptr,
             element.monotonic_functions_chain,

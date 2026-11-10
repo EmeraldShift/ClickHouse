@@ -68,8 +68,19 @@ SELECT (SELECT count() FROM t_null_granules WHERE assumeNotNull(x) > 40)
 -- With `transform_null_in`, `x IN (NULL)` is true on a NULL row. The count doesn't read the all-NULL granules.
 SELECT count() FROM t_null_granules WHERE x IN (NULL) SETTINGS transform_null_in = 1, max_rows_to_read = 8;
 
+-- With validation off, `e != 'c'` is true on every non-NULL `e`. The count reads only the granules around the first
+-- NULL.
+DROP TABLE IF EXISTS t_null_enum;
+CREATE TABLE t_null_enum (e Nullable(Enum8('a' = 1, 'b' = 2))) ENGINE = MergeTree ORDER BY e
+SETTINGS index_granularity = 4, index_granularity_bytes = '10Mi', allow_nullable_key = 1;
+INSERT INTO t_null_enum SELECT if(number % 2 = 0, NULL, 1 + number % 4 DIV 2) FROM numbers(100);
+
+SELECT count() FROM t_null_enum WHERE e != 'c' SETTINGS validate_enum_literals_in_operators = 0, max_rows_to_read = 8;
+SELECT count() FROM t_null_enum WHERE e = 'c' SETTINGS validate_enum_literals_in_operators = 0, max_rows_to_read = 1;
+
 DROP TABLE t_null_key;
 DROP TABLE t_atom_group;
 DROP TABLE t_nested_null;
 DROP TABLE t_nested_null_bound;
 DROP TABLE t_null_granules;
+DROP TABLE t_null_enum;
