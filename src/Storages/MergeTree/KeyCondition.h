@@ -391,6 +391,12 @@ public:
         /// does that for a NULL `x`. Such an atom can be NULL on any key range.
         bool hides_null = false;
 
+        /// Whether the atom may be under an odd number of `NOT`s. The constructor sets it for the filter's atoms.
+        bool under_not = true;
+
+        /// Whether the atom's key expression may hold a `Tuple` value with a nested NULL, see `atomMayClaimNestedNull`.
+        bool key_may_hold_nested_null = false;
+
         /// For FUNCTION_IN_RANGE and FUNCTION_NOT_IN_RANGE.
         Range range = Range::createWholeUniverse();
 

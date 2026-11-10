@@ -83,6 +83,19 @@ INSERT INTO t_unloaded_hidden_null SELECT if(number % 20 = 0, NULL, number) FROM
 
 SELECT count() FROM t_unloaded_hidden_null WHERE x != 5 SETTINGS use_lightweight_primary_key_index_analysis = 1;
 
+-- With a float in `t`, the `NOT` stays above the `t < (0., 1)` atom. That atom is NULL on the row `(0., NULL)`. The
+-- row lies inside its granule's range.
+DROP TABLE IF EXISTS t_nested_null;
+CREATE TABLE t_nested_null (t Tuple(Float64, Nullable(UInt32))) ENGINE = MergeTree ORDER BY t
+SETTINGS index_granularity = 4, index_granularity_bytes = '10Mi', allow_nullable_key = 1;
+INSERT INTO t_nested_null SELECT (intDiv(number, 4) * 2 + (number % 4 = 3), multiIf(number % 4 < 2, 5, number % 4 = 2, NULL, 0))
+FROM numbers(100);
+
+SELECT count() FROM t_nested_null WHERE NOT (t < (0., 1));
+-- Rows where `t < (20., 0)` is NULL lie above `(20., 0)`, outside the atom's range. Without a `NOT` above the atom,
+-- the filter skips them as if the atom were false. The count doesn't read the granules below `(20., 0)`.
+SELECT count() FROM t_nested_null WHERE t < (20., 0) SETTINGS max_rows_to_read = 8;
+
 -- Half of the rows have a NULL `x`, and the key puts them last.
 DROP TABLE IF EXISTS t_null_granules;
 CREATE TABLE t_null_granules (x Nullable(Float64)) ENGINE = MergeTree ORDER BY x
@@ -107,4 +120,5 @@ DROP TABLE t_hidden_null_value;
 DROP TABLE t_unloaded_null_key;
 DROP TABLE t_unloaded_atom_group;
 DROP TABLE t_unloaded_hidden_null;
+DROP TABLE t_nested_null;
 DROP TABLE t_null_granules;
