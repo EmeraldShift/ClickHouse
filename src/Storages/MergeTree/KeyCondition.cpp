@@ -100,6 +100,8 @@ extern const int TOO_SLOW;
 namespace
 {
 
+bool keyTypeMayHoldNestedNull(const DataTypePtr & key_type);
+
 /// A strict comparison does not survive a relaxed constant: after the constant has been
 /// transformed by a non-injective monotonic key function, only the non-strict bound is
 /// implied. For example, `x > 5` implies `round(x) >= round(5)`, but it does not imply
@@ -1722,6 +1724,8 @@ KeyCondition::KeyCondition(
         rpn[i].position_in_filter_rpn = i;
 
     findHyperrectanglesForArgumentsOfSpaceFillingCurves();
+
+    forEachAtomWithPolarity(rpn, [](RPNElement & atom, bool positive) { atom.under_not = !positive; });
 
     size_t next_function_number = 0;
     for (auto & element : expandAtomGroups(rpn))
@@ -6186,6 +6190,7 @@ std::optional<KeyCondition::RPNElement> KeyCondition::tryBuildComparisonAtom(
     element.monotonic_functions_chain = std::move(chain);
     element.argument_num_of_space_filling_curve = candidate.argument_num_of_space_filling_curve;
     element.relaxed = is_relaxed;
+    element.key_may_hold_nested_null = keyTypeMayHoldNestedNull(candidate.key_expr_type);
 
     const auto atom_it = atom_map.find(func_name);
     chassert(atom_it != atom_map.end());
@@ -7864,13 +7869,13 @@ static void tupleRangeToBoundingBox(const Range & tuple_range, Float64 & x_min, 
 namespace
 {
 
-/// Whether a value of a `Tuple` key type may carry a `NULL` or a `NaN` below its top level. Such a value
-/// compares as `NULL` or false at row level, while key order gives it a definite position, and nothing in
-/// a key range reveals it: a granule of `Tuple(Int32, Nullable(Int32))` values `(2, 1), (2, NULL), (3, 0)`
-/// has the ordinary bounds `[(2, 1), (3, 0)]`. The top level itself is analysed from the range, see below.
-/// Only `Tuple` elements are descended: an `Array` or a `Map` comparison is `compareAt`-based, so it
-/// answers a definite value for a nested `NULL` and orders a nested `NaN` exactly where the index does.
-bool keyTypeMayHoldNestedNullOrNaN(const DataTypePtr & key_type)
+/// Whether a value of a `Tuple` key type may carry a `NULL` below its top level. Such a value makes a comparison
+/// `NULL` at row level, while key order gives it a definite position, and nothing in a key range reveals it. A
+/// granule of `Tuple(Int32, Nullable(Int32))` values `(2, 1), (2, NULL), (3, 0)` has the ordinary bounds
+/// `[(2, 1), (3, 0)]`. The top level itself is analysed from the range, see `rangeOfKeyColumnMayHoldNull`. Only `Tuple`
+/// elements are descended. An `Array` or a `Map` comparison is `compareAt`-based, so it returns a definite value for a
+/// nested `NULL`.
+bool keyTypeMayHoldNestedNull(const DataTypePtr & key_type)
 {
     const auto * tuple = typeid_cast<const DataTypeTuple *>(removeNullable(removeLowCardinality(key_type)).get());
     if (!tuple)
@@ -7879,39 +7884,43 @@ bool keyTypeMayHoldNestedNullOrNaN(const DataTypePtr & key_type)
     for (const auto & element : tuple->getElements())
     {
         const auto unwrapped = removeLowCardinality(element);
-        if (unwrapped->isNullable() || WhichDataType(removeNullable(unwrapped)).isFloat()
-            || keyTypeMayHoldNestedNullOrNaN(unwrapped))
+        if (unwrapped->isNullable() || keyTypeMayHoldNestedNull(unwrapped))
             return true;
     }
     return false;
 }
 
-/// Whether a range atom can be wrong about a key value that carries a nested `NULL` or `NaN`. Key order
-/// puts such a value above every value that shares its prefix, and a row whose first differing position
-/// holds one compares greater than the constant at row level too, or is `NULL`, which `WHERE` rejects
-/// as well. So a range bounded above by an ordinary value excludes it on both sides, and only a range
-/// that reaches `+inf` can claim it as matching, while a negated range may claim it either way. A set
-/// atom is not affected: both the set index and the row-level `IN` compare whole tuples by hash, so a
-/// nested `NULL` or `NaN` matches only its identical copy on both sides.
-bool atomMayClaimNestedNullOrNaN(const KeyCondition::RPNElement & element)
+/// Whether the analysis must count a range atom as `NULL` on a key value that carries a nested `NULL`. Key order puts
+/// such a value above every value that shares its prefix. A comparison that reaches the nested `NULL` is `NULL` at row
+/// level, and the value lies above the comparison's constant.
+/// - A range bounded only above by an ordinary value, or a single point, doesn't hold the value, so the analysis counts
+///   the atom as false on it. Without a `NOT` above the atom, the filter keeps the same rows whether the atom is false or
+///   `NULL`.
+/// - Any other range, and a `NOT_IN_RANGE` atom, may hold the value.
+/// A set atom and a null-safe comparison compare a nested `NULL` as an ordinary value.
+bool atomMayClaimNestedNull(const KeyCondition::RPNElement & element)
 {
-    return element.function == KeyCondition::RPNElement::FUNCTION_NOT_IN_RANGE
-        || (element.function == KeyCondition::RPNElement::FUNCTION_IN_RANGE && element.range.right.isPositiveInfinity());
+    if (!element.null_on_null_key || !element.key_may_hold_nested_null)
+        return false;
+    if (element.function == KeyCondition::RPNElement::FUNCTION_NOT_IN_RANGE)
+        return true;
+    if (element.function != KeyCondition::RPNElement::FUNCTION_IN_RANGE)
+        return false;
+
+    const Range & range = element.range;
+    const bool excludes_value = !range.right.isPositiveInfinity()
+        && (range.left.isNegativeInfinity() || (range.left == range.right && range.left_included && range.right_included));
+    return element.under_not || !excludes_value;
 }
 
-/// Whether the analysed range of a key column, read by `element`, may hold a NULL value. A NULL key
-/// value is analysed as the `+inf` stand-in of the `NULLS LAST` order, so every range that reaches
-/// `+inf` may hold one. A `NULL` or a `NaN` nested in a composite key value may sit anywhere inside the
-/// range, see `atomMayClaimNestedNullOrNaN` for which atoms that matters for.
-bool rangeOfKeyColumnMayHoldNull(
-    const KeyCondition::RPNElement & element, const Range & key_range, const DataTypes & key_types, size_t key_position)
+/// Whether the analysed range of a key column may hold a NULL value. A NULL key value is analysed as
+/// the `+inf` stand-in of the `NULLS LAST` order, so every range that reaches `+inf` may hold one.
+bool rangeOfKeyColumnMayHoldNull(const Range & key_range, const DataTypes & key_types, size_t key_position)
 {
     if (key_position >= key_types.size() || !key_types[key_position])
         return false;
 
-    const auto & key_type = key_types[key_position];
-    return (key_range.right.isPositiveInfinity() && isNullableOrLowCardinalityNullable(key_type))
-        || (atomMayClaimNestedNullOrNaN(element) && keyTypeMayHoldNestedNullOrNaN(key_type));
+    return key_range.right.isPositiveInfinity() && isNullableOrLowCardinalityNullable(key_types[key_position]);
 }
 
 /// Whether `element` may be NULL on some row of `hyperrectangle`. `position_of` returns the position of a key column in
@@ -7923,11 +7932,14 @@ bool atomMayBeNull(
     if (!element.null_on_null_key)
         return false;
 
+    /// A `NULL` nested in a `Tuple` key value may sit anywhere inside the range of its key column.
+    if (atomMayClaimNestedNull(element))
+        return true;
+
     for (size_t key_column : element.key_columns)
     {
         const std::optional<size_t> position = position_of(key_column);
-        if (position && *position < hyperrectangle.size()
-            && rangeOfKeyColumnMayHoldNull(element, hyperrectangle[*position], key_types, *position))
+        if (position && *position < hyperrectangle.size() && rangeOfKeyColumnMayHoldNull(hyperrectangle[*position], key_types, *position))
             return true;
     }
 
