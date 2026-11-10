@@ -8040,11 +8040,11 @@ std::optional<BoolMask> KeyCondition::checkRangeAtomInKeyRange(
     const Range * key_range_ptr = &key_column_range;
     std::optional<Range> key_range_storage;
 
-    /// A NULL nested in a `Tuple` key value is stored above every value of its element, while
-    /// `Field` order puts it below them, so the upper bound comes out in `Field` order below
-    /// rows the key stores under it: `(2, 3)` is above `(2, NULL)`. The upper bound is widened to
-    /// `+inf`, which claims nothing about the column. A lower bound holding such a NULL only
-    /// comes out lower and needs no widening.
+    /// The key stores a NULL nested in a `Tuple` after every other value of its element, so `(2, 3)` comes before
+    /// `(2, NULL)`. `Field` comparison puts NULL first, so there `(2, NULL)` is below `(2, 3)`. With the upper bound
+    /// `(2, NULL)`, the key range would look like it ends before the row `(2, 3)`, and we could skip a granule with
+    /// matching rows. So such an upper bound is replaced with `+inf`. A lower bound like that needs no fix, because
+    /// it only makes the key range start earlier than the granule does.
     const bool upper_bound_widened = fieldHasNullInside(key_range_ptr->right);
     if (unlikely(upper_bound_widened))
     {
@@ -8083,8 +8083,8 @@ std::optional<BoolMask> KeyCondition::checkRangeAtomInKeyRange(
     ///   so no comparison condition can be true.
     /// - If only right bound is NaN: the range extends into NaN territory,
     ///   so it cannot be fully contained (NaN values don't satisfy the condition).
-    /// - A NaN or a NULL nested in a Tuple bound - the bound of a whole-tuple key comparison - is
-    ///   invisible to `Field::isNaN` and `Field::isNull`, and key order does not reproduce the
+    /// - A NaN nested in a Tuple bound - the bound of a whole-tuple key comparison - is
+    ///   invisible to `Field::isNaN`, and key order does not reproduce the
     ///   row-level comparison for it either, so the containment claim is dropped.
     ///   `intersects` is left alone: keeping the granule is the safe direction.
     if (unlikely(key_range.left.isNaN()))
@@ -8096,7 +8096,7 @@ std::optional<BoolMask> KeyCondition::checkRangeAtomInKeyRange(
     {
         contains = false;
     }
-    else if (unlikely(hasNullOrNaNInside(key_range.left) || hasNullOrNaNInside(key_range.right)))
+    else if (unlikely(hasNaNInside(key_range.left) || hasNaNInside(key_range.right)))
     {
         contains = false;
     }

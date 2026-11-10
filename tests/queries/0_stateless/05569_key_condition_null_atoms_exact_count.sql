@@ -43,6 +43,15 @@ SELECT count() FROM t_nested_null WHERE t < (20., 0) SETTINGS max_rows_to_read =
 -- range.
 SELECT count() FROM t_nested_null WHERE t > (20., 0);
 
+-- The second granule starts at `(2., NULL)`, and every row in it has a first element below 5. The count doesn't read it.
+DROP TABLE IF EXISTS t_nested_null_bound;
+CREATE TABLE t_nested_null_bound (t Tuple(Float64, Nullable(UInt32))) ENGINE = MergeTree ORDER BY t
+SETTINGS index_granularity = 4, index_granularity_bytes = '10Mi', allow_nullable_key = 1;
+INSERT INTO t_nested_null_bound VALUES ((1., 1)), ((1., 2)), ((1., 3)), ((1., 4)), ((2., NULL)), ((2., NULL)), ((3., 1)), ((3., 2)),
+    ((3., 3)), ((4., 1)), ((6., 0)), ((7., 0));
+
+SELECT count() FROM t_nested_null_bound WHERE t < (5., 0) SETTINGS max_rows_to_read = 9;
+
 -- Half of the rows have a NULL `x`, and the key puts them last.
 DROP TABLE IF EXISTS t_null_granules;
 CREATE TABLE t_null_granules (x Nullable(Float64)) ENGINE = MergeTree ORDER BY x
@@ -62,4 +71,5 @@ SELECT count() FROM t_null_granules WHERE x IN (NULL) SETTINGS transform_null_in
 DROP TABLE t_null_key;
 DROP TABLE t_atom_group;
 DROP TABLE t_nested_null;
+DROP TABLE t_nested_null_bound;
 DROP TABLE t_null_granules;
